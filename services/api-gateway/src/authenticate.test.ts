@@ -63,7 +63,7 @@ test('authenticate decorator should return generic 401 on invalid JWT', async (t
     await fastify.close();
     t.end();
   } catch (err) {
-    t.fail(err);
+    t.fail(String(err));
     await fastify.close();
     t.end();
   }

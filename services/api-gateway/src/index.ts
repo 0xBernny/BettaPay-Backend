@@ -32,14 +32,16 @@ import {
   CreateSettlementBody,
   AuthTokenBody,
   UpdatePaymentStatusBody,
+  UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
   createErrorResponse,
   ErrorCodes
 } from '@bettapay/validation';
-import { PrismaClient } from '@prisma/client';
+import prismaPkg from '@prisma/client';
 import pg from 'pg';
 import helmet from '@fastify/helmet';
 import { PrismaPg } from '@prisma/adapter-pg';
+const PrismaClient = ((prismaPkg as any).PrismaClient ?? (prismaPkg as any).default ?? prismaPkg) as new (options?: any) => any;
 
 declare module 'fastify' {
   export interface FastifyInstance {
@@ -89,6 +91,10 @@ interface UpdatePaymentStatusRouteBody {
   status?: unknown;
 }
 
+interface UpdateSettlementStatusRouteBody {
+  status?: unknown;
+}
+
 // Allowed payment status transitions. `initiated` is the only non-terminal state;
 // completed, failed, and cancelled are terminal and cannot transition further.
 const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
@@ -96,6 +102,13 @@ const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
   completed: [],
   failed: [],
   cancelled: [],
+};
+
+const SETTLEMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
+  pending: ['processing'],
+  processing: ['completed', 'failed'],
+  completed: [],
+  failed: [],
 };
 
 const isProduction = process.env.NODE_ENV === 'production';
@@ -260,7 +273,12 @@ fastify.register(fastifyJwt, {
 fastify.register(rateLimit, {
   max: 1000,
   timeWindow: '1 minute',
-  addHeaders: true
+  addHeaders: {
+    'x-ratelimit-limit': true,
+    'x-ratelimit-remaining': true,
+    'x-ratelimit-reset': true,
+    'retry-after': true,
+  }
 });
 
 fastify.register(rateLimit, {
@@ -528,6 +546,41 @@ fastify.patch<{ Params: PaymentParams; Body: UpdatePaymentStatusRouteBody }>('/a
   const updated = await prisma.payment.update({
     where: { id },
     data: { status: d.status },
+  });
+  return reply.send(updated);
+});
+
+fastify.patch<{ Params: { id: string }; Body: UpdateSettlementStatusRouteBody }>('/api/settlements/:id/status', {
+  preValidation: [fastify.authenticate],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  let d;
+  try {
+    d = UpdateSettlementStatusBody.parse(request.body);
+  } catch (error) {
+    return badRequest(reply, error);
+  }
+
+  const { id } = request.params;
+  const settlement = await prisma.settlement.findUnique({ where: { id } });
+  if (!settlement) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Settlement not found'));
+
+  const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
+  if (!allowed.includes(d.status)) {
+    return reply.code(422).send({
+      error: 'Invalid status transition',
+      from: settlement.status,
+      to: d.status,
+    });
+  }
+
+  const updated = await prisma.settlement.update({
+    where: { id },
+    data: {
+      status: d.status,
+      ...(d.status === 'completed' || d.status === 'failed' ? { completedAt: new Date() } : {}),
+    }
   });
   return reply.send(updated);
 });

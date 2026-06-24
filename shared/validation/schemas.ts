@@ -198,6 +198,11 @@ export const UpdatePaymentStatusBody = z.object({
   status: z.enum(['completed', 'failed', 'cancelled']),
 });
 
+export const UpdateSettlementStatusBody = z.object({
+  status: z.enum(['processing', 'completed', 'failed']),
+});
+export type UpdateSettlementStatusBody = z.infer<typeof UpdateSettlementStatusBody>;
+
 // Per-merchant fee rule configuration. feeBps is basis points (1% = 100 bps),
 // capped at 10000 (100%). Unknown keys are stripped; the route merges these into
 // the merchant's existing settings rather than replacing them.

@@ -42,7 +42,7 @@ function buildApp(handlerTimeoutMs: number) {
 
 test('Fastify uses the documented request and connection timeouts', async (t) => {
   const app = buildApp(REQUEST_TIMEOUT_MS);
-  t.equal(app.initialConfig.requestTimeout, 30_000, 'requestTimeout is 30s');
+  t.equal((app.initialConfig as any).requestTimeout, 30_000, 'requestTimeout is 30s');
   t.equal(app.initialConfig.connectionTimeout, 31_000, 'connectionTimeout is 31s (1s above requestTimeout)');
   await app.close();
   t.end();

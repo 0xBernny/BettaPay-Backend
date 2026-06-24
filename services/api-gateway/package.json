@@ -22,6 +22,8 @@
   "devDependencies": {
     "@types/node": "^20.10.0",
     "@types/pg": "^8.20.0",
+    "@types/tape": "^5.8.1",
+    "tape": "^5.10.2",
     "typescript": "^5.3.3"
   }
 }
