@@ -2,7 +2,7 @@
  * Indexer Service — BettaPay Backend
  *
  * Listens to Soroban contract event streams and indexes payment/settlement events.
- * Polls the Stellar RPC for contract events on the SETTLEMENT_CONTRACT_ID.
+ * Supports monitoring multiple contracts via CONTRACT_IDS (comma-separated env var).
  *
  * Endpoints:
  *   GET  /api/events              — list indexed events (paginated, from DB)
@@ -36,7 +36,7 @@ import {
 import type { EventType } from '@bettapay/validation';
 
 const env = validateEnv(process.env);
-const PORT = Number(process.env.PORT ?? '3003');
+const PORT = Number(process.env.PORT ?? '3000');
 
 const fastify = Fastify({ logger: createLoggerOptions({ level: env.LOG_LEVEL }) });
 registerRequestId(fastify);
@@ -49,9 +49,6 @@ registerTracing(fastify);
 // Inter-service auth: internal endpoints require a valid x-service-token (#117).
 registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 
-<<<<<<< HEAD
-// Polling state
-=======
 fastify.register(rateLimit, {
   max: 500,
   timeWindow: '1 minute'
@@ -59,12 +56,11 @@ fastify.register(rateLimit, {
 
 // In-memory event ring buffer (50 events max)
 const events: any[] = [];
->>>>>>> 35d765e (.)
 let latestLedgerCursor: number | undefined = undefined;
 let latestLedgerSequence: number | undefined = undefined;
 const BASE_BACKOFF = 1000;
 const MAX_BACKOFF = 30000;
-let currentBackoff = BASE_BACKOFF;
+let currentBackoff: number = BASE_BACKOFF;
 
 // ── BullMQ webhook delivery queue ────────────────────────────────────────────
 
@@ -116,6 +112,33 @@ webhookQueue.on('error', (err) => {
   fastify.log.error({ err: err.message }, '[Indexer] Webhook queue error');
 });
 
+// ── Multi-contract config ────────────────────────────────────────────────────
+
+// validateEnv resolves CONTRACT_IDS as a string[] (falls back to SETTLEMENT_CONTRACT_ID
+// when the env var is unset).
+const CONTRACT_IDS: string[] = env.CONTRACT_IDS;
+
+fastify.log.info({ contracts: CONTRACT_IDS }, '[Indexer] Monitoring contract IDs');
+
+const CONTRACT_NAMES: Record<string, string> = (() => {
+  const raw = env.CONTRACT_NAMES ?? '';
+  const map: Record<string, string> = {};
+  raw.split(',').forEach((entry) => {
+    const trimmed = entry.trim();
+    if (!trimmed) return;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) return;
+    const id = trimmed.slice(0, eqIdx).trim();
+    const name = trimmed.slice(eqIdx + 1).trim();
+    if (id && name) map[id] = name;
+  });
+  return map;
+})();
+
+function getContractName(contractId: string): string {
+  return CONTRACT_NAMES[contractId] ?? 'unknown';
+}
+
 // ── XDR decoding ─────────────────────────────────────────────────────────────
 
 function serializeNative(value: unknown): unknown {
@@ -147,6 +170,7 @@ async function persistEvent(
   topics: string[],
   type: string,
   contractId: string,
+  contractName: string,
   rawValue: string,
   decodedPayload: unknown,
   ledger: number
@@ -158,6 +182,7 @@ async function persistEvent(
       id,
       stellarId,
       contractId,
+      contractName,
       topics,
       type,
       rawValue,
@@ -167,7 +192,7 @@ async function persistEvent(
     },
   });
 
-  fastify.log.info({ id, type, ledger }, '[Indexer] Event indexed');
+  fastify.log.info({ id, type, contractName, ledger }, '[Indexer] Event indexed');
 
   const subs = await prisma.webhookSubscription.findMany();
   for (const sub of subs) {
@@ -215,8 +240,8 @@ fastify.get('/api/events', { preValidation: [fastify.serviceAuth] }, async (requ
   return { events: dbEvents, total, limit, offset, hasMore, latestLedgerCursor };
 });
 
-<<<<<<< HEAD
-// Issue #68 — replay historical events for a ledger range
+// Issue #68 — replay historical events for a ledger range (all contracts)
+// Issue #76 — extended to iterate over all configured contract IDs
 const ReplayBody = z.object({
   fromLedger: z.number().int().min(1),
   toLedger: z.number().int().min(1),
@@ -227,65 +252,75 @@ const ReplayBody = z.object({
 fastify.post('/api/events/replay', async (request, reply) => {
   const { fromLedger, toLedger } = ReplayBody.parse(request.body);
 
+  fastify.register(rateLimit, {
+    max: 60,
+    timeWindow: '1 minute'
+  });
+
   let newEvents = 0;
   let skippedDuplicates = 0;
-  let cursor = fromLedger;
 
-  while (cursor <= toLedger) {
-    const response = await server.getEvents({
-      startLedger: cursor,
-      filters: [{ type: 'contract' as const, contractIds: [env.SETTLEMENT_CONTRACT_ID], topics: [] }],
-      limit: 100,
-    });
+  for (const contractId of CONTRACT_IDS) {
+    let cursor = fromLedger;
 
-    if (!response.events || response.events.length === 0) break;
+    while (cursor <= toLedger) {
+      const response = await server.getEvents({
+        startLedger: cursor,
+        filters: [{ type: 'contract' as const, contractIds: [contractId], topics: [] }],
+        limit: 100,
+      });
 
-    for (const evt of response.events) {
-      if (evt.ledger > toLedger) break;
-      cursor = Math.max(cursor, evt.ledger + 1);
+      if (!response.events || response.events.length === 0) break;
 
-      const topics = Array.isArray(evt.topic) ? evt.topic.map(String) : [String(evt.topic)];
-      const rawValue = evt.value.toXDR('base64');
-      const decodedPayload = decodeScVal(evt.value, topics[0]);
-      const contractId = evt.contractId ? evt.contractId.toString() : 'unknown';
-      const stellarId = typeof evt.id === 'string' ? evt.id : null;
+      for (const evt of response.events) {
+        if (evt.ledger > toLedger) break;
+        cursor = Math.max(cursor, evt.ledger + 1);
 
-      // Skip duplicates using Stellar's own event ID (most reliable key)
-      if (stellarId) {
-        const existing = await prisma.indexedEvent.findUnique({ where: { stellarId } });
-        if (existing) {
-          skippedDuplicates++;
-          continue;
+        const topics = Array.isArray(evt.topic) ? evt.topic.map(String) : [String(evt.topic)];
+        const rawValue = evt.value.toXDR('base64');
+        const decodedPayload = decodeScVal(evt.value, topics[0]);
+        const resolvedContractId = evt.contractId ? evt.contractId.toString() : contractId;
+        const contractName = getContractName(resolvedContractId);
+        const stellarId = typeof evt.id === 'string' ? evt.id : null;
+
+        // Skip duplicates using Stellar's own event ID (most reliable key)
+        if (stellarId) {
+          const existing = await prisma.indexedEvent.findUnique({ where: { stellarId } });
+          if (existing) {
+            skippedDuplicates++;
+            continue;
+          }
+        } else {
+          // Fall back to ledger + contractId + rawValue fingerprint
+          const existing = await prisma.indexedEvent.findFirst({
+            where: { ledger: evt.ledger, contractId: resolvedContractId, rawValue },
+          });
+          if (existing) {
+            skippedDuplicates++;
+            continue;
+          }
         }
-      } else {
-        // Fall back to ledger + contractId + rawValue fingerprint
-        const existing = await prisma.indexedEvent.findFirst({
-          where: { ledger: evt.ledger, contractId, rawValue },
+
+        await prisma.indexedEvent.create({
+          data: {
+            id: 'evt_' + crypto.randomUUID().replace(/-/g, ''),
+            stellarId,
+            contractId: resolvedContractId,
+            contractName,
+            topics,
+            type: topics[0],
+            rawValue,
+            decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
+            ledger: evt.ledger,
+            indexedAt: new Date(),
+          },
         });
-        if (existing) {
-          skippedDuplicates++;
-          continue;
-        }
+        newEvents++;
       }
 
-      await prisma.indexedEvent.create({
-        data: {
-          id: 'evt_' + crypto.randomUUID().replace(/-/g, ''),
-          stellarId,
-          contractId,
-          topics,
-          type: topics[0],
-          rawValue,
-          decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
-          ledger: evt.ledger,
-          indexedAt: new Date(),
-        },
-      });
-      newEvents++;
+      const lastEvt = response.events[response.events.length - 1];
+      if (lastEvt.ledger >= toLedger || response.events.length < 100) break;
     }
-
-    const lastEvt = response.events[response.events.length - 1];
-    if (lastEvt.ledger >= toLedger || response.events.length < 100) break;
   }
 
   return reply.code(200).send({ newEvents, skippedDuplicates });
@@ -322,22 +357,6 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, 
 
 // ── Stellar RPC polling loop ──────────────────────────────────────────────────
 
-=======
-fastify.route({
-  method: ['GET', 'POST'],
-  url: '/api/events/replay',
-  config: {
-    rateLimit: {
-      max: 60,
-      timeWindow: '1 minute'
-    }
-  },
-  handler: async (request, reply) => {
-    return { status: 'ok', replayed: true };
-  }
-});
-
->>>>>>> 35d765e (.)
 const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
 
 async function pollEvents() {
@@ -355,14 +374,12 @@ async function pollEvents() {
     }
 
     const response = await server.getEvents({
-      startLedger: latestLedgerCursor,
-      filters: [
-        {
-          type: 'contract' as const,
-          contractIds: [env.SETTLEMENT_CONTRACT_ID],
-          topics: [],
-        },
-      ],
+      startLedger: latestLedgerCursor ?? 0,
+      filters: CONTRACT_IDS.map((contractId) => ({
+        type: 'contract' as const,
+        contractIds: [contractId],
+        topics: [],
+      })),
       limit: 100,
     });
 
@@ -371,13 +388,16 @@ async function pollEvents() {
         const topics = Array.isArray(evt.topic) ? evt.topic.map(String) : [String(evt.topic)];
         const rawValue = evt.value.toXDR('base64');
         const decodedPayload = decodeScVal(evt.value, topics[0]);
-        const contractId = evt.contractId ? evt.contractId.toString() : 'unknown';
+        const resolvedContractId = evt.contractId ? evt.contractId.toString() : CONTRACT_IDS[0];
+        const contractName = getContractName(resolvedContractId);
         const stellarId = typeof evt.id === 'string' ? evt.id : null;
 
-        await persistEvent(stellarId, topics, topics[0], contractId, rawValue, decodedPayload, evt.ledger);
-        latestLedgerCursor = Math.max(latestLedgerCursor, evt.ledger + 1);
+        await persistEvent(stellarId, topics, topics[0], resolvedContractId, contractName, rawValue, decodedPayload, evt.ledger);
+        if (latestLedgerCursor !== undefined) {
+          latestLedgerCursor = Math.max(latestLedgerCursor, evt.ledger + 1);
+        }
       }
-    } else if (latestLedgerSequence !== undefined) {
+    } else if (latestLedgerSequence !== undefined && latestLedgerCursor !== undefined) {
       latestLedgerCursor = Math.max(latestLedgerCursor, latestLedgerSequence);
     }
 
@@ -414,7 +434,6 @@ const start = async () => {
   }
 };
 
-<<<<<<< HEAD
 process.on('SIGTERM', async () => {
   await prisma.$disconnect();
   await webhookQueue.close();
@@ -423,11 +442,8 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-start();
-=======
 if (process.env.NODE_ENV !== 'test') {
   start();
 }
 
 export { fastify };
->>>>>>> 35d765e (.)
