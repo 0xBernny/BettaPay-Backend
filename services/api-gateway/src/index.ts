@@ -35,6 +35,10 @@ import {
   SettlementEngineUnavailableError,
 } from './clients/settlement-client.js';
 import {
+  createFxClient,
+  FxEngineUnavailableError,
+} from './clients/fx-client.js';
+import {
   CreateMerchantBody,
   CreatePaymentBody,
   CreateSettlementBody,
@@ -84,6 +88,7 @@ interface CreatePaymentRouteBody {
   amount?: unknown;
   asset?: unknown;
   reference?: unknown;
+  convertTo?: unknown;
 }
 
 interface CreateSettlementRouteBody {
@@ -167,6 +172,12 @@ const indexerClient = createIndexerClient({
 
 const settlementClient = createSettlementClient({
   baseUrl: env.SETTLEMENT_ENGINE_URL,
+  serviceToken: env.INTER_SERVICE_SECRET,
+  logger: fastify.log,
+});
+
+const fxClient = createFxClient({
+  baseUrl: env.FX_ENGINE_URL,
   serviceToken: env.INTER_SERVICE_SECRET,
   logger: fastify.log,
 });
@@ -545,24 +556,81 @@ fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
     }
   }
 
-  // ── 4. Create the payment (with idempotency fields when a key was supplied) ──
+  // ── 4. Optionally fetch FX quote if convertTo is specified ────────────────
+  let fxQuote: { quoteId: string | null; rate: string; result: string; to: string; expiresAt: string } | null = null;
+
+  if (d.convertTo) {
+    const convertTo = String(d.convertTo).toUpperCase();
+    if (convertTo === d.asset.toUpperCase()) {
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          'convertTo must differ from the payment asset',
+          { asset: d.asset, convertTo }
+        )
+      );
+    }
+
+    try {
+      const fxResult = await fxClient.getQuote(d.asset, convertTo, d.amount, request.headers);
+      if (fxResult.status === 200) {
+        fxQuote = {
+          quoteId: fxResult.body.quoteId,
+          rate: fxResult.body.rate,
+          result: fxResult.body.result,
+          to: fxResult.body.to,
+          expiresAt: fxResult.body.expiresAt,
+        };
+        request.log.info(
+          { quoteId: fxResult.body.quoteId, from: d.asset, to: convertTo, rate: fxResult.body.rate },
+          'FX quote fetched for payment'
+        );
+      } else {
+        request.log.warn(
+          { status: fxResult.status, from: d.asset, to: convertTo },
+          'fx-engine returned non-200 for quote; proceeding without conversion'
+        );
+      }
+    } catch (err) {
+      if (err instanceof FxEngineUnavailableError) {
+        request.log.warn(
+          { err, from: d.asset, to: convertTo },
+          'fx-engine unavailable; proceeding without conversion'
+        );
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  // ── 5. Create the payment ──────────────────────────────────────────────────
   const idempotencyKeyExpiresAt = idempotencyKey
     ? new Date(Date.now() + IDEMPOTENCY_TTL_MS)
     : null;
 
-    const payment = await prisma.payment.create({
-      data: {
-        id: 'pay_' + crypto.randomUUID().replace(/-/g, ''),
-        merchantId: d.merchantId,
-        payerId: d.payerId,
-        amount: d.amount,
-        asset: d.asset,
-        reference: d.reference,
-        status: 'initiated',
-        idempotencyKey: idempotencyKey ?? undefined,
-        idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
-      },
-    });
+  const paymentData: Record<string, unknown> = {
+    id: 'pay_' + crypto.randomUUID().replace(/-/g, ''),
+    merchantId: d.merchantId,
+    payerId: d.payerId,
+    amount: d.amount,
+    asset: d.asset,
+    reference: d.reference,
+    status: 'initiated',
+    idempotencyKey: idempotencyKey ?? undefined,
+    idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
+  };
+
+  if (fxQuote) {
+    paymentData.convertTo = fxQuote.to;
+    paymentData.convertedAmount = fxQuote.result;
+    paymentData.fxRate = fxQuote.rate;
+    paymentData.fxQuoteId = fxQuote.quoteId;
+    paymentData.fxQuoteExpiresAt = new Date(fxQuote.expiresAt);
+  }
+
+  const payment = await prisma.payment.create({
+    data: paymentData as any,
+  });
 
     request.log.info(
       { idempotencyKey, paymentId: payment.id },

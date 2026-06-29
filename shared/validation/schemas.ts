@@ -191,6 +191,7 @@ export const CreatePaymentBody = z.object({
   asset: z.string().min(1, 'asset is required'),
   payerId: z.string().optional(),
   reference: z.string().optional(),
+  convertTo: z.string().min(1, 'convertTo must be a currency code').optional(),
 });
 
 export const CreateSettlementBody = z.object({
