@@ -107,3 +107,43 @@ export function buildPaymentOperation(params: { source?: string; destination: st
     amount: params.amount
   };
 }
+
+const UINT64_MAX = (2n ** 64n) - 1n;
+const HEX_32_BYTES = /^[0-9a-fA-F]{64}$/;
+
+/**
+ * Validates a Stellar transaction memo field.
+ *
+ * @param type  One of: "text" | "id" | "hash" | "return"
+ * @param value The memo value as a string
+ * @returns     true if the value is valid for the given type, false otherwise
+ *
+ * Validation rules:
+ *  - text:   UTF-8 encoded byte length must be ≤ 28
+ *  - id:     unsigned 64-bit integer (0 – 2^64-1), no sign, no decimals
+ *  - hash:   exactly 64 hexadecimal characters (32 bytes)
+ *  - return: exactly 64 hexadecimal characters (32 bytes)
+ */
+export function validateMemo(type: string, value: string): boolean {
+  switch (type) {
+    case 'text':
+      return Buffer.byteLength(value, 'utf8') <= 28;
+
+    case 'id': {
+      if (!/^\d+$/.test(value)) return false;
+      try {
+        const n = BigInt(value);
+        return n >= 0n && n <= UINT64_MAX;
+      } catch {
+        return false;
+      }
+    }
+
+    case 'hash':
+    case 'return':
+      return HEX_32_BYTES.test(value);
+
+    default:
+      return false;
+  }
+}
