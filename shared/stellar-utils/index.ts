@@ -34,6 +34,13 @@ export function formatAmount(amount: string, decimals: number = 7): string {
   }
 }
 
+/**
+ * Validate a Stellar transaction hash (64-character lowercase hex string)
+ */
+export function validateTransactionHash(hash: string): boolean {
+  return /^[0-9a-f]{64}$/.test(hash);
+}
+
 export function buildPaymentOperation(params: { source?: string; destination: string; asset: string; amount: string }){
   // Placeholder: return normalized operation object
   return {
