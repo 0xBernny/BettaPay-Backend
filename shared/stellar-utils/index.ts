@@ -3,10 +3,25 @@
  * Provides helpers for interacting with the Stellar blockchain
  */
 
-import { StrKey } from '@stellar/stellar-sdk';
+import { StrKey, Keypair } from '@stellar/stellar-sdk';
 
 export function validateStellarAddress(address: string): boolean {
   return StrKey.isValidEd25519PublicKey(address);
+}
+
+/**
+ * Generate a random Ed25519 Stellar keypair.
+ *
+ * The returned `secretKey` is the master seed and **must** be stored
+ * securely (e.g. encrypted at rest, environment variable, or secret
+ * manager). It must **never** be logged, included in error messages,
+ * or sent over unencrypted channels.
+ *
+ * @returns An object with `publicKey` (G…) and `secretKey` (S…).
+ */
+export function generateStellarKeypair(): { publicKey: string; secretKey: string } {
+  const keypair = Keypair.random();
+  return { publicKey: keypair.publicKey(), secretKey: keypair.secret() };
 }
 
 // Convert decimal string to stroops (string of integer stroops)
