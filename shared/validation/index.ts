@@ -36,6 +36,9 @@ export const EnvSchema = z.object({
   FX_ENGINE_URL: z.string().url().default('http://localhost:3002'),
   SETTLEMENT_ENGINE_URL: z.string().url().default('http://localhost:3001'),
   INDEXER_URL: z.string().url().default('http://localhost:3003'),
+
+  // Event retention configuration (days, 0 = disabled)
+  EVENT_RETENTION_DAYS: z.string().transform((s) => parseInt(s, 10)).default('0'),
 });
 
 export type Env = z.infer<typeof EnvSchema>;
