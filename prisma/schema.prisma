@@ -27,6 +27,7 @@ model Merchant {
   createdAt   DateTime     @default(now())
   deletedAt   DateTime?
   settings    Json?
+  secretHash  String?
   payments    Payment[]
   settlements Settlement[]
 }
@@ -59,6 +60,30 @@ model Settlement {
   feeBps      Int
   asset       String
   status      SettlementStatus @default(pending)
+  webhookUrl  String?
+  batchId     String?
   initiatedAt DateTime         @default(now())
   completedAt DateTime?
+}
+
+model IndexedEvent {
+  id             String   @id
+  stellarId      String?  @unique
+  contractId     String
+  topics         String[]
+  type           String
+  rawValue       String
+  decodedPayload Json?
+  ledger         Int
+  indexedAt      DateTime @default(now())
+
+  @@index([ledger])
+  @@index([type])
+  @@index([contractId])
+}
+
+model WebhookSubscription {
+  id        String   @id
+  url       String
+  createdAt DateTime @default(now())
 }

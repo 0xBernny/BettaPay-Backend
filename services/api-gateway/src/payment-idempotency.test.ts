@@ -1,7 +1,7 @@
 import test from 'tape';
 import Fastify, { type FastifyRequest } from 'fastify';
 import crypto from 'crypto';
-
+import { createErrorResponse, ErrorCodes } from '@bettapay/validation';
 // ---------------------------------------------------------------------------
 // Self-contained idempotency tests for POST /api/payments.
 //
@@ -54,14 +54,14 @@ function buildApp(opts: BuildOptions = {}) {
     // 1. Parse body
     const body = request.body;
     if (!body?.merchantId || !body?.amount || !body?.asset) {
-      return reply.code(400).send({ error: 'Invalid request payload' });
+      return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Invalid request payload'));
     }
 
     // 2. Read + validate idempotency key
     const idempotencyKey = readIdempotencyKey(request);
 
     if (idempotencyKey !== null && idempotencyKey.length > IDEMPOTENCY_KEY_MAX_LEN) {
-      return reply.code(400).send({ error: 'Idempotency-Key must not exceed 255 characters' });
+      return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Idempotency-Key must not exceed 255 characters'));
     }
 
     // 3. Check for existing non-expired record
@@ -93,7 +93,7 @@ function buildApp(opts: BuildOptions = {}) {
       if (existing) {
         return reply.code(200).send(existing);
       }
-      return reply.code(400).send({ error: 'Invalid request payload' });
+      return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Invalid request payload'));
     }
 
     const payment: FakePayment = {
@@ -265,7 +265,7 @@ test('7. Idempotency-Key exceeding 255 characters is rejected (400)', async (t) 
   });
 
   t.equal(res.statusCode, 400, 'returns 400 for oversized key');
-  t.ok(JSON.parse(res.body).error.includes('255'), 'error message mentions the limit');
+  t.ok(JSON.parse(res.body).error.message.includes('255'), 'error message mentions the limit');
 
   await app.close();
   t.end();

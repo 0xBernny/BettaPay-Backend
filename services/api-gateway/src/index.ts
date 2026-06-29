@@ -11,11 +11,15 @@
  *   GET    /api/merchants/:id        — fetch merchant (protected)
  *   DELETE /api/merchants/:id        — soft-delete merchant (protected)
  *   POST   /api/merchants/:id/restore — restore soft-deleted merchant (protected)
+ *   PATCH  /api/merchants/:id/settings — update merchant fee rules / settings (protected)
  *   POST   /api/payments             — initiate payment session (protected)
  *   GET    /api/payments/:id         — fetch payment session
  *   PATCH  /api/payments/:id/status  — transition payment status (protected)
  *   POST   /api/settlements          — trigger settlement (protected)
  *   GET    /api/deployments          — Soroban contract addresses (testnet)
+ *   GET    /api/rates                — proxy to FX engine (timeout-aware)
+ *   GET    /api/currencies           — proxy to FX engine (timeout-aware)
+ *   GET    /api/quote                — proxy to FX engine (timeout-aware)
  */
 
 import Fastify, { type FastifyRequest, type FastifyReply } from 'fastify';
@@ -23,18 +27,30 @@ import cors from '@fastify/cors';
 import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
-import { validateEnv } from '@bettapay/validation';
+import { z } from 'zod';
+import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
+import { createFxClient } from './clients/fx-client.js';
+import { createIndexerClient } from './clients/indexer-client.js';
+import {
+  createSettlementClient,
+  SettlementEngineUnavailableError,
+} from './clients/settlement-client.js';
 import {
   CreateMerchantBody,
   CreatePaymentBody,
   CreateSettlementBody,
   AuthTokenBody,
-  UpdatePaymentStatusBody
+  UpdatePaymentStatusBody,
+  UpdateMerchantSettingsBody,
+  createErrorResponse,
+  ErrorCodes,
+  registerErrorHandler
 } from '@bettapay/validation';
 import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import helmet from '@fastify/helmet';
 import { PrismaPg } from '@prisma/adapter-pg';
+import { fetchUpstream, UpstreamTimeoutError } from './upstream-fetch.js';
 
 declare module 'fastify' {
   export interface FastifyInstance {
@@ -52,6 +68,7 @@ interface PaymentParams {
 
 interface AuthTokenRouteBody {
   merchantId?: unknown;
+  secret?: unknown;
 }
 
 interface CreateMerchantRouteBody {
@@ -59,6 +76,7 @@ interface CreateMerchantRouteBody {
   name?: unknown;
   ownerId?: unknown;
   settings?: unknown;
+  secret?: unknown;
 }
 
 interface CreatePaymentRouteBody {
@@ -66,6 +84,7 @@ interface CreatePaymentRouteBody {
   payerId?: unknown;
   amount?: unknown;
   asset?: unknown;
+  convertTo?: unknown;
   reference?: unknown;
 }
 
@@ -73,6 +92,12 @@ interface CreateSettlementRouteBody {
   merchantId?: unknown;
   amount?: unknown;
   asset?: unknown;
+  items?: unknown;
+}
+
+interface UpdateMerchantSettingsRouteBody {
+  feeBps?: unknown;
+  tier?: unknown;
 }
 
 interface UpdatePaymentStatusRouteBody {
@@ -87,6 +112,16 @@ const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
   failed: [],
   cancelled: [],
 };
+
+const IDEMPOTENCY_KEY_MAX_LEN = 255;
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function readIdempotencyKey(request: FastifyRequest): string | null {
+  const raw = request.headers['idempotency-key'];
+  if (!raw) return null;
+  const key = Array.isArray(raw) ? raw[0] : raw;
+  return (key as string).trim() || null;
+}
 
 const isProduction = process.env.NODE_ENV === 'production';
 
@@ -109,15 +144,39 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const CONNECTION_TIMEOUT_MS = 31_000;
 
 const fastify = Fastify({
-  logger: true,
+  logger: createLoggerOptions({ level: env.LOG_LEVEL }),
   requestTimeout: REQUEST_TIMEOUT_MS,
   connectionTimeout: CONNECTION_TIMEOUT_MS,
   // Limit request body size to 1MB (1,048,576 bytes) to protect the API gateway
   // from oversized payload attacks and align with typical financial transaction payload sizes.
   bodyLimit: 1_048_576,
-  genReqId: function (req) {
-    return (req.headers['x-request-id'] as string) || crypto.randomUUID();
-  }
+});
+
+registerRequestId(fastify);
+
+registerErrorHandler(fastify);
+// Distributed tracing: normalise x-request-id / x-trace-id and bind to the
+// request logger so trace context is logged and propagated downstream (#118).
+registerTracing(fastify);
+
+// Indexer HTTP client for optional on-chain event enrichment (Issue #116).
+// Enrichment is best-effort: indexer failures degrade to payment-only responses.
+const indexerClient = createIndexerClient({
+  baseUrl: env.INDEXER_URL,
+  serviceToken: env.INTER_SERVICE_SECRET,
+  logger: fastify.log,
+});
+
+const settlementClient = createSettlementClient({
+  baseUrl: env.SETTLEMENT_ENGINE_URL,
+  serviceToken: env.INTER_SERVICE_SECRET,
+  logger: fastify.log,
+});
+
+const fxClient = createFxClient({
+  baseUrl: env.FX_ENGINE_URL,
+  serviceToken: env.INTER_SERVICE_SECRET,
+  logger: fastify.log,
 });
 
 // --- Response logging hooks -------------------------------------------------
@@ -187,7 +246,7 @@ fastify.addHook('onRequest', async (request, reply) => {
   // client connection is freed.) The timer is cleared in the onResponse hook below.
   const timeoutTimer = setTimeout(() => {
     if (!reply.sent) {
-      reply.code(408).send({ error: 'Request Timeout' });
+      reply.code(408).send(createErrorResponse(ErrorCodes.REQUEST_TIMEOUT, 'Request Timeout'));
     }
   }, REQUEST_TIMEOUT_MS);
   (request as any).__timeoutTimer = timeoutTimer;
@@ -231,15 +290,20 @@ fastify.addHook('onSend', async (request, reply, payload) => {
   return payload;
 });
 
+function hashSecret(secret: string): string {
+  return crypto.createHash('sha256').update(secret).digest('hex');
+}
+
 const pool = new pg.Pool({ connectionString: env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter });
+const prisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
+setupPrismaQueryLogging(prisma, fastify.log);
 
 // Setup plugins
 fastify.register(helmet, { contentSecurityPolicy: false, hsts: { maxAge: 31536000 }, referrerPolicy: { policy: 'no-referrer' } });
 
 fastify.register(cors, {
-  origin: env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  origin: env.ALLOWED_ORIGINS
 });
 
 fastify.register(fastifyJwt, {
@@ -253,7 +317,12 @@ fastify.register(fastifyJwt, {
 fastify.register(rateLimit, {
   max: 1000,
   timeWindow: '1 minute',
-  addHeaders: true
+  addHeaders: {
+    'x-ratelimit-limit': true,
+    'x-ratelimit-remaining': true,
+    'x-ratelimit-reset': true,
+    'retry-after': true
+  }
 });
 
 fastify.register(rateLimit, {
@@ -275,13 +344,15 @@ async function logRequestBody(request: FastifyRequest, reply: FastifyReply) {
   }
 }
 
+
+
 // Authentication hook
 fastify.decorate('authenticate', async function (request: FastifyRequest, reply: FastifyReply) {
   try {
     await request.jwtVerify();
   } catch (err) {
     request.log.error(err);
-    reply.code(401).send({ error: 'Unauthorized' });
+    reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 });
 
@@ -336,18 +407,21 @@ fastify.get('/api/health', async (request, reply) => {
 });
 
 fastify.post<{ Body: AuthTokenRouteBody }>('/api/auth/token', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
-  try {
     const d = AuthTokenBody.parse(request.body);
     const merchant = await prisma.merchant.findFirst({ where: { id: d.merchantId, deletedAt: null } });
-    if (!merchant) return reply.code(404).send({ error: 'Merchant not found' });
 
-    // In a real system, you would verify the secret/password here.
-    // For this example, we'll just issue a token if the merchant exists.
+    const storedHash = merchant?.secretHash || '0'.repeat(64);
+    const inputHash = hashSecret(d.secret);
+    const hashBuffer = Buffer.from(storedHash, 'hex');
+    const inputBuffer = Buffer.from(inputHash, 'hex');
+
+    const isValid = merchant && merchant.secretHash && crypto.timingSafeEqual(hashBuffer, inputBuffer);
+    if (!isValid) {
+      return reply.code(401).send({ error: 'Invalid credentials' });
+    }
+
     const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
     return reply.send({ token });
-  } catch (error) {
-    return reply.code(400).send({ error: 'Invalid request payload' });
-  }
 });
 
 // Merchants
@@ -356,20 +430,19 @@ fastify.post<{ Body: CreateMerchantRouteBody }>('/api/merchants', {
   preHandler: [logRequestBody],
   config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
 }, async (request, reply) => {
-  try {
     const d = CreateMerchantBody.parse(request.body);
+    const secret = d.secret || crypto.randomBytes(24).toString('hex');
+    const secretHash = hashSecret(secret);
     const merchant = await prisma.merchant.create({
       data: {
         id: d.id,
         name: d.name,
-        ownerId: d.ownerId || 'unknown',
-        settings: d.settings ?? {},
+        ownerId: d.ownerId,
+        settings: d.settings as any ?? {},
+        secretHash,
       }
     });
-    return reply.code(201).send({ success: true, merchant });
-  } catch (error) {
-    return reply.code(400).send({ error: 'Invalid request payload' });
-  }
+    return reply.code(201).send({ success: true, merchant, secret });
 });
 
 fastify.get<{ Params: MerchantParams }>('/api/merchants/:id', {
@@ -379,7 +452,7 @@ fastify.get<{ Params: MerchantParams }>('/api/merchants/:id', {
   const merchant = await prisma.merchant.findFirst({
     where: { id, deletedAt: null },
   });
-  if (!merchant) return reply.code(404).send({ error: 'Merchant not found' });
+  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
   return merchant;
 });
 
@@ -391,7 +464,7 @@ fastify.delete<{ Params: MerchantParams }>('/api/merchants/:id', {
   const merchant = await prisma.merchant.findFirst({
     where: { id, deletedAt: null },
   });
-  if (!merchant) return reply.code(404).send({ error: 'Merchant not found' });
+  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
 
   await prisma.merchant.update({
     where: { id },
@@ -407,9 +480,9 @@ fastify.post<{ Params: MerchantParams }>('/api/merchants/:id/restore', {
 }, async (request, reply) => {
   const { id } = request.params;
   const merchant = await prisma.merchant.findUnique({ where: { id } });
-  if (!merchant) return reply.code(404).send({ error: 'Merchant not found' });
+  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
   if (!merchant.deletedAt) {
-    return reply.code(400).send({ error: 'Merchant is not soft-deleted' });
+    return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Merchant is not soft-deleted'));
   }
 
   const restored = await prisma.merchant.update({
@@ -420,16 +493,30 @@ fastify.post<{ Params: MerchantParams }>('/api/merchants/:id/restore', {
   return reply.code(200).send({ success: true, merchant: restored });
 });
 
-// Idempotency-Key header validation: optional, 1–255 characters, no control chars.
-const IDEMPOTENCY_KEY_MAX_LEN = 255;
-const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+// Update per-merchant settings (fee rules, tier). Merges into existing settings so
+// a partial update does not wipe unrelated keys. The settlement engine reads
+// settings.feeBps from here when computing fees.
+fastify.patch<{ Params: MerchantParams; Body: UpdateMerchantSettingsRouteBody }>('/api/merchants/:id/settings', {
+  preValidation: [fastify.authenticate],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const d = UpdateMerchantSettingsBody.parse(request.body);
 
-function readIdempotencyKey(request: FastifyRequest): string | null {
-  const raw = request.headers['idempotency-key'];
-  if (!raw) return null;
-  const key = Array.isArray(raw) ? raw[0] : raw;
-  return key.trim() || null;
-}
+  const { id } = request.params;
+  const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
+  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+
+  const currentSettings = (merchant.settings ?? {}) as Record<string, unknown>;
+  const nextSettings = { ...currentSettings, ...d };
+
+  const updated = await prisma.merchant.update({
+    where: { id },
+    data: { settings: nextSettings as object },
+  });
+
+  return reply.code(200).send({ success: true, merchant: updated });
+});
 
 // Payments
 fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
@@ -438,18 +525,13 @@ fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
   config: { rateLimit: { max: 300, timeWindow: '1 minute' } }
 }, async (request, reply) => {
   // ── 1. Parse and validate request body ──────────────────────────────────────
-  let d: ReturnType<typeof CreatePaymentBody.parse>;
-  try {
-    d = CreatePaymentBody.parse(request.body);
-  } catch {
-    return reply.code(400).send({ error: 'Invalid request payload' });
-  }
+  const d = CreatePaymentBody.parse(request.body);
 
   // ── 2. Read and validate optional Idempotency-Key header ────────────────────
   const idempotencyKey = readIdempotencyKey(request);
 
   if (idempotencyKey !== null && idempotencyKey.length > IDEMPOTENCY_KEY_MAX_LEN) {
-    return reply.code(400).send({ error: 'Idempotency-Key must not exceed 255 characters' });
+    return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Idempotency-Key must not exceed 255 characters'));
   }
 
   // ── 3. Idempotency check: look for a non-expired record with the same key ───
@@ -476,7 +558,13 @@ fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
     ? new Date(Date.now() + IDEMPOTENCY_TTL_MS)
     : null;
 
-  try {
+    const fxQuote = d.convertTo
+      ? await fxClient.getQuote(
+          { from: d.asset, to: d.convertTo, amount: d.amount },
+          request.headers,
+        )
+      : null;
+
     const payment = await prisma.payment.create({
       data: {
         id: 'pay_' + crypto.randomUUID().replace(/-/g, ''),
@@ -496,38 +584,27 @@ fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
       idempotencyKey ? 'Idempotency miss — payment created' : 'Payment created (no idempotency key)'
     );
 
-    return reply.code(201).send(payment);
-
-  } catch (error: any) {
-    // ── 5. Race-safety: two concurrent requests with the same key may both pass
-    //       the findFirst check. The second create will hit the @unique constraint
-    //       (Prisma error code P2002). Re-fetch the winning row and return 200.
-    if (error?.code === 'P2002' && idempotencyKey !== null) {
-      const existing = await prisma.payment.findFirst({
-        where: {
-          idempotencyKey,
-          idempotencyKeyExpiresAt: { gt: new Date() },
-        },
-      });
-
-      if (existing) {
-        request.log.warn(
-          { idempotencyKey, paymentId: existing.id },
-          'Idempotency race resolved — returning existing payment'
-        );
-        return reply.code(200).send(existing);
-      }
+    if (d.convertTo) {
+      return reply.code(201).send({ ...payment, fxQuote });
     }
 
-    request.log.error({ error }, 'Payment creation failed');
-    return reply.code(400).send({ error: 'Invalid request payload' });
-  }
+    return reply.code(201).send(payment);
 });
 
-fastify.get<{ Params: PaymentParams }>('/api/payments/:id', async (request, reply) => {
+fastify.get<{ Params: PaymentParams; Querystring: { includeEvents?: string } }>('/api/payments/:id', async (request, reply) => {
   const { id } = request.params;
   const payment = await prisma.payment.findUnique({ where: { id } });
-  if (!payment) return reply.code(404).send({ error: 'Payment not found' });
+  if (!payment) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Payment not found'));
+
+  // Optional on-chain event enrichment (?includeEvents=true). The indexer is an
+  // enrichment source only: if it is unavailable, `events` is null and the
+  // payment is still returned so the endpoint never fails on indexer issues.
+  if (request.query.includeEvents === 'true') {
+    // Forward tracing headers so the indexer call is part of the same trace (#118).
+    const events = await indexerClient.getPaymentEvents(payment.merchantId, request.headers);
+    return { ...payment, events };
+  }
+
   return payment;
 });
 
@@ -538,24 +615,18 @@ fastify.patch<{ Params: PaymentParams; Body: UpdatePaymentStatusRouteBody }>('/a
   preHandler: [logRequestBody],
   config: { rateLimit: { max: 300, timeWindow: '1 minute' } }
 }, async (request, reply) => {
-  let d: UpdatePaymentStatusBody;
-  try {
-    d = UpdatePaymentStatusBody.parse(request.body);
-  } catch (error) {
-    return reply.code(400).send({ error: 'Invalid request payload' });
-  }
+  const d = UpdatePaymentStatusBody.parse(request.body);
 
   const { id } = request.params;
   const payment = await prisma.payment.findUnique({ where: { id } });
-  if (!payment) return reply.code(404).send({ error: 'Payment not found' });
+  if (!payment) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Payment not found'));
 
   const allowed = PAYMENT_STATUS_TRANSITIONS[payment.status] ?? [];
   if (!allowed.includes(d.status)) {
-    return reply.code(422).send({
-      error: 'Invalid status transition',
+    return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid status transition', {
       from: payment.status,
       to: d.status,
-    });
+    }));
   }
 
   const updated = await prisma.payment.update({
@@ -566,26 +637,131 @@ fastify.patch<{ Params: PaymentParams; Body: UpdatePaymentStatusRouteBody }>('/a
 });
 
 // Settlements
+fastify.get('/api/settlements', {
+  preValidation: [fastify.authenticate],
+  config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const { merchantId, from, to } = request.query as { merchantId?: string; from?: string; to?: string };
+  const where: any = {};
+  if (merchantId) {
+    where.merchantId = merchantId;
+  }
+  if (from || to) {
+    where.initiatedAt = {};
+    if (from) {
+      where.initiatedAt.gte = new Date(from);
+    }
+    if (to) {
+      where.initiatedAt.lte = new Date(to);
+    }
+  }
+
+  const records = await prisma.settlement.findMany({
+    where,
+    orderBy: { initiatedAt: 'desc' },
+  });
+  return { settlements: records, total: records.length };
+});
+
 fastify.post<{ Body: CreateSettlementRouteBody }>('/api/settlements', {
   preValidation: [fastify.authenticate],
   preHandler: [logRequestBody],
   config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
 }, async (request, reply) => {
-  try {
     const d = CreateSettlementBody.parse(request.body);
-    const settlement = await prisma.settlement.create({
-      data: {
-        id: 'set_' + crypto.randomUUID().replace(/-/g, ''),
-        merchantId: d.merchantId,
-        totalAmount: d.amount,
-        asset: d.asset,
-        status: 'pending',
+    const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
+    
+    if (!merchant) {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+    }
+
+    const settings = merchant.settings as {
+      webhookUrl?: string;
+      minSettlementAmount?: string;
+      maxSettlementAmount?: string;
+      dailySettlementLimit?: string;
+    } | null | undefined;
+
+    // Normalize to items array (backward compatibility: single amount/asset becomes single-item batch)
+    const items = d.items || (d.amount && d.asset ? [{ amount: d.amount, asset: d.asset }] : []);
+
+    // Validate each settlement item against merchant limits
+    for (const item of items) {
+      const amount = parseFloat(item.amount);
+
+      // Check minimum settlement amount
+      if (settings?.minSettlementAmount) {
+        const minAmount = parseFloat(settings.minSettlementAmount);
+        if (amount < minAmount) {
+          return reply.code(422).send(createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            `Settlement amount ${item.amount} is below minimum ${settings.minSettlementAmount}`,
+            { amount: item.amount, minSettlementAmount: settings.minSettlementAmount }
+          ));
+        }
       }
-    });
-    return reply.code(201).send(settlement);
-  } catch (error) {
-    return reply.code(400).send({ error: 'Invalid request payload' });
-  }
+
+      // Check maximum settlement amount
+      if (settings?.maxSettlementAmount) {
+        const maxAmount = parseFloat(settings.maxSettlementAmount);
+        if (amount > maxAmount) {
+          return reply.code(422).send(createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            `Settlement amount ${item.amount} exceeds maximum ${settings.maxSettlementAmount}`,
+            { amount: item.amount, maxSettlementAmount: settings.maxSettlementAmount }
+          ));
+        }
+      }
+    }
+
+    // Check daily settlement limit (aggregate all assets)
+    if (settings?.dailySettlementLimit) {
+      const todayStart = new Date();
+      todayStart.setHours(0, 0, 0, 0);
+
+      const todaySettlements = await prisma.settlement.findMany({
+        where: {
+          merchantId: d.merchantId,
+          initiatedAt: { gte: todayStart },
+        },
+        select: {
+          totalAmount: true
+        }
+      });
+
+      const currentDailyTotal = todaySettlements.reduce((sum: number, s: { totalAmount: string }) => sum + parseFloat(s.totalAmount), 0);
+      const requestTotal = items.reduce((sum: number, item: any) => sum + parseFloat(item.amount), 0);
+      const newDailyTotal = currentDailyTotal + requestTotal;
+      const dailyLimit = parseFloat(settings.dailySettlementLimit);
+
+      if (newDailyTotal > dailyLimit) {
+        return reply.code(422).send(createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          `Daily settlement limit exceeded. Current: ${currentDailyTotal}, Requested: ${requestTotal}, Limit: ${settings.dailySettlementLimit}`,
+          {
+            currentDailyTotal: currentDailyTotal.toString(),
+            requestedAmount: requestTotal.toString(),
+            dailySettlementLimit: settings.dailySettlementLimit,
+          }
+        ));
+      }
+    }
+
+    try {
+      const settlementResponse = await settlementClient.createSettlement(d, request.headers);
+      return reply
+        .code(settlementResponse.status)
+        .type(settlementResponse.contentType)
+        .send(settlementResponse.body);
+    } catch (err) {
+      if (err instanceof SettlementEngineUnavailableError) {
+        request.log.warn({ err }, 'settlement-engine unavailable during settlement creation');
+        return reply
+          .code(504)
+          .send(createErrorResponse(ErrorCodes.GATEWAY_TIMEOUT, 'Settlement engine unavailable'));
+      }
+      throw err;
+    }
 });
 
 fastify.get('/api/deployments', async (request, reply) => {
@@ -605,6 +781,36 @@ fastify.get('/api/deployments', async (request, reply) => {
     ],
     updatedAt: new Date().toISOString(),
   };
+});
+
+async function proxyFxUpstream(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  path: string
+) {
+  const targetUrl = new URL(path, env.FX_ENGINE_URL).toString();
+
+  try {
+    const response = await fetchUpstream(request, targetUrl, {}, request.log);
+    const body = await response.text();
+    const contentType = response.headers.get('content-type') ?? 'application/json';
+    return reply.code(response.status).type(contentType).send(body);
+  } catch (err) {
+    if (err instanceof UpstreamTimeoutError) {
+      return reply
+        .code(504)
+        .send(createErrorResponse(ErrorCodes.GATEWAY_TIMEOUT, 'Gateway Timeout'));
+    }
+    throw err;
+  }
+}
+
+fastify.get('/api/rates', async (request, reply) => proxyFxUpstream(request, reply, '/api/rates'));
+fastify.get('/api/currencies', async (request, reply) => proxyFxUpstream(request, reply, '/api/currencies'));
+fastify.get('/api/quote', async (request, reply) => {
+  const query = new URLSearchParams(request.query as Record<string, string>).toString();
+  const path = query ? `/api/quote?${query}` : '/api/quote';
+  return proxyFxUpstream(request, reply, path);
 });
 
 // Graceful shutdown
@@ -631,15 +837,22 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 const start = async () => {
   try {
+    await connectWithRetry(prisma, fastify.log);
+
     // Seed admin merchant
+    const adminSecret = env.ADMIN_SECRET;
+    const adminSecretHash = hashSecret(adminSecret);
     await prisma.merchant.upsert({
       where: { id: env.ADMIN_ADDRESS },
-      update: {},
+      update: {
+        secretHash: adminSecretHash
+      },
       create: {
         id: env.ADMIN_ADDRESS,
         name: 'BettaPay Merchant LLC',
         ownerId: 'admin-user-001',
         settings: { preferredAsset: 'USDC', autoSettle: true },
+        secretHash: adminSecretHash
       }
     });
 

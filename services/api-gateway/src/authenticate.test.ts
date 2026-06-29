@@ -2,7 +2,7 @@ import test from 'tape';
 import Fastify from 'fastify';
 import fastifyJwt from '@fastify/jwt';
 import { FastifyRequest, FastifyReply } from 'fastify';
-
+import { createErrorResponse, ErrorCodes } from '@bettapay/validation';
 test('authenticate decorator should return generic 401 on invalid JWT', async (t) => {
   const fastify = Fastify({ logger: false });
 
@@ -17,7 +17,7 @@ test('authenticate decorator should return generic 401 on invalid JWT', async (t
       await request.jwtVerify();
     } catch (err) {
       request.log.error(err);
-      reply.code(401).send({ error: 'Unauthorized' });
+      reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
     }
   });
 
@@ -35,7 +35,7 @@ test('authenticate decorator should return generic 401 on invalid JWT', async (t
 
     t.equal(response1.statusCode, 401, 'Status code should be 401');
     const body1 = JSON.parse(response1.body);
-    t.equal(body1.error, 'Unauthorized', 'Error message should be generic "Unauthorized"');
+    t.equal(body1.error.message, 'Unauthorized', 'Error message should be generic "Unauthorized"');
     t.notOk(response1.body.includes('fast-jwt'), 'Response should not contain fast-jwt error details');
     t.notOk(response1.body.includes('ERR_'), 'Response should not contain error codes');
 
@@ -47,7 +47,7 @@ test('authenticate decorator should return generic 401 on invalid JWT', async (t
 
     t.equal(response2.statusCode, 401, 'Status code should be 401 for missing auth');
     const body2 = JSON.parse(response2.body);
-    t.equal(body2.error, 'Unauthorized', 'Error message should be generic "Unauthorized" for missing auth');
+    t.equal(body2.error.message, 'Unauthorized', 'Error message should be generic "Unauthorized" for missing auth');
     t.notOk(response2.body.includes('Missing'), 'Response should not contain "Missing" error text');
 
     // Test 3: Valid JWT token should pass through
@@ -63,7 +63,7 @@ test('authenticate decorator should return generic 401 on invalid JWT', async (t
     await fastify.close();
     t.end();
   } catch (err) {
-    t.fail(err);
+    t.fail(err as any);
     await fastify.close();
     t.end();
   }

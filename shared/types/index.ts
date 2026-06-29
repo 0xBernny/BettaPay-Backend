@@ -5,12 +5,7 @@ export * from '@bettapay/validation';
 export type Json = string | number | boolean | null | { [key: string]: Json } | Json[];
 export type ID = string;
 export type Currency = string;
-
-export const EVENT_TYPES = [
-  'PaymentInitiated',
-  'PaymentCompleted',
-  'SettlementTriggered',
-  'FXExecuted',
-  'BillPaid',
-  'AnchorSettled'
-] as const;
+/** Arbitrary-precision decimal amount encoded as a numeric string, e.g. "1500.50". */
+export type Amount = string;
+/** Integer Stellar stroop amount encoded as a string, e.g. "15005000000". */
+export type Stroops = string;

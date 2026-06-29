@@ -9,11 +9,14 @@
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-precision.test.ts"
+    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-precision.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/genReqId-usage.test.ts"
   },
   "dependencies": {
+    "@bettapay/shared-types": "workspace:^",
     "@bettapay/validation": "workspace:*",
     "@fastify/cors": "^11.2.0",
+    "@fastify/helmet": "^12.0.0",
+    "@fastify/rate-limit": "^10.0.0",
     "@prisma/client": "^7.8.0",
     "bignumber.js": "^9.1.0",
     "bullmq": "^5.79.1",
