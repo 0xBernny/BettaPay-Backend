@@ -14,6 +14,7 @@ export const merchantSchema = z.object({
     name: z.string(),
     ownerId: idSchema,
     createdAt: isoDateString,
+    deletedAt: isoDateString.optional(),
     settings: z.record(z.any()).optional()
 });
 export const walletSchema = z.object({
@@ -53,6 +54,7 @@ export const settlementSchema = z.object({
     netAmount: z.string(),
     feeBps: z.number(),
     asset: z.string(),
+    batchId: z.string().optional(),
     initiatedAt: isoDateString,
     completedAt: isoDateString.optional(),
     status: z.enum(['pending', 'processing', 'completed', 'failed']),
@@ -134,12 +136,30 @@ export function parseEvent(raw) {
 export function safeParseEvent(raw) {
     return eventSchemas.safeParse(raw);
 }
+// ─── Webhook URL validation ───────────────────────────────────────────────────
+const PRIVATE_HOST_PATTERN = /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|::1|\[::1\]|0\.0\.0\.0)$/i;
+function isPrivateOrLocalhost(urlString) {
+    try {
+        const { hostname } = new URL(urlString);
+        return PRIVATE_HOST_PATTERN.test(hostname);
+    }
+    catch {
+        return false;
+    }
+}
+export const WebhookUrlSchema = z
+    .string()
+    .url('Webhook URL must be a valid URL')
+    .max(2048, 'Webhook URL must not exceed 2048 characters')
+    .refine((url) => process.env.NODE_ENV !== 'production' || url.startsWith('https://'), 'Webhook URL must use HTTPS in production')
+    .refine((url) => process.env.NODE_ENV !== 'production' || !isPrivateOrLocalhost(url), 'Webhook URL must not point to localhost or private IP addresses');
 // ─── Request Body Schemas (used by API Gateway route handlers) ────────────────
 export const CreateMerchantBody = z.object({
     id: z.string().min(1, 'id is required'),
     name: z.string().min(1, 'name is required'),
     ownerId: z.string().optional(),
     settings: z.record(z.unknown()).optional(),
+    secret: z.string().optional(),
 });
 export const CreatePaymentBody = z.object({
     merchantId: z.string().min(1, 'merchantId is required'),
@@ -150,11 +170,62 @@ export const CreatePaymentBody = z.object({
 });
 export const CreateSettlementBody = z.object({
     merchantId: z.string().min(1, 'merchantId is required'),
-    amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
-    asset: z.string().min(1, 'asset is required'),
+    amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').optional(),
+    asset: z.string().min(1, 'asset is required').optional(),
+    items: z.array(z.object({
+        amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
+        asset: z.string().min(1, 'asset is required'),
+    })).optional(),
+}).refine((data) => {
+    // Either single amount/asset OR items array must be provided, not both
+    const hasSingleAsset = data.amount && data.asset;
+    const hasItems = data.items && data.items.length > 0;
+    return (hasSingleAsset && !hasItems) || (!hasSingleAsset && hasItems);
+}, {
+    message: 'Provide either amount/asset OR items array, not both',
 });
 export const AuthTokenBody = z.object({
     merchantId: z.string().min(1, 'merchantId is required'),
     secret: z.string().min(1, 'secret is required'),
 });
+// A payment may only be moved into a terminal state. `initiated` is never an
+// accepted target (payments start there at creation), so it is excluded here.
+export const UpdatePaymentStatusBody = z.object({
+    status: z.enum(['completed', 'failed', 'cancelled']),
+});
+// Per-merchant fee rule configuration. feeBps is basis points (1% = 100 bps),
+// capped at 10000 (100%). Unknown keys are stripped; the route merges these into
+// the merchant's existing settings rather than replacing them.
+export const UpdateMerchantSettingsBody = z.object({
+    feeBps: z.number().int().min(0).max(10000).optional(),
+    tier: z.string().optional(),
+    minSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'minSettlementAmount must be a numeric string').optional(),
+    maxSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'maxSettlementAmount must be a numeric string').optional(),
+    dailySettlementLimit: z.string().regex(/^\d+(\.\d+)?$/, 'dailySettlementLimit must be a numeric string').optional(),
+    webhookUrl: WebhookUrlSchema.optional(),
+});
+export const PaginationQuery = z.object({
+    limit: z.coerce.number().max(200).default(50),
+    offset: z.coerce.number().min(0).default(0),
+});
+export const SettlementListQuery = PaginationQuery.extend({
+    status: z.enum(['pending', 'processing', 'completed', 'failed']).optional(),
+    from: isoDateString.optional(),
+    to: isoDateString.optional(),
+}).refine((data) => !data.from || !data.to || data.from <= data.to, { message: 'from must be before to' });
+export const DateRangeQuery = z
+    .object({
+    from: isoDateString.optional(),
+    to: isoDateString.optional().default(() => new Date().toISOString())
+})
+    .refine((data) => !data.from || !data.to || data.from <= data.to, { message: "from must be before to" });
+// ─── Indexer types ────────────────────────────────────────────────────────────
+export const EVENT_TYPES = [
+    'PaymentInitiated',
+    'PaymentCompleted',
+    'SettlementTriggered',
+    'FXExecuted',
+    'BillPaid',
+    'AnchorSettled'
+];
 //# sourceMappingURL=schemas.js.map

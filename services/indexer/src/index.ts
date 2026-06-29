@@ -27,6 +27,7 @@ import {
   registerServiceAuth,
   PaginationQuery,
   EVENT_TYPES,
+  WebhookUrlSchema,
   connectWithRetry,
   createLoggerOptions,
   registerTracing,
@@ -276,7 +277,7 @@ fastify.post('/api/events/replay', async (request, reply) => {
 
 // Issue #70 — webhook subscription CRUD
 const WebhookBody = z.object({
-  url: z.string().url('url must be a valid URL'),
+  url: WebhookUrlSchema,
 });
 
 fastify.post('/api/webhooks', async (request, reply) => {
