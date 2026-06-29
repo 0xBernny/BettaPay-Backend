@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { CurrencyCode } from './currency.js';
 
 // Entity schemas
 export const idSchema = z.string().min(1);
@@ -32,7 +33,7 @@ export const walletSchema = z.object({
   id: idSchema,
   ownerId: idSchema,
   address: z.string(),
-  asset: z.string(),
+  asset: CurrencyCode,
   balance: z.string()
 });
 
@@ -40,9 +41,9 @@ export const transactionSchema = z.object({
   id: idSchema,
   type: z.enum(['payment','settlement','anchor_transfer','fx']),
   amount: z.string(),
-  asset: z.string(),
-  from: z.string().nullable(),
-  to: z.string().nullable(),
+  asset: CurrencyCode,
+  from: CurrencyCode.nullable(),
+  to: CurrencyCode.nullable(),
   createdAt: isoDateString,
   metadata: z.record(z.any()).optional()
 });
@@ -52,7 +53,7 @@ export const paymentSchema = z.object({
   merchantId: idSchema,
   payerId: idSchema.optional(),
   amount: z.string(),
-  asset: z.string(),
+  asset: CurrencyCode,
   status: z.enum(['initiated','completed','failed','cancelled']),
   createdAt: isoDateString,
   reference: z.string().optional(),
@@ -67,7 +68,7 @@ export const settlementSchema = z.object({
   feeAmount: z.string(),
   netAmount: z.string(),
   feeBps: z.number(),
-  asset: z.string(),
+  asset: CurrencyCode,
   batchId: z.string().optional(),
   initiatedAt: isoDateString,
   completedAt: isoDateString.optional(),
@@ -76,8 +77,8 @@ export const settlementSchema = z.object({
 
 export const fxQuoteSchema = z.object({
   id: idSchema,
-  fromCurrency: z.string(),
-  toCurrency: z.string(),
+  fromCurrency: CurrencyCode,
+  toCurrency: CurrencyCode,
   rate: z.string(),
   expiresAt: isoDateString
 });
@@ -86,7 +87,7 @@ export const billPaymentSchema = z.object({
   id: idSchema,
   merchantId: idSchema,
   amount: z.string(),
-  asset: z.string(),
+  asset: CurrencyCode,
   billerReference: z.string(),
   status: z.enum(['initiated','paid','failed']),
   createdAt: isoDateString
@@ -96,7 +97,7 @@ export const anchorTransferSchema = z.object({
   id: idSchema,
   anchorName: z.string(),
   amount: z.string(),
-  asset: z.string(),
+  asset: CurrencyCode,
   externalReference: z.string().optional(),
   status: z.enum(['pending','completed','failed']),
   createdAt: isoDateString
@@ -194,8 +195,8 @@ export const CreateMerchantBody = z.object({
 export const CreatePaymentBody = z.object({
   merchantId: z.string().min(1, 'merchantId is required'),
   amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
-  asset: z.string().min(1, 'asset is required'),
-  convertTo: z.string().min(1, 'convertTo is required').optional(),
+  asset: CurrencyCode,
+  convertTo: CurrencyCode.optional(),
   payerId: z.string().optional(),
   reference: z.string().optional(),
   idempotencyKey: IdempotencyKeySchema.optional(),
@@ -204,10 +205,10 @@ export const CreatePaymentBody = z.object({
 export const CreateSettlementBody = z.object({
   merchantId: z.string().min(1, 'merchantId is required'),
   amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').optional(),
-  asset: z.string().min(1, 'asset is required').optional(),
+  asset: CurrencyCode.optional(),
   items: z.array(z.object({
     amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
-    asset: z.string().min(1, 'asset is required'),
+    asset: CurrencyCode,
   })).optional(),
   idempotencyKey: IdempotencyKeySchema.optional(),
 }).refine((data) => {

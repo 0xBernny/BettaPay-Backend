@@ -5,6 +5,7 @@ import { FastifyRequest } from 'fastify';
 import { resolveAllowedOrigins } from './cors.js';
 
 export * from './schemas.js';
+export * from './currency.js';
 export * from './plugins.js';
 export * from './prisma.js';
 export * from './cors.js';

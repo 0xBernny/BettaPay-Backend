@@ -27,6 +27,7 @@ import {
   ErrorCodes,
   createLoggerOptions,
   registerTracing,
+  CurrencyCode,
 } from '@bettapay/validation';
 
 const env = validateEnv(process.env);
@@ -196,8 +197,8 @@ fastify.get('/api/currencies', async (_request, _reply) => {
 // ── GET /api/quote (issues #48 & #49) ────────────────────────────────────
 
 const QuoteQuerySchema = z.object({
-  from:        z.string().default('USDC'),
-  to:          z.string().default('NGN'),
+  from:        CurrencyCode.default('USDC'),
+  to:          CurrencyCode.default('NGN'),
   amount:      z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').default('1'),
   slippageBps: z.string().regex(/^\d+$/, 'slippageBps must be a non-negative integer').optional(),
 });
@@ -310,8 +311,8 @@ fastify.get(
 // ── GET /api/rates/history (issue #56) ───────────────────────────────────
 
 const HistoryQuerySchema = z.object({
-  from: z.string(),
-  to:   z.string(),
+  from: CurrencyCode,
+  to:   CurrencyCode,
   at:   z.string().optional(), // ISO 8601; defaults to now
 });
 
