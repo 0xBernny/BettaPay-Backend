@@ -15,7 +15,6 @@
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
-import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
@@ -49,17 +48,6 @@ registerTracing(fastify);
 // Inter-service auth: internal endpoints require a valid x-service-token (#117).
 registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 
-<<<<<<< HEAD
-// Polling state
-=======
-fastify.register(rateLimit, {
-  max: 500,
-  timeWindow: '1 minute'
-});
-
-// In-memory event ring buffer (50 events max)
-const events: any[] = [];
->>>>>>> 35d765e (.)
 let latestLedgerCursor: number | undefined = undefined;
 let latestLedgerSequence: number | undefined = undefined;
 const BASE_BACKOFF = 1000;
@@ -215,7 +203,6 @@ fastify.get('/api/events', { preValidation: [fastify.serviceAuth] }, async (requ
   return { events: dbEvents, total, limit, offset, hasMore, latestLedgerCursor };
 });
 
-<<<<<<< HEAD
 // Issue #68 — replay historical events for a ledger range
 const ReplayBody = z.object({
   fromLedger: z.number().int().min(1),
@@ -322,22 +309,7 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, 
 
 // ── Stellar RPC polling loop ──────────────────────────────────────────────────
 
-=======
-fastify.route({
-  method: ['GET', 'POST'],
-  url: '/api/events/replay',
-  config: {
-    rateLimit: {
-      max: 60,
-      timeWindow: '1 minute'
-    }
-  },
-  handler: async (request, reply) => {
-    return { status: 'ok', replayed: true };
-  }
-});
 
->>>>>>> 35d765e (.)
 const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
 
 async function pollEvents() {
@@ -355,7 +327,7 @@ async function pollEvents() {
     }
 
     const response = await server.getEvents({
-      startLedger: latestLedgerCursor,
+      startLedger: latestLedgerCursor!,
       filters: [
         {
           type: 'contract' as const,
@@ -375,10 +347,10 @@ async function pollEvents() {
         const stellarId = typeof evt.id === 'string' ? evt.id : null;
 
         await persistEvent(stellarId, topics, topics[0], contractId, rawValue, decodedPayload, evt.ledger);
-        latestLedgerCursor = Math.max(latestLedgerCursor, evt.ledger + 1);
+        latestLedgerCursor = Math.max(latestLedgerCursor!, evt.ledger + 1);
       }
     } else if (latestLedgerSequence !== undefined) {
-      latestLedgerCursor = Math.max(latestLedgerCursor, latestLedgerSequence);
+      latestLedgerCursor = Math.max(latestLedgerCursor!, latestLedgerSequence!);
     }
 
     // Warn if the indexer is too far behind the network tip
@@ -414,7 +386,6 @@ const start = async () => {
   }
 };
 
-<<<<<<< HEAD
 process.on('SIGTERM', async () => {
   await prisma.$disconnect();
   await webhookQueue.close();
@@ -423,11 +394,8 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-start();
-=======
 if (process.env.NODE_ENV !== 'test') {
   start();
 }
 
 export { fastify };
->>>>>>> 35d765e (.)

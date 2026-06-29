@@ -46,6 +46,8 @@ import {
   ErrorCodes,
   registerErrorHandler
 } from '@bettapay/validation';
+import type { Merchant } from '@prisma/client';
+import type { ApiResponse, PaginatedResponse } from '@bettapay/shared-types';
 import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import helmet from '@fastify/helmet';
@@ -447,13 +449,16 @@ fastify.post<{ Body: CreateMerchantRouteBody }>('/api/merchants', {
 
 fastify.get<{ Params: MerchantParams }>('/api/merchants/:id', {
   preValidation: [fastify.authenticate]
-}, async (request, reply) => {
+}, async (request, reply): Promise<ApiResponse<Merchant>> => {
   const { id } = request.params;
   const merchant = await prisma.merchant.findFirst({
     where: { id, deletedAt: null },
   });
-  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
-  return merchant;
+  if (!merchant) {
+    reply.code(404);
+    return { error: createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found') };
+  }
+  return { data: merchant };
 });
 
 fastify.delete<{ Params: MerchantParams }>('/api/merchants/:id', {

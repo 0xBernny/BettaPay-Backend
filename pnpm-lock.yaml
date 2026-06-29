@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  axios: ^1.7.4
+
 importers:
 
   .:
@@ -51,6 +54,9 @@ importers:
 
   services/api-gateway:
     dependencies:
+      '@bettapay/shared-types':
+        specifier: workspace:^
+        version: link:../../shared/types
       '@bettapay/validation':
         specifier: workspace:*
         version: link:../../shared/validation
