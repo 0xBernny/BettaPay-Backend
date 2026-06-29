@@ -21,6 +21,8 @@ import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
 import { PrismaClient } from '@prisma/client';
 import { rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
+import pg from 'pg';
+import { PrismaPg } from '@prisma/adapter-pg';
 import { z } from 'zod';
 import {
   validateEnv,
@@ -28,9 +30,12 @@ import {
   registerRequestId,
   registerServiceAuth,
   PaginationQuery,
+  DateRangeQuery,
   EVENT_TYPES,
   connectWithRetry,
   createLoggerOptions,
+  getPrismaLogLevels,
+  setupPrismaQueryLogging,
   registerTracing,
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
@@ -40,7 +45,10 @@ const PORT = Number(process.env.PORT ?? '3003');
 
 const fastify = Fastify({ logger: createLoggerOptions({ level: env.LOG_LEVEL }) });
 registerRequestId(fastify);
-const prisma = new PrismaClient();
+const pool = new pg.Pool({ connectionString: env.DATABASE_URL });
+const prismaAdapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter: prismaAdapter, log: getPrismaLogLevels() });
+setupPrismaQueryLogging(prisma, fastify.log);
 
 fastify.register(cors, { origin: env.ALLOWED_ORIGINS });
 registerErrorHandler(fastify);
@@ -49,17 +57,12 @@ registerTracing(fastify);
 // Inter-service auth: internal endpoints require a valid x-service-token (#117).
 registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 
-<<<<<<< HEAD
-// Polling state
-=======
 fastify.register(rateLimit, {
   max: 500,
   timeWindow: '1 minute'
 });
 
-// In-memory event ring buffer (50 events max)
-const events: any[] = [];
->>>>>>> 35d765e (.)
+// Polling state
 let latestLedgerCursor: number | undefined = undefined;
 let latestLedgerSequence: number | undefined = undefined;
 const BASE_BACKOFF = 1000;
@@ -215,7 +218,41 @@ fastify.get('/api/events', { preValidation: [fastify.serviceAuth] }, async (requ
   return { events: dbEvents, total, limit, offset, hasMore, latestLedgerCursor };
 });
 
-<<<<<<< HEAD
+// Issue #79 — event counts by type within a configurable time window.
+fastify.get('/api/events/stats', { preValidation: [fastify.serviceAuth] }, async (request) => {
+  const { from: fromStr, to: toStr } = DateRangeQuery.parse(request.query ?? {});
+
+  const from = fromStr ? new Date(fromStr) : undefined;
+  const to = new Date(toStr);
+
+  const grouped = await prisma.indexedEvent.groupBy({
+    by: ['type'],
+    _count: true,
+    where: {
+      indexedAt: {
+        ...(from ? { gte: from } : {}),
+        lte: to,
+      },
+    },
+  });
+
+  const byType: Record<string, number> = {};
+  let total = 0;
+  for (const entry of grouped) {
+    byType[entry.type] = entry._count;
+    total += entry._count;
+  }
+
+  return {
+    total,
+    byType,
+    timeRange: {
+      from: from?.toISOString() ?? toStr,
+      to: to.toISOString(),
+    },
+  };
+});
+
 // Issue #68 — replay historical events for a ledger range
 const ReplayBody = z.object({
   fromLedger: z.number().int().min(1),
@@ -322,22 +359,6 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, 
 
 // ── Stellar RPC polling loop ──────────────────────────────────────────────────
 
-=======
-fastify.route({
-  method: ['GET', 'POST'],
-  url: '/api/events/replay',
-  config: {
-    rateLimit: {
-      max: 60,
-      timeWindow: '1 minute'
-    }
-  },
-  handler: async (request, reply) => {
-    return { status: 'ok', replayed: true };
-  }
-});
-
->>>>>>> 35d765e (.)
 const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
 
 async function pollEvents() {
@@ -414,7 +435,6 @@ const start = async () => {
   }
 };
 
-<<<<<<< HEAD
 process.on('SIGTERM', async () => {
   await prisma.$disconnect();
   await webhookQueue.close();
@@ -423,11 +443,8 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-start();
-=======
 if (process.env.NODE_ENV !== 'test') {
   start();
 }
 
 export { fastify };
->>>>>>> 35d765e (.)
