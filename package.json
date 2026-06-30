@@ -40,6 +40,9 @@
     "fastify": "^5.8.5",
     "ioredis": "^5.11.1"
   },
+  "prisma": {
+    "seed": "ts-node --esm prisma/seed.ts"
+  },
   "pnpm": {
     "overrides": {
       "axios": "^1.7.4"
