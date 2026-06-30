@@ -1,6 +1,62 @@
 import test from 'tape';
 import { fastify } from './index.js';
 
+test('GET /api/events/stats - rejects requests without service token', async (t) => {
+  await fastify.ready();
+
+  try {
+    const res = await fastify.inject({
+      method: 'GET',
+      url: '/api/events/stats',
+    });
+    t.equal(res.statusCode, 401, 'should return 401 without x-service-token');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'UNAUTHORIZED', 'error code should be UNAUTHORIZED');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    t.end();
+  }
+});
+
+test('GET /api/events/stats - rejects invalid date strings with 400', async (t) => {
+  await fastify.ready();
+
+  try {
+    const res = await fastify.inject({
+      method: 'GET',
+      url: '/api/events/stats?from=not-a-date',
+      headers: { 'x-service-token': process.env.INTER_SERVICE_SECRET || 'test-secret-that-is-at-least-16-chars' },
+    });
+    t.equal(res.statusCode, 400, 'should return 400 for invalid from date');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'VALIDATION_ERROR', 'error code should be VALIDATION_ERROR');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    t.end();
+  }
+});
+
+test('GET /api/events/stats - rejects from > to with 400', async (t) => {
+  await fastify.ready();
+
+  try {
+    const res = await fastify.inject({
+      method: 'GET',
+      url: '/api/events/stats?from=2025-06-01T00:00:00Z&to=2024-06-01T00:00:00Z',
+      headers: { 'x-service-token': process.env.INTER_SERVICE_SECRET || 'test-secret-that-is-at-least-16-chars' },
+    });
+    t.equal(res.statusCode, 400, 'should return 400 when from is after to');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'VALIDATION_ERROR', 'error code should be VALIDATION_ERROR');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    t.end();
+  }
+});
+
 test('Indexer rate limiting - requests below the limit succeed', async (t) => {
   await fastify.ready();
 

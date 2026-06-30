@@ -29,6 +29,7 @@ import {
   registerRequestId,
   registerServiceAuth,
   PaginationQuery,
+  DateRangeQuery,
   EVENT_TYPES,
   WebhookUrlSchema,
   buildPrismaConnectionUrl,
