@@ -125,6 +125,9 @@ importers:
       '@fastify/cors':
         specifier: '*'
         version: 11.2.0
+      '@fastify/rate-limit':
+        specifier: '*'
+        version: 11.0.0
       '@prisma/client':
         specifier: '*'
         version: 7.8.0(prisma@7.8.0(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(typescript@5.9.3))(typescript@5.9.3)
@@ -212,11 +215,7 @@ importers:
         specifier: ^5.3.3
         version: 5.9.3
 
-  shared/stellar-utils:
-    dependencies:
-      '@bettapay/shared-types':
-        specifier: workspace:^
-        version: link:../types
+  shared/stellar-utils: {}
 
   shared/types:
     dependencies:
@@ -226,6 +225,9 @@ importers:
 
   shared/validation:
     dependencies:
+      '@bettapay/stellar-utils':
+        specifier: workspace:^
+        version: link:../stellar-utils
       zod:
         specifier: ^3.22.4
         version: 3.25.76

@@ -27,6 +27,7 @@ import {
   ErrorCodes,
   createLoggerOptions,
   registerTracing,
+  AmountString,
 } from '@bettapay/validation';
 
 const env = validateEnv(process.env);
@@ -198,7 +199,7 @@ fastify.get('/api/currencies', async (_request, _reply) => {
 const QuoteQuerySchema = z.object({
   from:        z.string().default('USDC'),
   to:          z.string().default('NGN'),
-  amount:      z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').default('1'),
+  amount:      AmountString.default('1'),
   slippageBps: z.string().regex(/^\d+$/, 'slippageBps must be a non-negative integer').optional(),
 });
 
