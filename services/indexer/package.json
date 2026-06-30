@@ -8,14 +8,25 @@
     "build": "tsc --project tsconfig.json",
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "test": "cross-env DOTENV_CONFIG_PATH=../../.env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/index.test.ts"
   },
   "dependencies": {
-    "zod": "^3.22.4",
-    "@bettapay/validation": "workspace:*"
+    "@bettapay/validation": "workspace:*",
+    "@prisma/client": "*",
+    "@stellar/stellar-sdk": "*",
+    "bullmq": "*",
+    "fastify": "*",
+    "@fastify/cors": "*",
+    "@fastify/helmet": "*",
+    "ioredis": "*",
+    "zod": "^3.22.4"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
+    "@types/tape": "^5.6.4",
+    "cross-env": "^7.0.3",
+    "tape": "^5.9.0",
     "typescript": "^5.3.3"
   }
 }

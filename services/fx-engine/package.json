@@ -11,8 +11,10 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "zod": "^3.22.4",
-    "@bettapay/validation": "workspace:*"
+    "@fastify/rate-limit": "^10.0.0",
+    "@bettapay/validation": "workspace:*",
+    "ioredis": "^5.11.1",
+    "zod": "^3.22.4"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
