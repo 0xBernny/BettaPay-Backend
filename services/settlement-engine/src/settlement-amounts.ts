@@ -13,17 +13,18 @@
  */
 
 import BigNumber from 'bignumber.js';
+import type { Amount } from '@bettapay/shared-types';
 
 // Always round DOWN (conservative/banker-safe), never use scientific notation
 BigNumber.config({ ROUNDING_MODE: BigNumber.ROUND_DOWN, EXPONENTIAL_AT: [-20, 40] });
 
 export interface SettlementAmounts {
   /** Exact original input — no rounding applied */
-  grossAmount: string;
+  grossAmount: Amount;
   /** Fee deducted from gross, rounded DOWN to input decimal places */
-  feeAmount: string;
+  feeAmount: Amount;
   /** grossAmount − feeAmount, same decimal places as input */
-  netAmount: string;
+  netAmount: Amount;
 }
 
 /**
@@ -38,7 +39,7 @@ export interface SettlementAmounts {
  *   // → { grossAmount: '100.123456', feeAmount: '1.001234', netAmount: '99.122222' }
  */
 export function computeSettlementAmounts(
-  grossAmountStr: string,
+  grossAmountStr: Amount,
   feeBps: number
 ): SettlementAmounts {
   const gross = new BigNumber(grossAmountStr);

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert';
 import {
+  buildPrismaConnectionUrl,
   connectWithRetry,
   getPrismaLogLevels,
   shouldEnablePrismaQueryLogging,
@@ -66,4 +67,22 @@ test('connectWithRetry throws after exhausting retries', async () => {
         warn: () => undefined,
       }, { baseDelayMs: 1, maxRetries: 3 }),
   );
+});
+
+test('buildPrismaConnectionUrl appends params with ? when URL has no query string', () => {
+  const url = 'postgresql://user:pass@localhost:5432/bettapay';
+  const result = buildPrismaConnectionUrl(url, 15, 10);
+  assert.strictEqual(result, 'postgresql://user:pass@localhost:5432/bettapay?connection_limit=15&pool_timeout=10');
+});
+
+test('buildPrismaConnectionUrl appends params with & when URL already has a query string', () => {
+  const url = 'postgresql://user:pass@localhost:5432/bettapay?sslmode=require';
+  const result = buildPrismaConnectionUrl(url, 20, 5);
+  assert.strictEqual(result, 'postgresql://user:pass@localhost:5432/bettapay?sslmode=require&connection_limit=20&pool_timeout=5');
+});
+
+test('buildPrismaConnectionUrl uses defaults when no poolSize or timeout given', () => {
+  const url = 'postgresql://user:pass@localhost:5432/bettapay';
+  const result = buildPrismaConnectionUrl(url);
+  assert.strictEqual(result, 'postgresql://user:pass@localhost:5432/bettapay?connection_limit=10&pool_timeout=10');
 });
