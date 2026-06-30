@@ -22,11 +22,12 @@ import { z } from 'zod';
 import {
   validateEnv,
   registerErrorHandler,
+  registerRequestId,
   createErrorResponse,
   ErrorCodes,
-  genReqId,
   createLoggerOptions,
   registerTracing,
+  AmountString,
 } from '@bettapay/validation';
 
 const env = validateEnv(process.env);
@@ -158,9 +159,9 @@ interface StoredQuote {
 
 const fastify = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
-  genReqId,
 });
 
+registerRequestId(fastify);
 redis = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
 redis.on('error', (err) => fastify.log.warn({ err: err.message }, 'Redis error in fx-engine'));
 fastify.addHook('onClose', async () => { await redis.quit().catch(() => {}); });
@@ -198,7 +199,7 @@ fastify.get('/api/currencies', async (_request, _reply) => {
 const QuoteQuerySchema = z.object({
   from:        z.string().default('USDC'),
   to:          z.string().default('NGN'),
-  amount:      z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').default('1'),
+  amount:      AmountString.default('1'),
   slippageBps: z.string().regex(/^\d+$/, 'slippageBps must be a non-negative integer').optional(),
 });
 

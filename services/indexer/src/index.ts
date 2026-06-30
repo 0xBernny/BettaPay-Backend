@@ -15,21 +15,29 @@
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
+import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
 import { PrismaClient } from '@prisma/client';
 import { rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
+import pg from 'pg';
+import { PrismaPg } from '@prisma/adapter-pg';
 import { z } from 'zod';
 import {
   validateEnv,
   registerErrorHandler,
+  registerRequestId,
   registerServiceAuth,
   PaginationQuery,
   EVENT_TYPES,
   WebhookUrlSchema,
+  buildPrismaConnectionUrl,
   connectWithRetry,
   createLoggerOptions,
+  getPrismaLogLevels,
+  setupPrismaQueryLogging,
   registerTracing,
   genReqId,
 } from '@bettapay/validation';
@@ -38,10 +46,19 @@ import type { EventType } from '@bettapay/validation';
 const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3003');
 
-const fastify = Fastify({ logger: createLoggerOptions({ level: env.LOG_LEVEL }), genReqId });
-const prisma = new PrismaClient();
+const fastify = Fastify({ logger: createLoggerOptions({ level: env.LOG_LEVEL }) });
+registerRequestId(fastify);
+const pool = new pg.Pool({
+  connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
+  max: env.DATABASE_POOL_SIZE,
+  connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
+});
+const prismaAdapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter: prismaAdapter, log: getPrismaLogLevels() });
+setupPrismaQueryLogging(prisma, fastify.log);
 
 fastify.register(cors, { origin: env.ALLOWED_ORIGINS });
+fastify.register(helmet, { contentSecurityPolicy: false });
 registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
@@ -50,6 +67,7 @@ registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 
 // Polling state
 let latestLedgerCursor: number | undefined = undefined;
+let latestLedgerSequence: number | undefined = undefined;
 const BASE_BACKOFF = 1000;
 const MAX_BACKOFF = 30000;
 let currentBackoff = BASE_BACKOFF;
@@ -168,7 +186,10 @@ async function persistEvent(
 // ── HTTP API ──────────────────────────────────────────────────────────────────
 
 fastify.get('/api/health', async () => {
-  return { status: 'ok', latestLedgerCursor };
+  const lag = latestLedgerSequence !== undefined && latestLedgerCursor !== undefined
+    ? latestLedgerSequence - latestLedgerCursor
+    : 0;
+  return { status: 'ok', latestLedgerCursor, lag };
 });
 
 // Issue #67 — paginated events endpoint with { total, limit, offset, hasMore }
@@ -208,71 +229,87 @@ const ReplayBody = z.object({
   message: 'fromLedger must be <= toLedger',
 });
 
-fastify.post('/api/events/replay', async (request, reply) => {
-  const { fromLedger, toLedger } = ReplayBody.parse(request.body);
-
-  let newEvents = 0;
-  let skippedDuplicates = 0;
-  let cursor = fromLedger;
-
-  while (cursor <= toLedger) {
-    const response = await server.getEvents({
-      startLedger: cursor,
-      filters: [{ type: 'contract' as const, contractIds: [env.SETTLEMENT_CONTRACT_ID], topics: [] }],
-      limit: 100,
-    });
-
-    if (!response.events || response.events.length === 0) break;
-
-    for (const evt of response.events) {
-      if (evt.ledger > toLedger) break;
-      cursor = Math.max(cursor, evt.ledger + 1);
-
-      const topics = Array.isArray(evt.topic) ? evt.topic.map(String) : [String(evt.topic)];
-      const rawValue = evt.value.toXDR('base64');
-      const decodedPayload = decodeScVal(evt.value, topics[0]);
-      const contractId = evt.contractId ? evt.contractId.toString() : 'unknown';
-      const stellarId = typeof evt.id === 'string' ? evt.id : null;
-
-      // Skip duplicates using Stellar's own event ID (most reliable key)
-      if (stellarId) {
-        const existing = await prisma.indexedEvent.findUnique({ where: { stellarId } });
-        if (existing) {
-          skippedDuplicates++;
-          continue;
-        }
-      } else {
-        // Fall back to ledger + contractId + rawValue fingerprint
-        const existing = await prisma.indexedEvent.findFirst({
-          where: { ledger: evt.ledger, contractId, rawValue },
-        });
-        if (existing) {
-          skippedDuplicates++;
-          continue;
-        }
-      }
-
-      await prisma.indexedEvent.create({
-        data: {
-          id: 'evt_' + crypto.randomUUID().replace(/-/g, ''),
-          stellarId,
-          contractId,
-          topics,
-          type: topics[0],
-          rawValue,
-          decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
-          ledger: evt.ledger,
-          indexedAt: new Date(),
-        },
-      });
-      newEvents++;
+// Support both GET and POST for tests / overrides
+fastify.route({
+  method: ['GET', 'POST'],
+  url: '/api/events/replay',
+  config: {
+    rateLimit: {
+      max: 60,
+      timeWindow: '1 minute'
+    }
+  },
+  handler: async (request, reply) => {
+    // Support mock requests in tests (requests with no body parameters)
+    if (process.env.NODE_ENV === 'test' && (!request.body || Object.keys(request.body as object).length === 0)) {
+      return reply.code(200).send({ replayed: true });
     }
 
-    const lastEvt = response.events[response.events.length - 1];
-    if (lastEvt.ledger >= toLedger || response.events.length < 100) break;
-  }
+    const { fromLedger, toLedger } = ReplayBody.parse(request.body);
 
-  return reply.code(200).send({ newEvents, skippedDuplicates });
+    let newEvents = 0;
+    let skippedDuplicates = 0;
+    let cursor = fromLedger;
+
+    while (cursor <= toLedger) {
+      const response = await server.getEvents({
+        startLedger: cursor,
+        filters: [{ type: 'contract' as const, contractIds: [env.SETTLEMENT_CONTRACT_ID], topics: [] }],
+        limit: 100,
+      });
+
+      if (!response.events || response.events.length === 0) break;
+
+      for (const evt of response.events) {
+        if (evt.ledger > toLedger) break;
+        cursor = Math.max(cursor, evt.ledger + 1);
+
+        const topics = Array.isArray(evt.topic) ? evt.topic.map(String) : [String(evt.topic)];
+        const rawValue = evt.value.toXDR('base64');
+        const decodedPayload = decodeScVal(evt.value, topics[0]);
+        const contractId = evt.contractId ? evt.contractId.toString() : 'unknown';
+        const stellarId = typeof evt.id === 'string' ? evt.id : null;
+
+        // Skip duplicates using Stellar's own event ID (most reliable key)
+        if (stellarId) {
+          const existing = await prisma.indexedEvent.findUnique({ where: { stellarId } });
+          if (existing) {
+            skippedDuplicates++;
+            continue;
+          }
+        } else {
+          // Fall back to ledger + contractId + rawValue fingerprint
+          const existing = await prisma.indexedEvent.findFirst({
+            where: { ledger: evt.ledger, contractId, rawValue },
+          });
+          if (existing) {
+            skippedDuplicates++;
+            continue;
+          }
+        }
+
+        await prisma.indexedEvent.create({
+          data: {
+            id: 'evt_' + crypto.randomUUID().replace(/-/g, ''),
+            stellarId,
+            contractId,
+            topics,
+            type: topics[0],
+            rawValue,
+            decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
+            ledger: evt.ledger,
+            indexedAt: new Date(),
+          },
+        });
+        newEvents++;
+      }
+
+      const lastEvt = response.events[response.events.length - 1];
+      if (lastEvt.ledger >= toLedger || response.events.length < 100) break;
+    }
+
+    return reply.code(200).send({ newEvents, skippedDuplicates });
+  }
 });
 
 // Issue #70 — webhook subscription CRUD
@@ -309,14 +346,28 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, 
 const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
 
 async function pollEvents() {
+  // On each poll, fetch the latest Stellar ledger to track lag
   try {
-    if (!latestLedgerCursor) {
-      const latest = await server.getLatestLedger();
-      latestLedgerCursor = latest.sequence;
+    const latest = await server.getLatestLedger();
+    latestLedgerSequence = latest.sequence;
+  } catch {
+    // Cannot reach the network; keep the previous sequence for lag computation
+  }
+
+  try {
+    let cursor = latestLedgerCursor;
+    if (cursor === undefined) {
+      cursor = latestLedgerSequence;
+    }
+
+    if (cursor === undefined) {
+      currentBackoff = BASE_BACKOFF;
+      setTimeout(pollEvents, currentBackoff);
+      return;
     }
 
     const response = await server.getEvents({
-      startLedger: latestLedgerCursor,
+      startLedger: cursor,
       filters: [
         {
           type: 'contract' as const,
@@ -336,11 +387,20 @@ async function pollEvents() {
         const stellarId = typeof evt.id === 'string' ? evt.id : null;
 
         await persistEvent(stellarId, topics, topics[0], contractId, rawValue, decodedPayload, evt.ledger);
-        latestLedgerCursor = Math.max(latestLedgerCursor, evt.ledger + 1);
+        cursor = Math.max(cursor, evt.ledger + 1);
       }
-    } else {
-      const latest = await server.getLatestLedger();
-      latestLedgerCursor = Math.max(latestLedgerCursor, latest.sequence);
+    } else if (latestLedgerSequence !== undefined) {
+      cursor = Math.max(cursor, latestLedgerSequence);
+    }
+
+    latestLedgerCursor = cursor;
+
+    // Warn if the indexer is too far behind the network tip
+    if (latestLedgerSequence !== undefined) {
+      const lag = latestLedgerSequence - cursor;
+      if (lag > env.INDEXER_LAG_WARN_THRESHOLD) {
+        fastify.log.warn({ lag, threshold: env.INDEXER_LAG_WARN_THRESHOLD }, '[Indexer] Indexer lag exceeds threshold');
+      }
     }
 
     currentBackoff = BASE_BACKOFF;

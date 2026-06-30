@@ -34,13 +34,15 @@ import {
   validateEnv,
   CreateSettlementBody,
   registerErrorHandler,
+  registerRequestId,
   createErrorResponse,
   ErrorCodes,
+  FeeRule,
   SettlementListQuery,
   getPrismaLogLevels,
   setupPrismaQueryLogging,
+  buildPrismaConnectionUrl,
   connectWithRetry,
-  genReqId,
   createLoggerOptions,
   registerTracing,
 } from "@bettapay/validation";
@@ -55,6 +57,11 @@ const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3001');
 const startTime = Date.now();
 
+process.env.DATABASE_URL = buildPrismaConnectionUrl(
+  env.DATABASE_URL,
+  env.DATABASE_POOL_SIZE,
+  env.DATABASE_POOL_TIMEOUT,
+);
 const prisma = new PrismaClient({ log: getPrismaLogLevels() });
 
 type SettlementJobData = {
@@ -70,9 +77,9 @@ const fastify = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
   // Explicitly set body limit to 1MB (Fastify's default)
   bodyLimit: 1_048_576,
-  genReqId
 });
 
+registerRequestId(fastify);
 setupPrismaQueryLogging(prisma, fastify.log);
 
 const redis = new Redis(env.REDIS_URL);
@@ -107,7 +114,8 @@ const redisConnection = new URL(env.REDIS_URL);
 const connectionParams = {
   host: redisConnection.hostname,
   port: parseInt(redisConnection.port || '6379', 10),
-  maxRetriesPerRequest: 3,
+  maxRetriesPerRequest: env.REDIS_MAX_RETRIES,
+  enableReadyCheck: false,
   retryStrategy: (times: number) => {
     if (times > 10) return null;
     const delay = Math.min(times * 1000, 30000);
@@ -566,9 +574,9 @@ fastify.post<{ Body: CreateSettlementRouteBody }>(
     }
 
     const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
-    const settings = merchant?.settings as { feeBps?: number; webhookUrl?: string } | null | undefined;
-    const feeBps = typeof settings?.feeBps === 'number' && Number.isFinite(settings.feeBps) ? settings.feeBps : env.FEES_DEFAULT_BPS;
-    const webhookUrl = settings?.webhookUrl || null;
+    const parsedFeeRule = FeeRule.passthrough().safeParse(merchant?.settings);
+    const feeBps = parsedFeeRule.success ? parsedFeeRule.data.feeBps : env.FEES_DEFAULT_BPS;
+    const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
 
     const { grossAmount, feeAmount, netAmount } = computeSettlementAmounts(d.amount, feeBps);
 
@@ -619,20 +627,89 @@ fastify.post<{ Body: CreateSettlementRouteBody }>(
     return reply.code(201).send(settlement);
 });
 
+// ============================================================================
+// GRACEFUL SHUTDOWN
+// ============================================================================
+
+let isShuttingDown = false;
+
+async function gracefulShutdown(signal: string): Promise<void> {
+  // Prevent multiple shutdown attempts
+  if (isShuttingDown) {
+    fastify.log.warn({ signal }, 'Shutdown already in progress, ignoring duplicate signal');
+    return;
+  }
+  
+  isShuttingDown = true;
+  fastify.log.info({ signal }, 'Received shutdown signal, starting graceful shutdown');
+
+  // Set a timeout to force exit if shutdown hangs
+  const forceExitTimeout = setTimeout(() => {
+    fastify.log.error('Graceful shutdown timed out after 30 seconds, forcing exit');
+    process.exit(1);
+  }, 30000);
+
+  try {
+    // 1. Close Fastify server (stops accepting new connections)
+    fastify.log.info('Closing Fastify server...');
+    await fastify.close();
+    fastify.log.info('Fastify server closed');
+
+    // 2. Close BullMQ worker (drain and close gracefully)
+    fastify.log.info('Closing BullMQ worker...');
+    await worker.close();
+    fastify.log.info('BullMQ worker closed');
+
+    // 3. Close BullMQ queues
+    fastify.log.info('Closing BullMQ queues...');
+    await settlementQueue.close();
+    await settlementDLQ.close();
+    fastify.log.info('BullMQ queues closed');
+
+    // 4. Close Redis connection
+    fastify.log.info('Closing Redis connection...');
+    await redis.quit();
+    fastify.log.info('Redis connection closed');
+
+    // 5. Disconnect Prisma
+    fastify.log.info('Disconnecting Prisma...');
+    await prisma.$disconnect();
+    fastify.log.info('Prisma disconnected');
+
+    // Clear the force exit timeout
+    clearTimeout(forceExitTimeout);
+
+    fastify.log.info({ signal }, 'Graceful shutdown completed successfully');
+    process.exit(0);
+  } catch (error) {
+    fastify.log.error({ error, signal }, 'Error during graceful shutdown');
+    clearTimeout(forceExitTimeout);
+    process.exit(1);
+  }
+}
+
+// Register shutdown handlers for SIGTERM and SIGINT
+process.on('SIGTERM', () => {
+  void gracefulShutdown('SIGTERM');
+});
+
+process.on('SIGINT', () => {
+  void gracefulShutdown('SIGINT');
+});
+
+// ============================================================================
+// STARTUP
+// ============================================================================
+
 const start = async () => {
   try {
     await connectWithRetry(prisma, fastify.log);
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    fastify.log.info({ port: PORT }, 'Settlement Engine started successfully');
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
   }
 };
-
-process.on('SIGTERM', async () => {
-  await prisma.$disconnect();
-  await fastify.close();
-  process.exit(0);
-});
 
 start();

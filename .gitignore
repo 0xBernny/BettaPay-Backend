@@ -7,6 +7,9 @@ build/
 *.js.map
 *.d.ts.map
 
+# Shared package dist directories
+shared/*/dist/
+
 # Environment — never commit secrets
 .env
 .env.local
