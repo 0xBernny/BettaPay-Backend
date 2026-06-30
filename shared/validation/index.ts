@@ -111,6 +111,11 @@ export const EnvSchema = z.object({
   ADMIN_ADDRESS: z.string().min(1, 'ADMIN_ADDRESS is required'),
   ADMIN_SECRET: z.string().min(1, 'ADMIN_SECRET is required'),
 
+  // Multi-contract indexing — comma-separated contract IDs; falls back to
+  // SETTLEMENT_CONTRACT_ID for backward compatibility.
+  CONTRACT_IDS: z.string().optional(),
+  CONTRACT_NAMES: z.string().optional(),
+
   // Service URLs (used by gateway to proxy requests)
   FX_ENGINE_URL: z.string().url().default('http://localhost:3002'),
   SETTLEMENT_ENGINE_URL: z.string().url().default('http://localhost:3001'),
@@ -131,8 +136,9 @@ export const EnvSchema = z.object({
   INDEXER_LAG_WARN_THRESHOLD: z.string().transform((s) => parseInt(s, 10)).default('10'),
 });
 
-export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS'> & {
+export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS'> & {
   ALLOWED_ORIGINS: string[];
+  CONTRACT_IDS: string[];
 };
 
 export function validateEnv(env: Record<string, unknown>): Env {
@@ -143,7 +149,17 @@ export function validateEnv(env: Record<string, unknown>): Env {
 
   try {
     const parsed = EnvSchema.parse(env);
-    return { ...parsed, ALLOWED_ORIGINS: origins };
+
+    const contractIds = (parsed.CONTRACT_IDS ?? parsed.SETTLEMENT_CONTRACT_ID)
+      .split(',')
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0);
+
+    if (contractIds.length === 0) {
+      throw new Error('\n[BettaPay] Invalid or missing environment variables:\n  CONTRACT_IDS: at least one contract ID must be provided\n');
+    }
+
+    return { ...parsed, ALLOWED_ORIGINS: origins, CONTRACT_IDS: contractIds };
   } catch (error) {
     if (error instanceof z.ZodError) {
       const message = error.errors.map((e) => `  ${e.path.join('.')}: ${e.message}`).join('\n');
