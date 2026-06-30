@@ -5,6 +5,9 @@
 
 import { StrKey } from '@stellar/stellar-sdk';
 
+type Amount = string;
+type Stroops = string;
+
 export function validateStellarAddress(address: string): boolean {
   return StrKey.isValidEd25519PublicKey(address);
 }
@@ -72,23 +75,52 @@ export function buildSetOptionsOp(params: {
   };
 }
 
-// Convert decimal string to stroops (string of integer stroops)
-export function toStellarAmount(decimalStr: string, decimals = 7): string {
-  // naive conversion: multiply decimal by 10^decimals
+/**
+ * Converts a decimal string amount to Stellar stroops (the smallest unit).
+ *
+ * Expected format: a non-negative decimal string matching `/^\d+(\.\d+)?$/`
+ * (e.g. `"100"`, `"0.5"`, `"100.0000001"`). Negative numbers, empty strings,
+ * scientific notation, and leading/trailing spaces are all rejected.
+ * If the fractional part has more digits than `decimals`, excess digits are truncated.
+ *
+ * @param decimalStr - Non-negative numeric string representing the amount.
+ * @param decimals   - Number of decimal places for the asset (default 7, matching XLM/USDC).
+ * @returns The equivalent amount expressed as a string of integer stroops.
+ * @throws {TypeError} If `decimalStr` is not a valid non-negative numeric string.
+ */
+export function toStellarAmount(decimalStr: Amount, decimals = 7): Stroops {
+  if (!/^\d+(\.\d+)?$/.test(decimalStr)) {
+    throw new TypeError('toStellarAmount: input must be a valid numeric string');
+  }
   const [whole, frac = ''] = decimalStr.split('.');
   const paddedFrac = (frac + '0'.repeat(decimals)).slice(0, decimals);
   const stroops = BigInt(whole || '0') * BigInt(10 ** decimals) + BigInt(paddedFrac || '0');
   return stroops.toString();
 }
 
-export function fromStellarAmount(stroopsStr: string, decimals = 7): string {
+/**
+ * Converts a stroops integer string to a decimal amount string.
+ *
+ * Expected format: a non-negative integer string matching `/^\d+$/`
+ * (e.g. `"15000000"`, `"1"`, `"0"`). Empty strings, decimal strings,
+ * negative numbers, and alpha-numeric values are all rejected.
+ *
+ * @param stroopsStr - Non-negative integer string representing stroops.
+ * @param decimals   - Number of decimal places for the asset (default 7, matching XLM/USDC).
+ * @returns The equivalent amount expressed as a decimal string.
+ * @throws {TypeError} If `stroopsStr` is not a valid non-negative integer string.
+ */
+export function fromStellarAmount(stroopsStr: Stroops, decimals = 7): Amount {
+  if (!/^\d+$/.test(stroopsStr)) {
+    throw new TypeError('fromStellarAmount: input must be a valid integer string');
+  }
   const n = BigInt(stroopsStr);
   const whole = n / BigInt(10 ** decimals);
-  const frac = (n % BigInt(10 ** decimals)).toString().padStart(decimals, '0').replace(/0+$/,'');
+  const frac = (n % BigInt(10 ** decimals)).toString().padStart(decimals, '0').replace(/0+$/, '');
   return frac ? `${whole.toString()}.${frac}` : whole.toString();
 }
 
-export function formatAmount(amount: string, decimals: number = 7): string {
+export function formatAmount(amount: Stroops, decimals: number = 7): Amount {
   // Provided for backwards compatibility: expects stroops input
   try {
     return fromStellarAmount(amount, decimals);
@@ -97,7 +129,7 @@ export function formatAmount(amount: string, decimals: number = 7): string {
   }
 }
 
-export function buildPaymentOperation(params: { source?: string; destination: string; asset: string; amount: string }){
+export function buildPaymentOperation(params: { source?: string; destination: string; asset: string; amount: Amount }){
   // Placeholder: return normalized operation object
   return {
     type: 'payment',
@@ -106,4 +138,54 @@ export function buildPaymentOperation(params: { source?: string; destination: st
     asset: params.asset,
     amount: params.amount
   };
+}
+
+/**
+ * Builds a properly encoded Horizon API URL for the specified resource.
+ * Handles trailing slashes in base URL and encodes query parameters.
+ *
+ * @param baseUrl - The Horizon API base URL (e.g., 'https://horizon.stellar.org' or 'https://horizon.stellar.org/')
+ * @param resource - The Horizon resource path (e.g., 'accounts', 'transactions', 'operations', 'payments', 'effects')
+ * @param params - Optional query parameters to include in the URL
+ * @returns The fully constructed URL string
+ *
+ * @example
+ * // Basic resource URL
+ * buildHorizonUrl('https://horizon.stellar.org', 'accounts');
+ * // Returns: 'https://horizon.stellar.org/accounts'
+ *
+ * @example
+ * // With query parameters
+ * buildHorizonUrl('https://horizon.stellar.org', 'transactions', { limit: 10, order: 'desc' });
+ * // Returns: 'https://horizon.stellar.org/transactions?limit=10&order=desc'
+ *
+ * @example
+ * // With trailing slash in base URL
+ * buildHorizonUrl('https://horizon.stellar.org/', 'payments', { asset: 'USD:GABC...' });
+ * // Returns: 'https://horizon.stellar.org/payments?asset=USD%3AGABC...'
+ *
+ * @example
+ * // Special characters are encoded
+ * buildHorizonUrl('https://horizon.stellar.org', 'accounts', { signer: 'GABC... =DEF' });
+ * // Returns: 'https://horizon.stellar.org/accounts?signer=GABC...%20%3DDEF'
+ */
+export function buildHorizonUrl(
+  baseUrl: string,
+  resource: string,
+  params?: Record<string, any>
+): string {
+  const normalizedBase = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+  const url = new URL(`${normalizedBase}/${resource}`);
+
+  if (params) {
+    const searchParams = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== null) {
+        searchParams.append(key, String(value));
+      }
+    }
+    url.search = searchParams.toString();
+  }
+
+  return url.toString();
 }
