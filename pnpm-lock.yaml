@@ -54,6 +54,9 @@ importers:
 
   services/api-gateway:
     dependencies:
+      '@bettapay/shared-types':
+        specifier: workspace:^
+        version: link:../../shared/types
       '@bettapay/validation':
         specifier: workspace:*
         version: link:../../shared/validation

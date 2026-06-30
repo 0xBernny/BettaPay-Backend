@@ -46,6 +46,7 @@ import {
   createLoggerOptions,
   registerTracing,
 } from "@bettapay/validation";
+import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
 interface CreateSettlementRouteBody {
   merchantId?: unknown;
@@ -316,7 +317,7 @@ fastify.get('/api/health', async (_request, reply) => {
   });
 });
 
-fastify.get('/api/settlements', async (request, reply) => {
+fastify.get('/api/settlements', async (request, reply): Promise<PaginatedResponse<SettlementRecord>> => {
   const { limit, offset, status, from, to } = SettlementListQuery.parse(request.query ?? {});
   const where: any = {};
   if (status) where.status = status;
@@ -333,7 +334,10 @@ fastify.get('/api/settlements', async (request, reply) => {
   });
   const total = await prisma.settlement.count({ where });
   const hasMore = offset + limit < total;
-  return { settlements: records, total, limit, offset, hasMore };
+  return {
+    data: records,
+    pagination: { total, limit, offset, hasMore }
+  };
 });
 
 interface ReconcileQuery {

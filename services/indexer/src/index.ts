@@ -15,8 +15,6 @@
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
-import helmet from '@fastify/helmet';
-import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
@@ -65,7 +63,6 @@ registerTracing(fastify);
 // Inter-service auth: internal endpoints require a valid x-service-token (#117).
 registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 
-// Polling state
 let latestLedgerCursor: number | undefined = undefined;
 let latestLedgerSequence: number | undefined = undefined;
 const BASE_BACKOFF = 1000;
@@ -343,6 +340,7 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, 
 
 // ── Stellar RPC polling loop ──────────────────────────────────────────────────
 
+
 const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
 
 async function pollEvents() {
@@ -367,7 +365,7 @@ async function pollEvents() {
     }
 
     const response = await server.getEvents({
-      startLedger: cursor,
+      startLedger: latestLedgerCursor!,
       filters: [
         {
           type: 'contract' as const,
@@ -387,10 +385,10 @@ async function pollEvents() {
         const stellarId = typeof evt.id === 'string' ? evt.id : null;
 
         await persistEvent(stellarId, topics, topics[0], contractId, rawValue, decodedPayload, evt.ledger);
-        cursor = Math.max(cursor, evt.ledger + 1);
+        latestLedgerCursor = Math.max(latestLedgerCursor!, evt.ledger + 1);
       }
     } else if (latestLedgerSequence !== undefined) {
-      cursor = Math.max(cursor, latestLedgerSequence);
+      latestLedgerCursor = Math.max(latestLedgerCursor!, latestLedgerSequence!);
     }
 
     latestLedgerCursor = cursor;
@@ -436,4 +434,8 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-start();
+if (process.env.NODE_ENV !== 'test') {
+  start();
+}
+
+export { fastify };
