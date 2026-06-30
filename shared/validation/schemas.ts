@@ -240,11 +240,23 @@ export type HealthResponse = z.infer<typeof HealthResponse>;
 export const IdempotencyKeySchema = z.string().uuid({ message: 'idempotencyKey must be a valid UUID' });
 export type IdempotencyKey = z.infer<typeof IdempotencyKeySchema>;
 
+export const MerchantSettings = z.object({
+  feeBps: z.number().int().min(0).max(10000).optional(),
+  webhookUrl: z.string().url().optional(),
+  preferredAsset: z.string().optional(),
+  autoSettle: z.boolean().optional(),
+  maxSettlementAmount: z.number().positive().optional(),
+  minSettlementAmount: z.number().positive().optional(),
+  dailySettlementLimit: z.number().positive().optional(),
+});
+
+export type MerchantSettings = z.infer<typeof MerchantSettings>;
+
 export const CreateMerchantBody = z.object({
   id: z.string().min(1, 'id is required'),
   name: z.string().min(1, 'name is required'),
-  ownerId: StellarAddressSchema,
-  settings: z.record(z.unknown()).optional(),
+  ownerId: z.string().min(1, 'ownerId is required'),
+  settings: MerchantSettings.optional(),
   secret: z.string().optional(),
 });
 
