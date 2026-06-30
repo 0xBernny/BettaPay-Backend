@@ -5,6 +5,15 @@ import { validateStellarAddress } from '@bettapay/stellar-utils';
 export const idSchema = z.string().min(1);
 export const isoDateString = z.string().refine((s) => !Number.isNaN(Date.parse(s)), { message: 'Invalid ISO date string' });
 
+export const AmountString = z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string');
+export const PositiveAmountString = AmountString.refine(
+  (val) => {
+    const parsed = parseFloat(val);
+    return !isNaN(parsed) && parsed > 0;
+  },
+  { message: 'Amount must be greater than zero' }
+);
+
 export const StellarAddressSchema = z.string().refine(validateStellarAddress, {
   message: 'Invalid Stellar public key',
 });
@@ -183,6 +192,35 @@ export function safeParseEvent(raw: unknown) {
   return eventSchemas.safeParse(raw);
 }
 
+// ─── Webhook URL validation ───────────────────────────────────────────────────
+
+const PRIVATE_HOST_PATTERN =
+  /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|::1|\[::1\]|0\.0\.0\.0)$/i;
+
+function isPrivateOrLocalhost(urlString: string): boolean {
+  try {
+    const { hostname } = new URL(urlString);
+    return PRIVATE_HOST_PATTERN.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
+export const WebhookUrlSchema = z
+  .string()
+  .url('Webhook URL must be a valid URL')
+  .max(2048, 'Webhook URL must not exceed 2048 characters')
+  .refine(
+    (url) => process.env.NODE_ENV !== 'production' || url.startsWith('https://'),
+    'Webhook URL must use HTTPS in production'
+  )
+  .refine(
+    (url) => process.env.NODE_ENV !== 'production' || !isPrivateOrLocalhost(url),
+    'Webhook URL must not point to localhost or private IP addresses'
+  );
+
+export type WebhookUrl = z.infer<typeof WebhookUrlSchema>;
+
 // ─── Health Check Schemas ──────────────────────────────────────────────────────
 
 export const HealthStatus = z.enum(['healthy', 'degraded', 'unhealthy']);
@@ -258,6 +296,7 @@ export const UpdateMerchantSettingsBody = z.object({
   minSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'minSettlementAmount must be a numeric string').optional(),
   maxSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'maxSettlementAmount must be a numeric string').optional(),
   dailySettlementLimit: z.string().regex(/^\d+(\.\d+)?$/, 'dailySettlementLimit must be a numeric string').optional(),
+  webhookUrl: WebhookUrlSchema.optional(),
 });
 
 export const PaginationQuery = z.object({

@@ -122,9 +122,9 @@ importers:
       '@fastify/cors':
         specifier: '*'
         version: 11.2.0
-      '@fastify/rate-limit':
+      '@fastify/helmet':
         specifier: '*'
-        version: 11.0.0
+        version: 12.0.1
       '@prisma/client':
         specifier: '*'
         version: 7.8.0(prisma@7.8.0(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(typescript@5.9.3))(typescript@5.9.3)

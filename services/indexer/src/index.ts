@@ -32,6 +32,7 @@ import {
   registerServiceAuth,
   PaginationQuery,
   EVENT_TYPES,
+  WebhookUrlSchema,
   buildPrismaConnectionUrl,
   connectWithRetry,
   createLoggerOptions,
@@ -39,7 +40,6 @@ import {
   setupPrismaQueryLogging,
   registerTracing,
   genReqId,
-  createWebhookUrlSchema,
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
 
@@ -314,7 +314,7 @@ fastify.route({
 
 // Issue #70 — webhook subscription CRUD
 const WebhookBody = z.object({
-  url: createWebhookUrlSchema(),
+  url: WebhookUrlSchema,
 });
 
 fastify.post('/api/webhooks', async (request, reply) => {
