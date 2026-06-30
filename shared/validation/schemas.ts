@@ -5,6 +5,11 @@ import { CurrencyCode } from './currency.js';
 export const idSchema = z.string().min(1);
 export const isoDateString = z.string().refine((s) => !Number.isNaN(Date.parse(s)), { message: 'Invalid ISO date string' });
 
+export const StellarAddressSchema = z.string().refine(validateStellarAddress, {
+  message: 'Invalid Stellar public key',
+});
+export type StellarAddress = z.infer<typeof StellarAddressSchema>;
+
 export const userSchema = z.object({
   id: idSchema,
   email: z.string().email(),
@@ -16,7 +21,7 @@ export const userSchema = z.object({
 export const merchantSchema = z.object({
   id: idSchema,
   name: z.string(),
-  ownerId: idSchema,
+  ownerId: StellarAddressSchema,
   createdAt: isoDateString,
   deletedAt: isoDateString.optional(),
   settings: z.record(z.any()).optional()
@@ -31,9 +36,9 @@ export type FeeRule = z.infer<typeof FeeRule>;
 
 export const walletSchema = z.object({
   id: idSchema,
-  ownerId: idSchema,
-  address: z.string(),
-  asset: CurrencyCode,
+  ownerId: StellarAddressSchema,
+  address: StellarAddressSchema,
+  asset: z.string(),
   balance: z.string()
 });
 
@@ -50,8 +55,8 @@ export const transactionSchema = z.object({
 
 export const paymentSchema = z.object({
   id: idSchema,
-  merchantId: idSchema,
-  payerId: idSchema.optional(),
+  merchantId: StellarAddressSchema,
+  payerId: StellarAddressSchema.optional(),
   amount: z.string(),
   asset: CurrencyCode,
   status: z.enum(['initiated','completed','failed','cancelled']),
@@ -62,7 +67,7 @@ export const paymentSchema = z.object({
 
 export const settlementSchema = z.object({
   id: idSchema,
-  merchantId: idSchema,
+  merchantId: StellarAddressSchema,
   totalAmount: z.string(),
   grossAmount: z.string(),
   feeAmount: z.string(),
@@ -85,7 +90,7 @@ export const fxQuoteSchema = z.object({
 
 export const billPaymentSchema = z.object({
   id: idSchema,
-  merchantId: idSchema,
+  merchantId: StellarAddressSchema,
   amount: z.string(),
   asset: CurrencyCode,
   billerReference: z.string(),
@@ -166,6 +171,8 @@ export type FXQuote = z.infer<typeof fxQuoteSchema>;
 export type BillPayment = z.infer<typeof billPaymentSchema>;
 export type AnchorTransfer = z.infer<typeof anchorTransferSchema>;
 export type EventPayloads = z.infer<typeof eventSchemas>;
+export type AmountString = z.infer<typeof AmountString>;
+export type PositiveAmountString = z.infer<typeof PositiveAmountString>;
 
 // Convenience parsers
 export function parseEvent(raw: unknown) {
@@ -175,6 +182,17 @@ export function parseEvent(raw: unknown) {
 export function safeParseEvent(raw: unknown) {
   return eventSchemas.safeParse(raw);
 }
+
+// ─── Health Check Schemas ──────────────────────────────────────────────────────
+
+export const HealthStatus = z.enum(['healthy', 'degraded', 'unhealthy']);
+export type HealthStatus = z.infer<typeof HealthStatus>;
+
+export const HealthResponse = z.object({
+  status: HealthStatus,
+  uptime: z.number().optional(),
+});
+export type HealthResponse = z.infer<typeof HealthResponse>;
 
 // ─── Request Body Schemas (used by API Gateway route handlers) ────────────────
 
@@ -187,13 +205,13 @@ export type IdempotencyKey = z.infer<typeof IdempotencyKeySchema>;
 export const CreateMerchantBody = z.object({
   id: z.string().min(1, 'id is required'),
   name: z.string().min(1, 'name is required'),
-  ownerId: z.string().min(1, 'ownerId is required'),
+  ownerId: StellarAddressSchema,
   settings: z.record(z.unknown()).optional(),
   secret: z.string().optional(),
 });
 
 export const CreatePaymentBody = z.object({
-  merchantId: z.string().min(1, 'merchantId is required'),
+  merchantId: StellarAddressSchema,
   amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
   asset: CurrencyCode,
   convertTo: CurrencyCode.optional(),
@@ -203,7 +221,7 @@ export const CreatePaymentBody = z.object({
 });
 
 export const CreateSettlementBody = z.object({
-  merchantId: z.string().min(1, 'merchantId is required'),
+  merchantId: StellarAddressSchema,
   amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').optional(),
   asset: CurrencyCode.optional(),
   items: z.array(z.object({
@@ -221,7 +239,7 @@ export const CreateSettlementBody = z.object({
 });
 
 export const AuthTokenBody = z.object({
-  merchantId: z.string().min(1, 'merchantId is required'),
+  merchantId: StellarAddressSchema,
   secret: z.string().min(1, 'secret is required'),
 });
 

@@ -41,6 +41,7 @@ import {
   SettlementListQuery,
   getPrismaLogLevels,
   setupPrismaQueryLogging,
+  buildPrismaConnectionUrl,
   connectWithRetry,
   createLoggerOptions,
   registerTracing,
@@ -56,6 +57,11 @@ const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3001');
 const startTime = Date.now();
 
+process.env.DATABASE_URL = buildPrismaConnectionUrl(
+  env.DATABASE_URL,
+  env.DATABASE_POOL_SIZE,
+  env.DATABASE_POOL_TIMEOUT,
+);
 const prisma = new PrismaClient({ log: getPrismaLogLevels() });
 
 type SettlementJobData = {
@@ -621,20 +627,89 @@ fastify.post<{ Body: CreateSettlementRouteBody }>(
     return reply.code(201).send(settlement);
 });
 
+// ============================================================================
+// GRACEFUL SHUTDOWN
+// ============================================================================
+
+let isShuttingDown = false;
+
+async function gracefulShutdown(signal: string): Promise<void> {
+  // Prevent multiple shutdown attempts
+  if (isShuttingDown) {
+    fastify.log.warn({ signal }, 'Shutdown already in progress, ignoring duplicate signal');
+    return;
+  }
+  
+  isShuttingDown = true;
+  fastify.log.info({ signal }, 'Received shutdown signal, starting graceful shutdown');
+
+  // Set a timeout to force exit if shutdown hangs
+  const forceExitTimeout = setTimeout(() => {
+    fastify.log.error('Graceful shutdown timed out after 30 seconds, forcing exit');
+    process.exit(1);
+  }, 30000);
+
+  try {
+    // 1. Close Fastify server (stops accepting new connections)
+    fastify.log.info('Closing Fastify server...');
+    await fastify.close();
+    fastify.log.info('Fastify server closed');
+
+    // 2. Close BullMQ worker (drain and close gracefully)
+    fastify.log.info('Closing BullMQ worker...');
+    await worker.close();
+    fastify.log.info('BullMQ worker closed');
+
+    // 3. Close BullMQ queues
+    fastify.log.info('Closing BullMQ queues...');
+    await settlementQueue.close();
+    await settlementDLQ.close();
+    fastify.log.info('BullMQ queues closed');
+
+    // 4. Close Redis connection
+    fastify.log.info('Closing Redis connection...');
+    await redis.quit();
+    fastify.log.info('Redis connection closed');
+
+    // 5. Disconnect Prisma
+    fastify.log.info('Disconnecting Prisma...');
+    await prisma.$disconnect();
+    fastify.log.info('Prisma disconnected');
+
+    // Clear the force exit timeout
+    clearTimeout(forceExitTimeout);
+
+    fastify.log.info({ signal }, 'Graceful shutdown completed successfully');
+    process.exit(0);
+  } catch (error) {
+    fastify.log.error({ error, signal }, 'Error during graceful shutdown');
+    clearTimeout(forceExitTimeout);
+    process.exit(1);
+  }
+}
+
+// Register shutdown handlers for SIGTERM and SIGINT
+process.on('SIGTERM', () => {
+  void gracefulShutdown('SIGTERM');
+});
+
+process.on('SIGINT', () => {
+  void gracefulShutdown('SIGINT');
+});
+
+// ============================================================================
+// STARTUP
+// ============================================================================
+
 const start = async () => {
   try {
     await connectWithRetry(prisma, fastify.log);
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    fastify.log.info({ port: PORT }, 'Settlement Engine started successfully');
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
   }
 };
-
-process.on('SIGTERM', async () => {
-  await prisma.$disconnect();
-  await fastify.close();
-  process.exit(0);
-});
 
 start();
