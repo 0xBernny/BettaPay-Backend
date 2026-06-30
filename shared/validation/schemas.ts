@@ -1,4 +1,8 @@
 import { z } from 'zod';
+import { validateStellarAddress } from '@bettapay/stellar-utils';
+
+const MAX_MERCHANT_SETTINGS_KEYS = 50;
+const MAX_MERCHANT_SETTINGS_SIZE = 10 * 1024;
 
 // Entity schemas
 export const idSchema = z.string().min(1);
@@ -167,9 +171,25 @@ export function safeParseEvent(raw: unknown) {
 
 export const CreateMerchantBody = z.object({
   id: z.string().min(1, 'id is required'),
-  name: z.string().min(1, 'name is required'),
-  ownerId: z.string().optional(),
-  settings: z.record(z.unknown()).optional(),
+  name: z
+    .string()
+    .min(3, 'merchant name must be at least 3 characters')
+    .max(100, 'merchant name must be at most 100 characters'),
+  ownerId: z
+    .string()
+    .refine((val) => validateStellarAddress(val), 'ownerId must be a valid Stellar address')
+    .optional(),
+  settings: z
+    .record(z.unknown())
+    .refine(
+      (val) => Object.keys(val).length <= MAX_MERCHANT_SETTINGS_KEYS,
+      'settings must contain at most 50 keys',
+    )
+    .refine(
+      (val) => JSON.stringify(val).length <= MAX_MERCHANT_SETTINGS_SIZE,
+      'settings must be 10240 bytes or less',
+    )
+    .optional(),
 });
 
 export const CreatePaymentBody = z.object({
