@@ -1,6 +1,150 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { DateRangeQuery, IdempotencyKeySchema, PaginationQuery, CreatePaymentBody, CreateSettlementBody } from './schemas.js';
+import {
+  AmountString,
+  CreateMerchantBody,
+  CreatePaymentBody,
+  CreateSettlementBody,
+  DateRangeQuery,
+  IdempotencyKeySchema,
+  PaginationQuery,
+  PositiveAmountString,
+  StellarAddressSchema,
+  WebhookUrlSchema,
+  merchantSchema,
+  paymentSchema,
+  walletSchema,
+} from './schemas.js';
+
+const VALID_STELLAR_PUBLIC_KEY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+const INVALID_STELLAR_PUBLIC_KEY = 'merchant-1';
+
+test('WebhookUrlSchema validation', async (t) => {
+  await t.test('Valid HTTPS URL passes', () => {
+    const result = WebhookUrlSchema.parse('https://example.com/hook');
+    assert.strictEqual(result, 'https://example.com/hook');
+  });
+
+  await t.test('Valid HTTP URL passes in non-production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'development';
+    try {
+      const result = WebhookUrlSchema.parse('http://example.com/hook');
+      assert.strictEqual(result, 'http://example.com/hook');
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('Non-URL string fails', () => {
+    assert.throws(() => WebhookUrlSchema.parse('not-a-url'), /valid URL/);
+  });
+
+  await t.test('URL exceeding 2048 characters fails', () => {
+    const long = 'https://example.com/' + 'a'.repeat(2048);
+    assert.throws(() => WebhookUrlSchema.parse(long), /2048/);
+  });
+
+  await t.test('HTTP URL rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('http://example.com/hook'),
+        /HTTPS/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('localhost rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('https://localhost/hook'),
+        /localhost|private/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('127.0.0.1 rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('https://127.0.0.1/hook'),
+        /localhost|private/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('Private IP 192.168.x.x rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('https://192.168.1.1/hook'),
+        /localhost|private/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('Private IP 10.x.x.x rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('https://10.0.0.1/hook'),
+        /localhost|private/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('Private IP 172.16.x.x rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('https://172.16.0.1/hook'),
+        /localhost|private/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('Public IP passes in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const result = WebhookUrlSchema.parse('https://93.184.216.34/hook');
+      assert.strictEqual(result, 'https://93.184.216.34/hook');
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('localhost allowed in development', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'development';
+    try {
+      const result = WebhookUrlSchema.parse('http://localhost:3000/hook');
+      assert.strictEqual(result, 'http://localhost:3000/hook');
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+});
 
 test('PaginationQuery validation', async (t) => {
   await t.test('Default limit is 50', () => {
@@ -98,6 +242,101 @@ test('DateRangeQuery validation', async (t) => {
   });
 });
 
+test('AmountString validation', async (t) => {
+  await t.test('Valid numeric strings pass', () => {
+    assert.strictEqual(AmountString.parse('123'), '123');
+    assert.strictEqual(AmountString.parse('0'), '0');
+    assert.strictEqual(AmountString.parse('12.34'), '12.34');
+    assert.strictEqual(AmountString.parse('0.0'), '0.0');
+  });
+
+  await t.test('Invalid numeric strings fail', () => {
+    assert.throws(() => AmountString.parse('abc'), /amount must be a numeric string/);
+    assert.throws(() => AmountString.parse('12.34.56'), /amount must be a numeric string/);
+    assert.throws(() => AmountString.parse('-12.3'), /amount must be a numeric string/);
+  });
+});
+
+test('PositiveAmountString validation', async (t) => {
+  await t.test('Positive numeric strings pass', () => {
+    assert.strictEqual(PositiveAmountString.parse('123'), '123');
+    assert.strictEqual(PositiveAmountString.parse('12.34'), '12.34');
+    assert.strictEqual(PositiveAmountString.parse('0.01'), '0.01');
+  });
+
+  await t.test('Zero fails', () => {
+    assert.throws(() => PositiveAmountString.parse('0'), /Amount must be greater than zero/);
+    assert.throws(() => PositiveAmountString.parse('0.0'), /Amount must be greater than zero/);
+  });
+
+  await t.test('Negative values fail', () => {
+    assert.throws(() => PositiveAmountString.parse('-1'), /amount must be a numeric string/);
+    assert.throws(() => PositiveAmountString.parse('-0.01'), /amount must be a numeric string/);
+  });
+});
+
+test('CreatePaymentBody validation', async (t) => {
+  await t.test('Valid payment body passes', () => {
+    const valid = {
+      merchantId: 'mer_123',
+      amount: '100.50',
+      asset: 'USDC',
+    };
+    const result = CreatePaymentBody.parse(valid);
+    assert.deepStrictEqual(result, valid);
+  });
+
+  await t.test('Invalid amount in payment body fails', () => {
+    assert.throws(() => CreatePaymentBody.parse({
+      merchantId: 'mer_123',
+      amount: 'abc',
+      asset: 'USDC',
+    }), /amount must be a numeric string/);
+  });
+});
+
+test('CreateSettlementBody validation', async (t) => {
+  await t.test('Valid single settlement passes', () => {
+    const valid = {
+      merchantId: 'mer_123',
+      amount: '500',
+      asset: 'EURT',
+    };
+    const result = CreateSettlementBody.parse(valid);
+    assert.deepStrictEqual(result, valid);
+  });
+
+  await t.test('Valid batch settlement passes', () => {
+    const valid = {
+      merchantId: 'mer_123',
+      items: [
+        { amount: '100.50', asset: 'USDC' },
+        { amount: '200', asset: 'EURT' },
+      ],
+    };
+    const result = CreateSettlementBody.parse(valid);
+    assert.deepStrictEqual(result, valid);
+  });
+
+  await t.test('Invalid amount in single settlement fails', () => {
+    assert.throws(() => CreateSettlementBody.parse({
+      merchantId: 'mer_123',
+      amount: '-50',
+      asset: 'EURT',
+    }), /amount must be a numeric string/);
+  });
+
+  await t.test('Invalid amount in batch settlement items fails', () => {
+    assert.throws(() => CreateSettlementBody.parse({
+      merchantId: 'mer_123',
+      items: [
+        { amount: '100.50', asset: 'USDC' },
+        { amount: 'abc', asset: 'EURT' },
+      ],
+    }), /amount must be a numeric string/);
+  });
+});
+
 test('IdempotencyKeySchema validation', async (t) => {
   await t.test('Valid UUID v4 passes', () => {
     const key = '550e8400-e29b-41d4-a716-446655440000';
@@ -129,7 +368,7 @@ test('IdempotencyKeySchema validation', async (t) => {
   await t.test('CreatePaymentBody accepts optional idempotencyKey', () => {
     const key = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
     const result = CreatePaymentBody.parse({
-      merchantId: 'merchant-1',
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
       amount: '100.00',
       asset: 'USDC',
       idempotencyKey: key,
@@ -139,7 +378,7 @@ test('IdempotencyKeySchema validation', async (t) => {
 
   await t.test('CreatePaymentBody works without idempotencyKey', () => {
     const result = CreatePaymentBody.parse({
-      merchantId: 'merchant-1',
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
       amount: '100.00',
       asset: 'USDC',
     });
@@ -149,7 +388,7 @@ test('IdempotencyKeySchema validation', async (t) => {
   await t.test('CreatePaymentBody rejects invalid idempotencyKey', () => {
     assert.throws(
       () => CreatePaymentBody.parse({
-        merchantId: 'merchant-1',
+        merchantId: VALID_STELLAR_PUBLIC_KEY,
         amount: '100.00',
         asset: 'USDC',
         idempotencyKey: 'not-a-uuid',
@@ -161,7 +400,7 @@ test('IdempotencyKeySchema validation', async (t) => {
   await t.test('CreateSettlementBody accepts optional idempotencyKey', () => {
     const key = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
     const result = CreateSettlementBody.parse({
-      merchantId: 'merchant-1',
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
       amount: '500.00',
       asset: 'USDC',
       idempotencyKey: key,
@@ -171,7 +410,7 @@ test('IdempotencyKeySchema validation', async (t) => {
 
   await t.test('CreateSettlementBody works without idempotencyKey', () => {
     const result = CreateSettlementBody.parse({
-      merchantId: 'merchant-1',
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
       amount: '500.00',
       asset: 'USDC',
     });
@@ -181,12 +420,97 @@ test('IdempotencyKeySchema validation', async (t) => {
   await t.test('CreateSettlementBody rejects invalid idempotencyKey', () => {
     assert.throws(
       () => CreateSettlementBody.parse({
-        merchantId: 'merchant-1',
+        merchantId: VALID_STELLAR_PUBLIC_KEY,
         amount: '500.00',
         asset: 'USDC',
         idempotencyKey: 'bad-key',
       }),
       /idempotencyKey must be a valid UUID/
     );
+  });
+});
+
+test('StellarAddressSchema validation', async (t) => {
+  await t.test('Valid Stellar public key passes', () => {
+    const result = StellarAddressSchema.parse(VALID_STELLAR_PUBLIC_KEY);
+    assert.strictEqual(result, VALID_STELLAR_PUBLIC_KEY);
+  });
+
+  await t.test('Invalid Stellar public key fails with descriptive message', () => {
+    assert.throws(
+      () => StellarAddressSchema.parse(INVALID_STELLAR_PUBLIC_KEY),
+      /Invalid Stellar public key/
+    );
+  });
+
+  await t.test('CreateMerchantBody validates ownerId as a Stellar address', () => {
+    const result = CreateMerchantBody.parse({
+      id: 'merchant-1',
+      name: 'Betta Merchant',
+      ownerId: VALID_STELLAR_PUBLIC_KEY,
+    });
+
+    assert.strictEqual(result.ownerId, VALID_STELLAR_PUBLIC_KEY);
+  });
+
+  await t.test('CreateMerchantBody rejects invalid ownerId', () => {
+    assert.throws(
+      () => CreateMerchantBody.parse({
+        id: 'merchant-1',
+        name: 'Betta Merchant',
+        ownerId: INVALID_STELLAR_PUBLIC_KEY,
+      }),
+      /Invalid Stellar public key/
+    );
+  });
+
+  await t.test('CreatePaymentBody validates merchantId and payerId as Stellar addresses', () => {
+    const result = CreatePaymentBody.parse({
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
+      payerId: VALID_STELLAR_PUBLIC_KEY,
+      amount: '100.00',
+      asset: 'USDC',
+    });
+
+    assert.strictEqual(result.merchantId, VALID_STELLAR_PUBLIC_KEY);
+    assert.strictEqual(result.payerId, VALID_STELLAR_PUBLIC_KEY);
+  });
+
+  await t.test('CreatePaymentBody rejects invalid merchantId', () => {
+    assert.throws(
+      () => CreatePaymentBody.parse({
+        merchantId: INVALID_STELLAR_PUBLIC_KEY,
+        amount: '100.00',
+        asset: 'USDC',
+      }),
+      /Invalid Stellar public key/
+    );
+  });
+
+  await t.test('Entity schemas use StellarAddressSchema where Stellar addresses are expected', () => {
+    assert.strictEqual(merchantSchema.parse({
+      id: 'merchant-1',
+      name: 'Betta Merchant',
+      ownerId: VALID_STELLAR_PUBLIC_KEY,
+      createdAt: new Date().toISOString(),
+    }).ownerId, VALID_STELLAR_PUBLIC_KEY);
+
+    assert.strictEqual(walletSchema.parse({
+      id: 'wallet-1',
+      ownerId: VALID_STELLAR_PUBLIC_KEY,
+      address: VALID_STELLAR_PUBLIC_KEY,
+      asset: 'USDC',
+      balance: '0',
+    }).address, VALID_STELLAR_PUBLIC_KEY);
+
+    assert.strictEqual(paymentSchema.parse({
+      id: 'payment-1',
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
+      payerId: VALID_STELLAR_PUBLIC_KEY,
+      amount: '100.00',
+      asset: 'USDC',
+      status: 'initiated',
+      createdAt: new Date().toISOString(),
+    }).merchantId, VALID_STELLAR_PUBLIC_KEY);
   });
 });

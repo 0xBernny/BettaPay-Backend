@@ -28,7 +28,7 @@ import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
+import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
 import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient } from './clients/indexer-client.js';
 import {
@@ -46,6 +46,8 @@ import {
   ErrorCodes,
   registerErrorHandler
 } from '@bettapay/validation';
+import type { Merchant } from '@prisma/client';
+import type { ApiResponse, PaginatedResponse } from '@bettapay/shared-types';
 import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import helmet from '@fastify/helmet';
@@ -294,7 +296,11 @@ function hashSecret(secret: string): string {
   return crypto.createHash('sha256').update(secret).digest('hex');
 }
 
-const pool = new pg.Pool({ connectionString: env.DATABASE_URL });
+const pool = new pg.Pool({
+  connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
+  max: env.DATABASE_POOL_SIZE,
+  connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
+});
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
 setupPrismaQueryLogging(prisma, fastify.log);
@@ -447,13 +453,16 @@ fastify.post<{ Body: CreateMerchantRouteBody }>('/api/merchants', {
 
 fastify.get<{ Params: MerchantParams }>('/api/merchants/:id', {
   preValidation: [fastify.authenticate]
-}, async (request, reply) => {
+}, async (request, reply): Promise<ApiResponse<Merchant>> => {
   const { id } = request.params;
   const merchant = await prisma.merchant.findFirst({
     where: { id, deletedAt: null },
   });
-  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
-  return merchant;
+  if (!merchant) {
+    reply.code(404);
+    return { error: createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found') };
+  }
+  return { data: merchant };
 });
 
 fastify.delete<{ Params: MerchantParams }>('/api/merchants/:id', {
@@ -838,23 +847,6 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 const start = async () => {
   try {
     await connectWithRetry(prisma, fastify.log);
-
-    // Seed admin merchant
-    const adminSecret = env.ADMIN_SECRET;
-    const adminSecretHash = hashSecret(adminSecret);
-    await prisma.merchant.upsert({
-      where: { id: env.ADMIN_ADDRESS },
-      update: {
-        secretHash: adminSecretHash
-      },
-      create: {
-        id: env.ADMIN_ADDRESS,
-        name: 'BettaPay Merchant LLC',
-        ownerId: 'admin-user-001',
-        settings: { preferredAsset: 'USDC', autoSettle: true },
-        secretHash: adminSecretHash
-      }
-    });
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {
