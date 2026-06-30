@@ -28,8 +28,13 @@ import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, connectWithRetry, genReqId, createLoggerOptions, registerTracing } from '@bettapay/validation';
+import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
+import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient } from './clients/indexer-client.js';
+import {
+  createSettlementClient,
+  SettlementEngineUnavailableError,
+} from './clients/settlement-client.js';
 import {
   CreateMerchantBody,
   CreatePaymentBody,
@@ -41,6 +46,8 @@ import {
   ErrorCodes,
   registerErrorHandler
 } from '@bettapay/validation';
+import type { Merchant } from '@prisma/client';
+import type { ApiResponse, PaginatedResponse } from '@bettapay/shared-types';
 import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import helmet from '@fastify/helmet';
@@ -79,6 +86,7 @@ interface CreatePaymentRouteBody {
   payerId?: unknown;
   amount?: unknown;
   asset?: unknown;
+  convertTo?: unknown;
   reference?: unknown;
 }
 
@@ -144,8 +152,9 @@ const fastify = Fastify({
   // Limit request body size to 1MB (1,048,576 bytes) to protect the API gateway
   // from oversized payload attacks and align with typical financial transaction payload sizes.
   bodyLimit: 1_048_576,
-  genReqId
 });
+
+registerRequestId(fastify);
 
 registerErrorHandler(fastify);
 // Distributed tracing: normalise x-request-id / x-trace-id and bind to the
@@ -156,6 +165,18 @@ registerTracing(fastify);
 // Enrichment is best-effort: indexer failures degrade to payment-only responses.
 const indexerClient = createIndexerClient({
   baseUrl: env.INDEXER_URL,
+  serviceToken: env.INTER_SERVICE_SECRET,
+  logger: fastify.log,
+});
+
+const settlementClient = createSettlementClient({
+  baseUrl: env.SETTLEMENT_ENGINE_URL,
+  serviceToken: env.INTER_SERVICE_SECRET,
+  logger: fastify.log,
+});
+
+const fxClient = createFxClient({
+  baseUrl: env.FX_ENGINE_URL,
   serviceToken: env.INTER_SERVICE_SECRET,
   logger: fastify.log,
 });
@@ -275,7 +296,11 @@ function hashSecret(secret: string): string {
   return crypto.createHash('sha256').update(secret).digest('hex');
 }
 
-const pool = new pg.Pool({ connectionString: env.DATABASE_URL });
+const pool = new pg.Pool({
+  connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
+  max: env.DATABASE_POOL_SIZE,
+  connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
+});
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
 setupPrismaQueryLogging(prisma, fastify.log);
@@ -418,7 +443,7 @@ fastify.post<{ Body: CreateMerchantRouteBody }>('/api/merchants', {
       data: {
         id: d.id,
         name: d.name,
-        ownerId: d.ownerId || 'unknown',
+        ownerId: d.ownerId,
         settings: d.settings as any ?? {},
         secretHash,
       }
@@ -428,13 +453,16 @@ fastify.post<{ Body: CreateMerchantRouteBody }>('/api/merchants', {
 
 fastify.get<{ Params: MerchantParams }>('/api/merchants/:id', {
   preValidation: [fastify.authenticate]
-}, async (request, reply) => {
+}, async (request, reply): Promise<ApiResponse<Merchant>> => {
   const { id } = request.params;
   const merchant = await prisma.merchant.findFirst({
     where: { id, deletedAt: null },
   });
-  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
-  return merchant;
+  if (!merchant) {
+    reply.code(404);
+    return { error: createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found') };
+  }
+  return { data: merchant };
 });
 
 fastify.delete<{ Params: MerchantParams }>('/api/merchants/:id', {
@@ -539,6 +567,13 @@ fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
     ? new Date(Date.now() + IDEMPOTENCY_TTL_MS)
     : null;
 
+    const fxQuote = d.convertTo
+      ? await fxClient.getQuote(
+          { from: d.asset, to: d.convertTo, amount: d.amount },
+          request.headers,
+        )
+      : null;
+
     const payment = await prisma.payment.create({
       data: {
         id: 'pay_' + crypto.randomUUID().replace(/-/g, ''),
@@ -557,6 +592,10 @@ fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
       { idempotencyKey, paymentId: payment.id },
       idempotencyKey ? 'Idempotency miss — payment created' : 'Payment created (no idempotency key)'
     );
+
+    if (d.convertTo) {
+      return reply.code(201).send({ ...payment, fxQuote });
+    }
 
     return reply.code(201).send(payment);
 });
@@ -652,8 +691,6 @@ fastify.post<{ Body: CreateSettlementRouteBody }>('/api/settlements', {
       dailySettlementLimit?: string;
     } | null | undefined;
 
-    const webhookUrl = settings?.webhookUrl || null;
-
     // Normalize to items array (backward compatibility: single amount/asset becomes single-item batch)
     const items = d.items || (d.amount && d.asset ? [{ amount: d.amount, asset: d.asset }] : []);
 
@@ -719,37 +756,20 @@ fastify.post<{ Body: CreateSettlementRouteBody }>('/api/settlements', {
       }
     }
 
-    // Create settlements (multi-asset batch or single)
-    const batchId = 'batch_' + crypto.randomUUID().replace(/-/g, '');
-    const settlements = await Promise.all(
-      items.map((item) =>
-        prisma.settlement.create({
-          data: {
-            id: 'set_' + crypto.randomUUID().replace(/-/g, ''),
-            merchantId: d.merchantId,
-            totalAmount: item.amount,
-            grossAmount: item.amount,
-            feeAmount: '0',
-            netAmount: item.amount,
-            feeBps: 0,
-            asset: item.asset,
-            status: 'pending',
-            webhookUrl,
-            batchId: items.length > 1 ? batchId : null,
-          },
-        })
-      )
-    );
-
-    // Return single settlement or batch
-    if (settlements.length === 1) {
-      return reply.code(201).send(settlements[0]);
-    } else {
-      return reply.code(201).send({
-        batchId,
-        settlements,
-        total: settlements.length,
-      });
+    try {
+      const settlementResponse = await settlementClient.createSettlement(d, request.headers);
+      return reply
+        .code(settlementResponse.status)
+        .type(settlementResponse.contentType)
+        .send(settlementResponse.body);
+    } catch (err) {
+      if (err instanceof SettlementEngineUnavailableError) {
+        request.log.warn({ err }, 'settlement-engine unavailable during settlement creation');
+        return reply
+          .code(504)
+          .send(createErrorResponse(ErrorCodes.GATEWAY_TIMEOUT, 'Settlement engine unavailable'));
+      }
+      throw err;
     }
 });
 
@@ -827,23 +847,6 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 const start = async () => {
   try {
     await connectWithRetry(prisma, fastify.log);
-
-    // Seed admin merchant
-    const adminSecret = env.ADMIN_SECRET;
-    const adminSecretHash = hashSecret(adminSecret);
-    await prisma.merchant.upsert({
-      where: { id: env.ADMIN_ADDRESS },
-      update: {
-        secretHash: adminSecretHash
-      },
-      create: {
-        id: env.ADMIN_ADDRESS,
-        name: 'BettaPay Merchant LLC',
-        ownerId: 'admin-user-001',
-        settings: { preferredAsset: 'USDC', autoSettle: true },
-        secretHash: adminSecretHash
-      }
-    });
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {

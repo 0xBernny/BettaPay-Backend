@@ -1,8 +1,176 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { buildSetOptionsOp, validateStellarAddress } from './index.js';
+import { buildSetOptionsOp, validateStellarAddress, toStellarAmount, fromStellarAmount } from './index.js';
 
 const VALID_KEY = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN';
+
+test('toStellarAmount', async (t) => {
+  await t.test('converts an integer string to stroops', () => {
+    assert.strictEqual(toStellarAmount('1'), '10000000');
+  });
+
+  await t.test('converts a decimal string to stroops', () => {
+    assert.strictEqual(toStellarAmount('1.5'), '15000000');
+  });
+
+  await t.test('converts zero to stroops', () => {
+    assert.strictEqual(toStellarAmount('0'), '0');
+  });
+
+  await t.test('converts a fractional-only decimal correctly', () => {
+    assert.strictEqual(toStellarAmount('0.0000001'), '1');
+  });
+
+  await t.test('handles a multi-digit amount with decimals', () => {
+    assert.strictEqual(toStellarAmount('100.50'), '1005000000');
+  });
+
+  await t.test('truncates excess decimal places instead of rounding', () => {
+    // 8 decimal digits provided but decimals=7; the 8th digit is dropped
+    assert.strictEqual(toStellarAmount('1.00000009'), '10000000');
+  });
+
+  await t.test('respects a custom decimals parameter', () => {
+    assert.strictEqual(toStellarAmount('1.00', 2), '100');
+  });
+
+  await t.test('throws TypeError for an empty string', () => {
+    assert.throws(
+      () => toStellarAmount(''),
+      (err: unknown) => err instanceof TypeError && /toStellarAmount: input must be a valid numeric string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a negative number', () => {
+    assert.throws(
+      () => toStellarAmount('-1'),
+      (err: unknown) => err instanceof TypeError && /toStellarAmount: input must be a valid numeric string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for scientific notation', () => {
+    assert.throws(
+      () => toStellarAmount('1e10'),
+      (err: unknown) => err instanceof TypeError && /toStellarAmount: input must be a valid numeric string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a string with leading spaces', () => {
+    assert.throws(
+      () => toStellarAmount(' 1'),
+      (err: unknown) => err instanceof TypeError && /toStellarAmount: input must be a valid numeric string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a string with trailing spaces', () => {
+    assert.throws(
+      () => toStellarAmount('1 '),
+      (err: unknown) => err instanceof TypeError && /toStellarAmount: input must be a valid numeric string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a string with no digits before the decimal point', () => {
+    assert.throws(
+      () => toStellarAmount('.5'),
+      (err: unknown) => err instanceof TypeError && /toStellarAmount: input must be a valid numeric string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a string with no digits after the decimal point', () => {
+    assert.throws(
+      () => toStellarAmount('1.'),
+      (err: unknown) => err instanceof TypeError && /toStellarAmount: input must be a valid numeric string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a non-numeric string', () => {
+    assert.throws(
+      () => toStellarAmount('abc'),
+      (err: unknown) => err instanceof TypeError && /toStellarAmount: input must be a valid numeric string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a mixed alphanumeric string', () => {
+    assert.throws(
+      () => toStellarAmount('1a2'),
+      (err: unknown) => err instanceof TypeError && /toStellarAmount: input must be a valid numeric string/.test((err as TypeError).message),
+    );
+  });
+});
+
+test('fromStellarAmount', async (t) => {
+  await t.test('converts a stroops string to a decimal amount', () => {
+    assert.strictEqual(fromStellarAmount('15000000'), '1.5');
+    assert.strictEqual(fromStellarAmount('1'), '0.0000001');
+  });
+
+  await t.test('handles inputs with leading zeros correctly', () => {
+    assert.strictEqual(fromStellarAmount('0015000000'), '1.5');
+    assert.strictEqual(fromStellarAmount('000'), '0');
+  });
+
+  await t.test('converts zero stroops to zero', () => {
+    assert.strictEqual(fromStellarAmount('0'), '0');
+  });
+
+  await t.test('handles a large stroops value', () => {
+    assert.strictEqual(fromStellarAmount('1000000000000000'), '100000000');
+  });
+
+  await t.test('throws TypeError for an empty string', () => {
+    assert.throws(
+      () => fromStellarAmount(''),
+      (err: unknown) => err instanceof TypeError && /fromStellarAmount: input must be a valid integer string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a decimal string', () => {
+    assert.throws(
+      () => fromStellarAmount('100.50'),
+      (err: unknown) => err instanceof TypeError && /fromStellarAmount: input must be a valid integer string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a negative number string', () => {
+    assert.throws(
+      () => fromStellarAmount('-1'),
+      (err: unknown) => err instanceof TypeError && /fromStellarAmount: input must be a valid integer string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a non-numeric string', () => {
+    assert.throws(
+      () => fromStellarAmount('abc'),
+      (err: unknown) => err instanceof TypeError && /fromStellarAmount: input must be a valid integer string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a mixed alphanumeric string', () => {
+    assert.throws(
+      () => fromStellarAmount('1a2b3c'),
+      (err: unknown) => err instanceof TypeError && /fromStellarAmount: input must be a valid integer string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a string with leading spaces', () => {
+    assert.throws(
+      () => fromStellarAmount(' 100'),
+      (err: unknown) => err instanceof TypeError && /fromStellarAmount: input must be a valid integer string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('throws TypeError for a string with trailing spaces', () => {
+    assert.throws(
+      () => fromStellarAmount('100 '),
+      (err: unknown) => err instanceof TypeError && /fromStellarAmount: input must be a valid integer string/.test((err as TypeError).message),
+    );
+  });
+
+  await t.test('respects a custom decimals parameter', () => {
+    assert.strictEqual(fromStellarAmount('100', 2), '1');
+    assert.strictEqual(fromStellarAmount('105', 2), '1.05');
+  });
+});
 
 test('validateStellarAddress', async (t) => {
   await t.test('returns true for a valid Ed25519 public key', () => {

@@ -6,12 +6,12 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-test('API Gateway imports and uses shared genReqId utility', (t) => {
+test('API Gateway imports and uses shared registerRequestId plugin', (t) => {
   const indexPath = path.resolve(__dirname, './index.ts');
   const content = fs.readFileSync(indexPath, 'utf-8');
   
-  t.ok(content.includes('genReqId'), 'index.ts should reference genReqId');
-  t.match(content, /import\s+{[^}]*genReqId[^}]*}\s+from\s+['"]@bettapay\/validation['"]/s, 'index.ts should import genReqId from @bettapay/validation');
-  t.match(content, /genReqId/s, 'index.ts should reference genReqId in Fastify configuration');
+  t.ok(content.includes('registerRequestId'), 'index.ts should reference registerRequestId');
+  t.match(content, /import\s+{[^}]*registerRequestId[^}]*}\s+from\s+['"]@bettapay\/validation['"]/s, 'index.ts should import registerRequestId from @bettapay/validation');
+  t.match(content, /registerRequestId\(fastify\)/s, 'index.ts should call registerRequestId(fastify)');
   t.end();
 });
