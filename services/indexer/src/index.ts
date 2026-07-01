@@ -265,21 +265,18 @@ const ReplayBody = z.object({
   message: 'fromLedger must be <= toLedger',
 });
 
-// Support both GET and POST for tests / overrides
-fastify.route({
-  method: ['GET', 'POST'],
-  url: '/api/events/replay',
-  config: {
-    rateLimit: {
-      max: 60,
-      timeWindow: '1 minute'
+fastify.post(
+  '/api/events/replay',
+  {
+    config: {
+      rateLimit: {
+        max: 60,
+        timeWindow: '1 minute'
+      }
     }
   },
-  handler: async (request, reply) => {
-    // Support mock requests in tests (requests with no body parameters)
-    if (process.env.NODE_ENV === 'test' && (!request.body || Object.keys(request.body as object).length === 0)) {
-      return reply.code(200).send({ replayed: true });
-    }
+  async (request, reply) => {
+  const { fromLedger, toLedger } = ReplayBody.parse(request.body);
 
   fastify.register(rateLimit, {
     max: 60,
@@ -383,7 +380,6 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, 
 });
 
 // ── Stellar RPC polling loop ──────────────────────────────────────────────────
-
 const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
 
 async function pollEvents() {
