@@ -5,6 +5,15 @@ import { CurrencyCode } from './currency.js';
 export const idSchema = z.string().min(1);
 export const isoDateString = z.string().refine((s) => !Number.isNaN(Date.parse(s)), { message: 'Invalid ISO date string' });
 
+export const AmountString = z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string');
+export const PositiveAmountString = AmountString.refine(
+  (val) => {
+    const parsed = parseFloat(val);
+    return !isNaN(parsed) && parsed > 0;
+  },
+  { message: 'Amount must be greater than zero' }
+);
+
 export const StellarAddressSchema = z.string().refine(validateStellarAddress, {
   message: 'Invalid Stellar public key',
 });
@@ -183,6 +192,35 @@ export function safeParseEvent(raw: unknown) {
   return eventSchemas.safeParse(raw);
 }
 
+// ─── Webhook URL validation ───────────────────────────────────────────────────
+
+const PRIVATE_HOST_PATTERN =
+  /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|::1|\[::1\]|0\.0\.0\.0)$/i;
+
+function isPrivateOrLocalhost(urlString: string): boolean {
+  try {
+    const { hostname } = new URL(urlString);
+    return PRIVATE_HOST_PATTERN.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
+export const WebhookUrlSchema = z
+  .string()
+  .url('Webhook URL must be a valid URL')
+  .max(2048, 'Webhook URL must not exceed 2048 characters')
+  .refine(
+    (url) => process.env.NODE_ENV !== 'production' || url.startsWith('https://'),
+    'Webhook URL must use HTTPS in production'
+  )
+  .refine(
+    (url) => process.env.NODE_ENV !== 'production' || !isPrivateOrLocalhost(url),
+    'Webhook URL must not point to localhost or private IP addresses'
+  );
+
+export type WebhookUrl = z.infer<typeof WebhookUrlSchema>;
+
 // ─── Health Check Schemas ──────────────────────────────────────────────────────
 
 export const HealthStatus = z.enum(['healthy', 'degraded', 'unhealthy']);
@@ -202,11 +240,23 @@ export type HealthResponse = z.infer<typeof HealthResponse>;
 export const IdempotencyKeySchema = z.string().uuid({ message: 'idempotencyKey must be a valid UUID' });
 export type IdempotencyKey = z.infer<typeof IdempotencyKeySchema>;
 
+export const MerchantSettings = z.object({
+  feeBps: z.number().int().min(0).max(10000).optional(),
+  webhookUrl: z.string().url().optional(),
+  preferredAsset: z.string().optional(),
+  autoSettle: z.boolean().optional(),
+  maxSettlementAmount: z.number().positive().optional(),
+  minSettlementAmount: z.number().positive().optional(),
+  dailySettlementLimit: z.number().positive().optional(),
+});
+
+export type MerchantSettings = z.infer<typeof MerchantSettings>;
+
 export const CreateMerchantBody = z.object({
   id: z.string().min(1, 'id is required'),
   name: z.string().min(1, 'name is required'),
-  ownerId: StellarAddressSchema,
-  settings: z.record(z.unknown()).optional(),
+  ownerId: z.string().min(1, 'ownerId is required'),
+  settings: MerchantSettings.optional(),
   secret: z.string().optional(),
 });
 
@@ -258,6 +308,7 @@ export const UpdateMerchantSettingsBody = z.object({
   minSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'minSettlementAmount must be a numeric string').optional(),
   maxSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'maxSettlementAmount must be a numeric string').optional(),
   dailySettlementLimit: z.string().regex(/^\d+(\.\d+)?$/, 'dailySettlementLimit must be a numeric string').optional(),
+  webhookUrl: WebhookUrlSchema.optional(),
 });
 
 export const PaginationQuery = z.object({

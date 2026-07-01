@@ -2,7 +2,7 @@
  * Indexer Service — BettaPay Backend
  *
  * Listens to Soroban contract event streams and indexes payment/settlement events.
- * Polls the Stellar RPC for contract events on the SETTLEMENT_CONTRACT_ID.
+ * Supports monitoring multiple contracts via CONTRACT_IDS (comma-separated env var).
  *
  * Endpoints:
  *   GET  /api/events              — list indexed events (paginated, from DB)
@@ -15,8 +15,6 @@
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
-import helmet from '@fastify/helmet';
-import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
@@ -31,7 +29,9 @@ import {
   registerRequestId,
   registerServiceAuth,
   PaginationQuery,
+  DateRangeQuery,
   EVENT_TYPES,
+  WebhookUrlSchema,
   buildPrismaConnectionUrl,
   connectWithRetry,
   createLoggerOptions,
@@ -39,13 +39,13 @@ import {
   setupPrismaQueryLogging,
   registerTracing,
   genReqId,
-  createWebhookUrlSchema,
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
 
 const env = validateEnv(process.env);
-const PORT = Number(process.env.PORT ?? '3003');
+const PORT = Number(process.env.PORT ?? '3000');
 
+export const fastify = Fastify({ logger: true });
 const fastify = Fastify({ logger: createLoggerOptions({ level: env.LOG_LEVEL }) });
 registerRequestId(fastify);
 const pool = new pg.Pool({
@@ -70,12 +70,13 @@ fastify.register(rateLimit, {
   timeWindow: '1 minute'
 });
 
-// Polling state
+// In-memory event ring buffer (50 events max)
+const events: any[] = [];
 let latestLedgerCursor: number | undefined = undefined;
 let latestLedgerSequence: number | undefined = undefined;
 const BASE_BACKOFF = 1000;
 const MAX_BACKOFF = 30000;
-let currentBackoff = BASE_BACKOFF;
+let currentBackoff: number = BASE_BACKOFF;
 
 // ── BullMQ webhook delivery queue ────────────────────────────────────────────
 
@@ -127,6 +128,33 @@ webhookQueue.on('error', (err) => {
   fastify.log.error({ err: err.message }, '[Indexer] Webhook queue error');
 });
 
+// ── Multi-contract config ────────────────────────────────────────────────────
+
+// validateEnv resolves CONTRACT_IDS as a string[] (falls back to SETTLEMENT_CONTRACT_ID
+// when the env var is unset).
+const CONTRACT_IDS: string[] = env.CONTRACT_IDS;
+
+fastify.log.info({ contracts: CONTRACT_IDS }, '[Indexer] Monitoring contract IDs');
+
+const CONTRACT_NAMES: Record<string, string> = (() => {
+  const raw = env.CONTRACT_NAMES ?? '';
+  const map: Record<string, string> = {};
+  raw.split(',').forEach((entry) => {
+    const trimmed = entry.trim();
+    if (!trimmed) return;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) return;
+    const id = trimmed.slice(0, eqIdx).trim();
+    const name = trimmed.slice(eqIdx + 1).trim();
+    if (id && name) map[id] = name;
+  });
+  return map;
+})();
+
+function getContractName(contractId: string): string {
+  return CONTRACT_NAMES[contractId] ?? 'unknown';
+}
+
 // ── XDR decoding ─────────────────────────────────────────────────────────────
 
 function serializeNative(value: unknown): unknown {
@@ -158,6 +186,7 @@ async function persistEvent(
   topics: string[],
   type: string,
   contractId: string,
+  contractName: string,
   rawValue: string,
   decodedPayload: unknown,
   ledger: number
@@ -169,6 +198,7 @@ async function persistEvent(
       id,
       stellarId,
       contractId,
+      contractName,
       topics,
       type,
       rawValue,
@@ -178,7 +208,7 @@ async function persistEvent(
     },
   });
 
-  fastify.log.info({ id, type, ledger }, '[Indexer] Event indexed');
+  fastify.log.info({ id, type, contractName, ledger }, '[Indexer] Event indexed');
 
   const subs = await prisma.webhookSubscription.findMany();
   for (const sub of subs) {
@@ -226,7 +256,8 @@ fastify.get('/api/events', { preValidation: [fastify.serviceAuth] }, async (requ
   return { events: dbEvents, total, limit, offset, hasMore, latestLedgerCursor };
 });
 
-// Issue #68 — replay historical events for a ledger range
+// Issue #68 — replay historical events for a ledger range (all contracts)
+// Issue #76 — extended to iterate over all configured contract IDs
 const ReplayBody = z.object({
   fromLedger: z.number().int().min(1),
   toLedger: z.number().int().min(1),
@@ -247,16 +278,21 @@ fastify.post(
   async (request, reply) => {
   const { fromLedger, toLedger } = ReplayBody.parse(request.body);
 
-    const { fromLedger, toLedger } = ReplayBody.parse(request.body);
+  fastify.register(rateLimit, {
+    max: 60,
+    timeWindow: '1 minute'
+  });
 
-    let newEvents = 0;
-    let skippedDuplicates = 0;
+  let newEvents = 0;
+  let skippedDuplicates = 0;
+
+  for (const contractId of CONTRACT_IDS) {
     let cursor = fromLedger;
 
     while (cursor <= toLedger) {
       const response = await server.getEvents({
         startLedger: cursor,
-        filters: [{ type: 'contract' as const, contractIds: [env.SETTLEMENT_CONTRACT_ID], topics: [] }],
+        filters: [{ type: 'contract' as const, contractIds: [contractId], topics: [] }],
         limit: 100,
       });
 
@@ -269,7 +305,8 @@ fastify.post(
         const topics = Array.isArray(evt.topic) ? evt.topic.map(String) : [String(evt.topic)];
         const rawValue = evt.value.toXDR('base64');
         const decodedPayload = decodeScVal(evt.value, topics[0]);
-        const contractId = evt.contractId ? evt.contractId.toString() : 'unknown';
+        const resolvedContractId = evt.contractId ? evt.contractId.toString() : contractId;
+        const contractName = getContractName(resolvedContractId);
         const stellarId = typeof evt.id === 'string' ? evt.id : null;
 
         // Skip duplicates using Stellar's own event ID (most reliable key)
@@ -282,7 +319,7 @@ fastify.post(
         } else {
           // Fall back to ledger + contractId + rawValue fingerprint
           const existing = await prisma.indexedEvent.findFirst({
-            where: { ledger: evt.ledger, contractId, rawValue },
+            where: { ledger: evt.ledger, contractId: resolvedContractId, rawValue },
           });
           if (existing) {
             skippedDuplicates++;
@@ -294,7 +331,8 @@ fastify.post(
           data: {
             id: 'evt_' + crypto.randomUUID().replace(/-/g, ''),
             stellarId,
-            contractId,
+            contractId: resolvedContractId,
+            contractName,
             topics,
             type: topics[0],
             rawValue,
@@ -309,14 +347,12 @@ fastify.post(
       const lastEvt = response.events[response.events.length - 1];
       if (lastEvt.ledger >= toLedger || response.events.length < 100) break;
     }
-
-    return reply.code(200).send({ newEvents, skippedDuplicates });
   }
 });
 
 // Issue #70 — webhook subscription CRUD
 const WebhookBody = z.object({
-  url: createWebhookUrlSchema(),
+  url: WebhookUrlSchema,
 });
 
 fastify.post('/api/webhooks', async (request, reply) => {
@@ -368,14 +404,12 @@ async function pollEvents() {
     }
 
     const response = await server.getEvents({
-      startLedger: cursor,
-      filters: [
-        {
-          type: 'contract' as const,
-          contractIds: [env.SETTLEMENT_CONTRACT_ID],
-          topics: [],
-        },
-      ],
+      startLedger: latestLedgerCursor ?? 0,
+      filters: CONTRACT_IDS.map((contractId) => ({
+        type: 'contract' as const,
+        contractIds: [contractId],
+        topics: [],
+      })),
       limit: 100,
     });
 
@@ -384,14 +418,17 @@ async function pollEvents() {
         const topics = Array.isArray(evt.topic) ? evt.topic.map(String) : [String(evt.topic)];
         const rawValue = evt.value.toXDR('base64');
         const decodedPayload = decodeScVal(evt.value, topics[0]);
-        const contractId = evt.contractId ? evt.contractId.toString() : 'unknown';
+        const resolvedContractId = evt.contractId ? evt.contractId.toString() : CONTRACT_IDS[0];
+        const contractName = getContractName(resolvedContractId);
         const stellarId = typeof evt.id === 'string' ? evt.id : null;
 
-        await persistEvent(stellarId, topics, topics[0], contractId, rawValue, decodedPayload, evt.ledger);
-        latestLedgerCursor = Math.max(latestLedgerCursor ?? 0, evt.ledger + 1);
+        await persistEvent(stellarId, topics, topics[0], resolvedContractId, contractName, rawValue, decodedPayload, evt.ledger);
+        if (latestLedgerCursor !== undefined) {
+          latestLedgerCursor = Math.max(latestLedgerCursor, evt.ledger + 1);
+        }
       }
-    } else if (latestLedgerSequence !== undefined) {
-      latestLedgerCursor = Math.max(latestLedgerCursor ?? 0, latestLedgerSequence);
+    } else if (latestLedgerSequence !== undefined && latestLedgerCursor !== undefined) {
+      latestLedgerCursor = Math.max(latestLedgerCursor, latestLedgerSequence);
     }
 
     latestLedgerCursor = cursor;
@@ -415,6 +452,80 @@ async function pollEvents() {
   }
 }
 
+export function cleanupOldEvents(): number {
+  const retentionDays = env.EVENT_RETENTION_DAYS;
+  if (retentionDays <= 0) {
+    return 0;
+  }
+
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+  let totalDeleted = 0;
+  const batchSize = 1000;
+
+  while (true) {
+    const toDeleteIndices: number[] = [];
+    for (let i = 0; i < events.length; i++) {
+      const indexedAt = events[i].indexedAt;
+      if (indexedAt) {
+        const date = new Date(indexedAt);
+        if (!isNaN(date.getTime()) && date < cutoff) {
+          toDeleteIndices.push(i);
+          if (toDeleteIndices.length === batchSize) {
+            break;
+          }
+        }
+      }
+    }
+
+    if (toDeleteIndices.length === 0) {
+      break;
+    }
+
+    // Delete matching records from the events array (back to front to preserve correct indices during deletion)
+    for (let i = toDeleteIndices.length - 1; i >= 0; i--) {
+      events.splice(toDeleteIndices[i], 1);
+    }
+
+    totalDeleted += toDeleteIndices.length;
+  }
+
+  return totalDeleted;
+}
+
+export function runCleanupJob(): void {
+  try {
+    const deletedCount = cleanupOldEvents();
+    fastify.log.info({
+      retentionDays: env.EVENT_RETENTION_DAYS,
+      deletedCount,
+      status: 'success'
+    }, `[Indexer] Event retention cleanup completed. Retention period: ${env.EVENT_RETENTION_DAYS} days. Deleted: ${deletedCount} events. Status: success`);
+  } catch (error: any) {
+    fastify.log.error({
+      retentionDays: env.EVENT_RETENTION_DAYS,
+      error: error?.message || error,
+      status: 'failed'
+    }, `[Indexer] Event retention cleanup failed. Retention period: ${env.EVENT_RETENTION_DAYS} days. Error: ${error}. Status: failed`);
+  }
+}
+
+let cleanupInterval: NodeJS.Timeout | undefined = undefined;
+
+export function startCleanupScheduler() {
+  if (env.EVENT_RETENTION_DAYS > 0) {
+    // Run once during startup
+    runCleanupJob();
+    // Schedule every 24 hours
+    cleanupInterval = setInterval(runCleanupJob, 24 * 60 * 60 * 1000);
+  }
+}
+
+export function stopCleanupScheduler() {
+  if (cleanupInterval) {
+    clearInterval(cleanupInterval);
+    cleanupInterval = undefined;
+  }
+}
 // ── Startup ───────────────────────────────────────────────────────────────────
 
 const start = async () => {
@@ -423,6 +534,7 @@ const start = async () => {
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
     fastify.log.info('[Indexer] Starting Stellar RPC polling loop...');
     pollEvents();
+    startCleanupScheduler();
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

@@ -49,3 +49,9 @@ coverage/
 Thumbs.db
 
 /generated/prisma
+
+# PostgreSQL local development databases & temp files
+pgdata/
+pgsql/
+*.zip
+

@@ -1,13 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert';
 import {
+  AmountString,
   CreateMerchantBody,
   CreatePaymentBody,
   CreateSettlementBody,
   DateRangeQuery,
   IdempotencyKeySchema,
   PaginationQuery,
+  PositiveAmountString,
   StellarAddressSchema,
+  WebhookUrlSchema,
   merchantSchema,
   paymentSchema,
   walletSchema,
@@ -15,6 +18,133 @@ import {
 
 const VALID_STELLAR_PUBLIC_KEY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const INVALID_STELLAR_PUBLIC_KEY = 'merchant-1';
+
+test('WebhookUrlSchema validation', async (t) => {
+  await t.test('Valid HTTPS URL passes', () => {
+    const result = WebhookUrlSchema.parse('https://example.com/hook');
+    assert.strictEqual(result, 'https://example.com/hook');
+  });
+
+  await t.test('Valid HTTP URL passes in non-production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'development';
+    try {
+      const result = WebhookUrlSchema.parse('http://example.com/hook');
+      assert.strictEqual(result, 'http://example.com/hook');
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('Non-URL string fails', () => {
+    assert.throws(() => WebhookUrlSchema.parse('not-a-url'), /valid URL/);
+  });
+
+  await t.test('URL exceeding 2048 characters fails', () => {
+    const long = 'https://example.com/' + 'a'.repeat(2048);
+    assert.throws(() => WebhookUrlSchema.parse(long), /2048/);
+  });
+
+  await t.test('HTTP URL rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('http://example.com/hook'),
+        /HTTPS/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('localhost rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('https://localhost/hook'),
+        /localhost|private/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('127.0.0.1 rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('https://127.0.0.1/hook'),
+        /localhost|private/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('Private IP 192.168.x.x rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('https://192.168.1.1/hook'),
+        /localhost|private/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('Private IP 10.x.x.x rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('https://10.0.0.1/hook'),
+        /localhost|private/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('Private IP 172.16.x.x rejected in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      assert.throws(
+        () => WebhookUrlSchema.parse('https://172.16.0.1/hook'),
+        /localhost|private/
+      );
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('Public IP passes in production', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const result = WebhookUrlSchema.parse('https://93.184.216.34/hook');
+      assert.strictEqual(result, 'https://93.184.216.34/hook');
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  await t.test('localhost allowed in development', () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'development';
+    try {
+      const result = WebhookUrlSchema.parse('http://localhost:3000/hook');
+      assert.strictEqual(result, 'http://localhost:3000/hook');
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+});
 
 test('PaginationQuery validation', async (t) => {
   await t.test('Default limit is 50', () => {
