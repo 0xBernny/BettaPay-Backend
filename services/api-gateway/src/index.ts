@@ -41,6 +41,7 @@ import {
   CreateSettlementBody,
   AuthTokenBody,
   UpdatePaymentStatusBody,
+  UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
   createErrorResponse,
   ErrorCodes,
@@ -103,6 +104,10 @@ interface UpdateMerchantSettingsRouteBody {
 }
 
 interface UpdatePaymentStatusRouteBody {
+  status?: unknown;
+}
+
+interface UpdateSettlementStatusRouteBody {
   status?: unknown;
 }
 
@@ -641,6 +646,41 @@ fastify.patch<{ Params: PaymentParams; Body: UpdatePaymentStatusRouteBody }>('/a
   const updated = await prisma.payment.update({
     where: { id },
     data: { status: d.status },
+  });
+  return reply.send(updated);
+});
+
+fastify.patch<{ Params: { id: string }; Body: UpdateSettlementStatusRouteBody }>('/api/settlements/:id/status', {
+  preValidation: [fastify.authenticate],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  let d;
+  try {
+    d = UpdateSettlementStatusBody.parse(request.body);
+  } catch (error) {
+    return badRequest(reply, error);
+  }
+
+  const { id } = request.params;
+  const settlement = await prisma.settlement.findUnique({ where: { id } });
+  if (!settlement) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Settlement not found'));
+
+  const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
+  if (!allowed.includes(d.status)) {
+    return reply.code(422).send({
+      error: 'Invalid status transition',
+      from: settlement.status,
+      to: d.status,
+    });
+  }
+
+  const updated = await prisma.settlement.update({
+    where: { id },
+    data: {
+      status: d.status,
+      ...(d.status === 'completed' || d.status === 'failed' ? { completedAt: new Date() } : {}),
+    }
   });
   return reply.send(updated);
 });
