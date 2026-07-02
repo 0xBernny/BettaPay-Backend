@@ -1,15 +1,7 @@
 import test from 'tape';
 import Fastify from 'fastify';
 import { z } from 'zod';
-import { createErrorResponse, ErrorCodes } from '@bettapay/validation';
-
-// Mirrors the badRequest helper in src/index.ts.
-function badRequest(reply: any, error: unknown) {
-  if (error instanceof z.ZodError) {
-    return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Validation failed', error.errors));
-  }
-  return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Invalid request payload'));
-}
+import { registerErrorHandler, createErrorResponse, ErrorCodes } from '@bettapay/validation';
 
 test('createErrorResponse builds the standard envelope', (t) => {
   const res = createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found');
@@ -27,15 +19,12 @@ test('createErrorResponse includes details when provided', (t) => {
 
 test('a Zod failure returns a 400 VALIDATION_ERROR with the issue list in details', async (t) => {
   const app = Fastify({ logger: false });
+  registerErrorHandler(app);
   const Body = z.object({ amount: z.string().regex(/^\d+$/, 'amount must be numeric') });
 
   app.post('/x', async (request, reply) => {
-    try {
-      Body.parse(request.body);
-      return reply.send({ ok: true });
-    } catch (error) {
-      return badRequest(reply, error);
-    }
+    Body.parse(request.body);
+    return reply.send({ ok: true });
   });
 
   const res = await app.inject({ method: 'POST', url: '/x', payload: { amount: 'not-a-number' } });

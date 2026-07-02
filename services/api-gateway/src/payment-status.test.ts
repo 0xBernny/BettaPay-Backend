@@ -1,6 +1,6 @@
 import test from 'tape';
 import Fastify from 'fastify';
-import { UpdatePaymentStatusBody } from '@bettapay/validation';
+import { UpdatePaymentStatusBody, createErrorResponse, ErrorCodes } from '@bettapay/validation';
 
 // Mirrors the PATCH /api/payments/:id/status logic in src/index.ts, but backed by
 // an in-memory store so the test does not need a database (same self-contained
@@ -25,14 +25,14 @@ function buildApp(initialStatus: string) {
       try {
         d = UpdatePaymentStatusBody.parse(request.body);
       } catch {
-        return reply.code(400).send({ error: 'Invalid request payload' });
+        return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Invalid request payload'));
       }
 
-      if (!payment) return reply.code(404).send({ error: 'Payment not found' });
+      if (!payment) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Payment not found'));
 
       const allowed = PAYMENT_STATUS_TRANSITIONS[payment.status] ?? [];
       if (!allowed.includes(d.status)) {
-        return reply.code(422).send({ error: 'Invalid status transition', from: payment.status, to: d.status });
+        return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid status transition', { from: payment.status, to: d.status }));
       }
 
       payment.status = d.status;
@@ -60,7 +60,7 @@ test('terminal states cannot transition', async (t) => {
   const app = buildApp('completed');
   const res = await patch(app, 'failed');
   t.equal(res.statusCode, 422, 'returns 422 Unprocessable Entity');
-  t.equal(JSON.parse(res.body).from, 'completed', 'reports the current state');
+  t.equal(JSON.parse(res.body).error.details.from, 'completed', 'reports the current state');
   await app.close();
   t.end();
 });

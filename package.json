@@ -4,7 +4,6 @@
   "private": true,
   "description": "BettaPay backend services — API gateway, FX engine, settlement engine, indexer",
   "type": "module",
-  "packageManager": "pnpm@9.0.0",
   "engines": {
     "node": ">=20.0.0"
   },
@@ -21,9 +20,11 @@
     "fx:dev": "pnpm --filter fx-engine dev",
     "settlement:dev": "pnpm --filter settlement-engine dev",
     "indexer:dev": "pnpm --filter indexer dev",
-    "clean": "pnpm -r clean && rm -rf node_modules"
+    "clean": "pnpm -r clean && rm -rf node_modules",
+    "test": "pnpm --filter @bettapay/validation test && pnpm --filter api-gateway test"
   },
   "devDependencies": {
+    "cross-env": "^7.0.3",
     "dotenv": "^17.4.2",
     "prettier": "^3.1.1",
     "prisma": "^7.8.0",
@@ -38,6 +39,9 @@
     "bullmq": "^5.78.0",
     "fastify": "^5.8.5",
     "ioredis": "^5.11.1"
+  },
+  "prisma": {
+    "seed": "ts-node --esm prisma/seed.ts"
   },
   "pnpm": {
     "overrides": {

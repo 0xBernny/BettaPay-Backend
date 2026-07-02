@@ -1,6 +1,6 @@
 import test from 'tape';
 import Fastify from 'fastify';
-
+import { createErrorResponse, ErrorCodes } from '@bettapay/validation';
 // These mirror the request-timeout configuration in src/index.ts. The test stays
 // self-contained (like authenticate.test.ts) so it does not boot the real server.
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -18,7 +18,7 @@ function buildApp(handlerTimeoutMs: number) {
   app.addHook('onRequest', async (request, reply) => {
     const timeoutTimer = setTimeout(() => {
       if (!reply.sent) {
-        reply.code(408).send({ error: 'Request Timeout' });
+        reply.code(408).send(createErrorResponse(ErrorCodes.REQUEST_TIMEOUT, 'Request Timeout'));
       }
     }, handlerTimeoutMs);
     (request as any).__timeoutTimer = timeoutTimer;
@@ -43,7 +43,7 @@ function buildApp(handlerTimeoutMs: number) {
 test('Fastify uses the documented request and connection timeouts', async (t) => {
   const app = buildApp(REQUEST_TIMEOUT_MS);
   t.equal((app.initialConfig as any).requestTimeout, 30_000, 'requestTimeout is 30s');
-  t.equal(app.initialConfig.connectionTimeout, 31_000, 'connectionTimeout is 31s (1s above requestTimeout)');
+  t.equal((app.initialConfig as any).connectionTimeout, 31_000, 'connectionTimeout is 31s (1s above requestTimeout)');
   await app.close();
   t.end();
 });
@@ -54,7 +54,7 @@ test('a request that exceeds the timeout returns 408', async (t) => {
 
   const slow = await app.inject({ method: 'GET', url: '/slow' });
   t.equal(slow.statusCode, 408, 'slow handler returns 408 Request Timeout');
-  t.equal(JSON.parse(slow.body).error, 'Request Timeout', 'body reports Request Timeout');
+  t.equal(JSON.parse(slow.body).error.message, 'Request Timeout', 'body reports Request Timeout');
 
   const fast = await app.inject({ method: 'GET', url: '/fast' });
   t.equal(fast.statusCode, 200, 'a fast handler still returns 200');

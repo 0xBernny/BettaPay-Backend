@@ -1,11 +1,11 @@
 import test from 'tape';
+import { FeeRule } from '@bettapay/validation';
 
 // Mirrors the resolution logic in fetchMerchantFeeBps (src/index.ts), without a
 // database: given a merchant record, pick settings.feeBps or fall back to default.
 function resolveFeeBps(merchant: { settings?: unknown } | null, defaultBps: number): number {
-  const settings = merchant?.settings as { feeBps?: number } | null | undefined;
-  const feeBps = settings?.feeBps;
-  return typeof feeBps === 'number' && Number.isFinite(feeBps) ? feeBps : defaultBps;
+  const parsed = FeeRule.passthrough().safeParse(merchant?.settings);
+  return parsed.success ? parsed.data.feeBps : defaultBps;
 }
 
 test('a configured feeBps is used', (t) => {

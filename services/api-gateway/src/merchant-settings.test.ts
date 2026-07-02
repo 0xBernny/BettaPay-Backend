@@ -1,6 +1,6 @@
 import test from 'tape';
 import Fastify from 'fastify';
-import { UpdateMerchantSettingsBody } from '@bettapay/validation';
+import { UpdateMerchantSettingsBody, createErrorResponse, ErrorCodes } from '@bettapay/validation';
 
 // Mirrors PATCH /api/merchants/:id/settings from src/index.ts, backed by an
 // in-memory merchant so the test does not need a database.
@@ -13,9 +13,9 @@ function buildApp(initial: Record<string, unknown> | 'missing') {
     try {
       d = UpdateMerchantSettingsBody.parse(request.body);
     } catch {
-      return reply.code(400).send({ error: 'Invalid request payload' });
+      return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Invalid request payload'));
     }
-    if (!merchant) return reply.code(404).send({ error: 'Merchant not found' });
+    if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     merchant.settings = { ...(merchant.settings ?? {}), ...d };
     return reply.code(200).send({ success: true, merchant });
   });
@@ -23,8 +23,8 @@ function buildApp(initial: Record<string, unknown> | 'missing') {
   return app;
 }
 
-async function patch(app: ReturnType<typeof buildApp>, payload: unknown) {
-  return app.inject({ method: 'PATCH', url: '/api/merchants/m1/settings', payload: payload as any });
+async function patch(app: any, payload: any) {
+  return app.inject({ method: 'PATCH', url: '/api/merchants/m1/settings', payload });
 }
 
 test('updating feeBps merges into existing settings', async (t) => {
