@@ -47,6 +47,12 @@ model Payment {
   // duplicate creation even under concurrent requests.
   idempotencyKey          String?       @unique
   idempotencyKeyExpiresAt DateTime?
+  // FX conversion metadata (populated when convertTo is supplied at creation)
+  convertTo              String?
+  convertedAmount         String?
+  fxRate                  String?
+  fxQuoteId               String?
+  fxQuoteExpiresAt        DateTime?
 }
 
 model Settlement {

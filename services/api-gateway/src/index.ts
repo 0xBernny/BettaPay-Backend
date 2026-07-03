@@ -35,6 +35,7 @@ import {
   createSettlementClient,
   SettlementEngineUnavailableError,
 } from './clients/settlement-client.js';
+import { createFxClient } from './clients/fx-client.js';
 import {
   CreateMerchantBody,
   CreatePaymentBody,
@@ -89,6 +90,7 @@ interface CreatePaymentRouteBody {
   asset?: unknown;
   convertTo?: unknown;
   reference?: unknown;
+  convertTo?: unknown;
 }
 
 interface CreateSettlementRouteBody {
