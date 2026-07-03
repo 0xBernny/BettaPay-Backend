@@ -3,8 +3,27 @@ import { propagateTracingHeaders } from '@bettapay/validation';
 type IncomingHeaders = Record<string, string | string[] | undefined>;
 
 interface MinimalLogger {
+  info?: (obj: unknown, msg?: string) => void;
   warn: (obj: unknown, msg?: string) => void;
-  info: (obj: unknown, msg?: string) => void;
+}
+
+export interface FxQuoteRequest {
+  from: string;
+  to: string;
+  amount: string;
+}
+
+export interface FxQuoteResponse {
+  quoteId: string | null;
+  from: string;
+  to: string;
+  amount: string;
+  result: string;
+  rate: string;
+  slippageBps: number;
+  slippageLimit: string;
+  cachedAt: string;
+  expiresAt: string;
 }
 
 export interface FxClientOptions {
@@ -15,40 +34,11 @@ export interface FxClientOptions {
   logger?: MinimalLogger;
 }
 
-export interface FxQuote {
-  quoteId: string | null;
-  from: string;
-  to: string;
-  amount: string;
-  result: string;
-  rate: string;
-  slippageBps: number;
-  slippageLimit: string;
-  expiresAt: string;
-}
-
-export interface FxClientResult {
-  status: number;
-  body: FxQuote;
-}
-
 export interface FxClient {
-  getQuote(
-    from: string,
-    to: string,
-    amount: string,
-    incomingHeaders?: IncomingHeaders
-  ): Promise<FxClientResult>;
+  getQuote(request: FxQuoteRequest, incomingHeaders?: IncomingHeaders): Promise<FxQuoteResponse | null>;
 }
 
 export const DEFAULT_FX_TIMEOUT_MS = 5_000;
-
-export class FxEngineUnavailableError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'FxEngineUnavailableError';
-  }
-}
 
 export function createFxClient(options: FxClientOptions): FxClient {
   const {
@@ -60,46 +50,56 @@ export function createFxClient(options: FxClientOptions): FxClient {
   } = options;
 
   const root = baseUrl.replace(/\/+$/, '');
-  const authHeaders: Record<string, string> = serviceToken
-    ? { 'x-service-token': serviceToken }
-    : {};
 
   async function getQuote(
-    from: string,
-    to: string,
-    amount: string,
-    incomingHeaders: IncomingHeaders = {}
-  ): Promise<FxClientResult> {
-    const params = new URLSearchParams({ from, to, amount });
-    const url = `${root}/api/quote?${params.toString()}`;
-    const headers = propagateTracingHeaders(incomingHeaders, {
-      ...authHeaders,
-      'content-type': 'application/json',
+    quoteRequest: FxQuoteRequest,
+    incomingHeaders: IncomingHeaders = {},
+  ): Promise<FxQuoteResponse | null> {
+    const query = new URLSearchParams({
+      from: quoteRequest.from,
+      to: quoteRequest.to,
+      amount: quoteRequest.amount,
     });
+    const url = `${root}/api/quote?${query.toString()}`;
 
+    const baseHeaders: Record<string, string> = {};
+    if (serviceToken) {
+      baseHeaders['x-service-token'] = serviceToken;
+    } else {
+      const authorization = incomingHeaders.authorization ?? incomingHeaders.Authorization;
+      const token = Array.isArray(authorization) ? authorization[0] : authorization;
+      if (token) baseHeaders.authorization = token;
+    }
+
+    const headers = propagateTracingHeaders(incomingHeaders, baseHeaders);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const startedAt = Date.now();
 
     try {
-      const response = await fetchImpl(url, {
-        method: 'GET',
-        headers,
-        signal: controller.signal,
-      });
+      const res = await fetchImpl(url, { signal: controller.signal, headers });
+      const durationMs = Date.now() - startedAt;
 
-      const body = await response.json() as FxQuote;
+      if (!res.ok) {
+        logger?.warn(
+          { status: res.status, durationMs, from: quoteRequest.from, to: quoteRequest.to },
+          'fx-client: non-OK quote response - continuing without quote',
+        );
+        return null;
+      }
 
-      logger?.info(
-        { from, to, amount, quoteId: body.quoteId, status: response.status },
-        'fx-engine quote fetched'
+      const body = (await res.json()) as FxQuoteResponse;
+      logger?.info?.(
+        { durationMs, from: quoteRequest.from, to: quoteRequest.to },
+        'fx-client: quote fetched',
       );
-
-      return { status: response.status, body };
+      return body;
     } catch (err) {
-      logger?.warn({ err, from, to, amount }, 'fx-engine request failed');
-      throw new FxEngineUnavailableError(
-        err instanceof Error ? err.message : 'fx-engine unavailable'
+      logger?.warn(
+        { err, from: quoteRequest.from, to: quoteRequest.to },
+        'fx-client: quote request failed - continuing without quote',
       );
+      return null;
     } finally {
       clearTimeout(timer);
     }

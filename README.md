@@ -90,3 +90,17 @@ import { validateEnv } from '../../shared/validation/index.js';
 ```
 
 No workspace aliases. Each service is independently workable.
+
+## Database Migrations
+
+Prisma is used for ORM and schema migrations.
+
+To apply migrations to a new or existing database:
+```bash
+npx prisma migrate deploy
+```
+
+To create a new migration during development:
+```bash
+npx prisma migrate dev --name <migration_name>
+```

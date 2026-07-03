@@ -76,6 +76,7 @@ model IndexedEvent {
   id             String   @id
   stellarId      String?  @unique
   contractId     String
+  contractName   String?
   topics         String[]
   type           String
   rawValue       String

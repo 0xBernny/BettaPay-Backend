@@ -28,27 +28,28 @@ import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
+import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
+import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient } from './clients/indexer-client.js';
 import {
   createSettlementClient,
   SettlementEngineUnavailableError,
 } from './clients/settlement-client.js';
-import {
-  createFxClient,
-  FxEngineUnavailableError,
-} from './clients/fx-client.js';
+import { createFxClient } from './clients/fx-client.js';
 import {
   CreateMerchantBody,
   CreatePaymentBody,
   CreateSettlementBody,
   AuthTokenBody,
   UpdatePaymentStatusBody,
+  UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
   createErrorResponse,
   ErrorCodes,
   registerErrorHandler
 } from '@bettapay/validation';
+import type { Merchant } from '@prisma/client';
+import type { ApiResponse, PaginatedResponse } from '@bettapay/shared-types';
 import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import helmet from '@fastify/helmet';
@@ -87,6 +88,7 @@ interface CreatePaymentRouteBody {
   payerId?: unknown;
   amount?: unknown;
   asset?: unknown;
+  convertTo?: unknown;
   reference?: unknown;
   convertTo?: unknown;
 }
@@ -104,6 +106,10 @@ interface UpdateMerchantSettingsRouteBody {
 }
 
 interface UpdatePaymentStatusRouteBody {
+  status?: unknown;
+}
+
+interface UpdateSettlementStatusRouteBody {
   status?: unknown;
 }
 
@@ -297,7 +303,11 @@ function hashSecret(secret: string): string {
   return crypto.createHash('sha256').update(secret).digest('hex');
 }
 
-const pool = new pg.Pool({ connectionString: env.DATABASE_URL });
+const pool = new pg.Pool({
+  connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
+  max: env.DATABASE_POOL_SIZE,
+  connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
+});
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
 setupPrismaQueryLogging(prisma, fastify.log);
@@ -450,13 +460,16 @@ fastify.post<{ Body: CreateMerchantRouteBody }>('/api/merchants', {
 
 fastify.get<{ Params: MerchantParams }>('/api/merchants/:id', {
   preValidation: [fastify.authenticate]
-}, async (request, reply) => {
+}, async (request, reply): Promise<ApiResponse<Merchant>> => {
   const { id } = request.params;
   const merchant = await prisma.merchant.findFirst({
     where: { id, deletedAt: null },
   });
-  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
-  return merchant;
+  if (!merchant) {
+    reply.code(404);
+    return { error: createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found') };
+  }
+  return { data: merchant };
 });
 
 fastify.delete<{ Params: MerchantParams }>('/api/merchants/:id', {
@@ -556,86 +569,40 @@ fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
     }
   }
 
-  // ── 4. Optionally fetch FX quote if convertTo is specified ────────────────
-  let fxQuote: { quoteId: string | null; rate: string; result: string; to: string; expiresAt: string } | null = null;
-
-  if (d.convertTo) {
-    const convertTo = String(d.convertTo).toUpperCase();
-    if (convertTo === d.asset.toUpperCase()) {
-      return reply.code(400).send(
-        createErrorResponse(
-          ErrorCodes.VALIDATION_ERROR,
-          'convertTo must differ from the payment asset',
-          { asset: d.asset, convertTo }
-        )
-      );
-    }
-
-    try {
-      const fxResult = await fxClient.getQuote(d.asset, convertTo, d.amount, request.headers);
-      if (fxResult.status === 200) {
-        fxQuote = {
-          quoteId: fxResult.body.quoteId,
-          rate: fxResult.body.rate,
-          result: fxResult.body.result,
-          to: fxResult.body.to,
-          expiresAt: fxResult.body.expiresAt,
-        };
-        request.log.info(
-          { quoteId: fxResult.body.quoteId, from: d.asset, to: convertTo, rate: fxResult.body.rate },
-          'FX quote fetched for payment'
-        );
-      } else {
-        request.log.warn(
-          { status: fxResult.status, from: d.asset, to: convertTo },
-          'fx-engine returned non-200 for quote; proceeding without conversion'
-        );
-      }
-    } catch (err) {
-      if (err instanceof FxEngineUnavailableError) {
-        request.log.warn(
-          { err, from: d.asset, to: convertTo },
-          'fx-engine unavailable; proceeding without conversion'
-        );
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  // ── 5. Create the payment ──────────────────────────────────────────────────
+  // ── 4. Create the payment (with idempotency fields when a key was supplied) ──
   const idempotencyKeyExpiresAt = idempotencyKey
     ? new Date(Date.now() + IDEMPOTENCY_TTL_MS)
     : null;
 
-  const paymentData: Record<string, unknown> = {
-    id: 'pay_' + crypto.randomUUID().replace(/-/g, ''),
-    merchantId: d.merchantId,
-    payerId: d.payerId,
-    amount: d.amount,
-    asset: d.asset,
-    reference: d.reference,
-    status: 'initiated',
-    idempotencyKey: idempotencyKey ?? undefined,
-    idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
-  };
+    const fxQuote = d.convertTo
+      ? await fxClient.getQuote(
+          { from: d.asset, to: d.convertTo, amount: d.amount },
+          request.headers,
+        )
+      : null;
 
-  if (fxQuote) {
-    paymentData.convertTo = fxQuote.to;
-    paymentData.convertedAmount = fxQuote.result;
-    paymentData.fxRate = fxQuote.rate;
-    paymentData.fxQuoteId = fxQuote.quoteId;
-    paymentData.fxQuoteExpiresAt = new Date(fxQuote.expiresAt);
-  }
-
-  const payment = await prisma.payment.create({
-    data: paymentData as any,
-  });
+    const payment = await prisma.payment.create({
+      data: {
+        id: 'pay_' + crypto.randomUUID().replace(/-/g, ''),
+        merchantId: d.merchantId,
+        payerId: d.payerId,
+        amount: d.amount,
+        asset: d.asset,
+        reference: d.reference,
+        status: 'initiated',
+        idempotencyKey: idempotencyKey ?? undefined,
+        idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
+      },
+    });
 
     request.log.info(
       { idempotencyKey, paymentId: payment.id },
       idempotencyKey ? 'Idempotency miss — payment created' : 'Payment created (no idempotency key)'
     );
+
+    if (d.convertTo) {
+      return reply.code(201).send({ ...payment, fxQuote });
+    }
 
     return reply.code(201).send(payment);
 });
@@ -681,6 +648,41 @@ fastify.patch<{ Params: PaymentParams; Body: UpdatePaymentStatusRouteBody }>('/a
   const updated = await prisma.payment.update({
     where: { id },
     data: { status: d.status },
+  });
+  return reply.send(updated);
+});
+
+fastify.patch<{ Params: { id: string }; Body: UpdateSettlementStatusRouteBody }>('/api/settlements/:id/status', {
+  preValidation: [fastify.authenticate],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  let d;
+  try {
+    d = UpdateSettlementStatusBody.parse(request.body);
+  } catch (error) {
+    return badRequest(reply, error);
+  }
+
+  const { id } = request.params;
+  const settlement = await prisma.settlement.findUnique({ where: { id } });
+  if (!settlement) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Settlement not found'));
+
+  const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
+  if (!allowed.includes(d.status)) {
+    return reply.code(422).send({
+      error: 'Invalid status transition',
+      from: settlement.status,
+      to: d.status,
+    });
+  }
+
+  const updated = await prisma.settlement.update({
+    where: { id },
+    data: {
+      status: d.status,
+      ...(d.status === 'completed' || d.status === 'failed' ? { completedAt: new Date() } : {}),
+    }
   });
   return reply.send(updated);
 });
@@ -887,23 +889,6 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 const start = async () => {
   try {
     await connectWithRetry(prisma, fastify.log);
-
-    // Seed admin merchant
-    const adminSecret = env.ADMIN_SECRET;
-    const adminSecretHash = hashSecret(adminSecret);
-    await prisma.merchant.upsert({
-      where: { id: env.ADMIN_ADDRESS },
-      update: {
-        secretHash: adminSecretHash
-      },
-      create: {
-        id: env.ADMIN_ADDRESS,
-        name: 'BettaPay Merchant LLC',
-        ownerId: 'admin-user-001',
-        settings: { preferredAsset: 'USDC', autoSettle: true },
-        secretHash: adminSecretHash
-      }
-    });
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {

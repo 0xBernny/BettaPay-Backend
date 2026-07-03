@@ -5,12 +5,15 @@ import { FastifyRequest } from 'fastify';
 import { resolveAllowedOrigins } from './cors.js';
 
 export * from './schemas.js';
+export * from './currency.js';
 export * from './plugins.js';
 export * from './prisma.js';
 export * from './cors.js';
 export * from './tracing.js';
 export * from './fastify-plugins.js';
 export * from './logger.js';
+export * from './envAwareSchema.js';
+export * from './webhookSchema.js';
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {
@@ -84,6 +87,16 @@ export const EnvSchema = z.object({
   // Database — required; services crash fast if not provided
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
 
+  // Connection pool — limits concurrent DB connections and prevents
+  // connection exhaustion under burst traffic. Pool timeout ensures
+  // a stalled query does not block the entire service indefinitely.
+  // Values are applied as ?connection_limit=N&pool_timeout=10 on the
+  // connection URL; pg.Pool.max is set to the same size for adapter-
+  // based clients (api-gateway). Default of 10 matches pg.Pool's own
+  // built-in default and is safe for most workloads.
+  DATABASE_POOL_SIZE: z.string().transform((s) => parseInt(s, 10)).default('10'),
+  DATABASE_POOL_TIMEOUT: z.string().transform((s) => parseInt(s, 10)).default('10'),
+
   // Redis — optional, falls back to localhost
   REDIS_URL: z.string().default('redis://localhost:6379'),
   REDIS_MAX_RETRIES: z.string().transform((s) => parseInt(s, 10)).default('3'),
@@ -98,6 +111,11 @@ export const EnvSchema = z.object({
   GOVERNANCE_CONTRACT_ID: z.string().min(1, 'GOVERNANCE_CONTRACT_ID is required'),
   ADMIN_ADDRESS: z.string().min(1, 'ADMIN_ADDRESS is required'),
   ADMIN_SECRET: z.string().min(1, 'ADMIN_SECRET is required'),
+
+  // Multi-contract indexing — comma-separated contract IDs; falls back to
+  // SETTLEMENT_CONTRACT_ID for backward compatibility.
+  CONTRACT_IDS: z.string().optional(),
+  CONTRACT_NAMES: z.string().optional(),
 
   // Service URLs (used by gateway to proxy requests)
   FX_ENGINE_URL: z.string().url().default('http://localhost:3002'),
@@ -119,8 +137,9 @@ export const EnvSchema = z.object({
   INDEXER_LAG_WARN_THRESHOLD: z.string().transform((s) => parseInt(s, 10)).default('10'),
 });
 
-export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS'> & {
+export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS'> & {
   ALLOWED_ORIGINS: string[];
+  CONTRACT_IDS: string[];
 };
 
 export function validateEnv(env: Record<string, unknown>): Env {
@@ -131,7 +150,17 @@ export function validateEnv(env: Record<string, unknown>): Env {
 
   try {
     const parsed = EnvSchema.parse(env);
-    return { ...parsed, ALLOWED_ORIGINS: origins };
+
+    const contractIds = (parsed.CONTRACT_IDS ?? parsed.SETTLEMENT_CONTRACT_ID)
+      .split(',')
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0);
+
+    if (contractIds.length === 0) {
+      throw new Error('\n[BettaPay] Invalid or missing environment variables:\n  CONTRACT_IDS: at least one contract ID must be provided\n');
+    }
+
+    return { ...parsed, ALLOWED_ORIGINS: origins, CONTRACT_IDS: contractIds };
   } catch (error) {
     if (error instanceof z.ZodError) {
       const message = error.errors.map((e) => `  ${e.path.join('.')}: ${e.message}`).join('\n');
