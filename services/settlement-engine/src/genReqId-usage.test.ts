@@ -15,3 +15,14 @@ test('Settlement Engine imports and uses shared registerRequestId plugin', (t) =
   t.match(content, /registerRequestId\(fastify\)/s, 'index.ts should call registerRequestId(fastify)');
   t.end();
 });
+
+test('Settlement Engine configures BullMQ Redis retry options', (t) => {
+  const indexPath = path.resolve(__dirname, './index.ts');
+  const content = fs.readFileSync(indexPath, 'utf-8');
+
+  t.match(content, /maxRetriesPerRequest:\s*env\.REDIS_MAX_RETRIES/s, 'BullMQ max retries should come from REDIS_MAX_RETRIES');
+  t.match(content, /enableReadyCheck:\s*false/s, 'BullMQ should disable Redis ready checks for compatibility');
+  t.match(content, /retryStrategy:\s*\(times:\s*number\)/s, 'BullMQ should configure an explicit retryStrategy');
+  t.match(content, /Math\.min\(times \* 1000,\s*30000\)/s, 'retryStrategy should cap reconnect delay');
+  t.end();
+});
