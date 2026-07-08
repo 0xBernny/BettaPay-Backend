@@ -31,7 +31,7 @@ test('updating feeBps merges into existing settings', async (t) => {
   const app = buildApp({ tier: 'silver', autoSettle: true });
   const res = await patch(app, { feeBps: 75 });
   t.equal(res.statusCode, 200, 'returns 200');
-  const settings = JSON.parse(res.body).merchant.settings;
+  const settings = JSON.parse(res.body as string).merchant.settings;
   t.equal(settings.feeBps, 75, 'feeBps is set');
   t.equal(settings.autoSettle, true, 'unrelated settings are preserved');
   await app.close();
@@ -40,7 +40,7 @@ test('updating feeBps merges into existing settings', async (t) => {
 
 test('updating a missing merchant returns 404', async (t) => {
   const app = buildApp('missing');
-  const res = await patch(app, { feeBps: 75 });
+  const res = await patch(app, { feeBps: 75 }) as any;
   t.equal(res.statusCode, 404, 'returns 404');
   await app.close();
   t.end();
@@ -48,7 +48,7 @@ test('updating a missing merchant returns 404', async (t) => {
 
 test('an out-of-range feeBps is rejected', async (t) => {
   const app = buildApp({});
-  const res = await patch(app, { feeBps: 20000 });
+  const res = await patch(app, { feeBps: 20000 }) as any;
   t.equal(res.statusCode, 400, 'returns 400 for feeBps above 10000');
   await app.close();
   t.end();

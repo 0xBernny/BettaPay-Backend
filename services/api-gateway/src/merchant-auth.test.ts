@@ -51,7 +51,7 @@ function buildApp(initialMerchants: any[] = []) {
       const merchant = {
         id: d.id,
         name: d.name,
-        ownerId: d.ownerId || 'unknown',
+        ownerId: d.ownerId,
         settings: d.settings || {},
         secretHash,
       };
@@ -147,7 +147,7 @@ test('merchant creation hashes secrets and plaintext secrets are never persisted
     const res1 = await app.inject({
       method: 'POST',
       url: '/api/merchants',
-      payload: { id: 'm-new-1', name: 'New Merchant', secret: 'my-custom-secret' }
+      payload: { id: 'm-new-1', name: 'New Merchant', ownerId: 'user-new-1', secret: 'my-custom-secret' }
     });
 
     t.equal(res1.statusCode, 201, 'creation succeeds');
@@ -164,7 +164,7 @@ test('merchant creation hashes secrets and plaintext secrets are never persisted
     const res2 = await app.inject({
       method: 'POST',
       url: '/api/merchants',
-      payload: { id: 'm-new-2', name: 'Generated Merchant' }
+      payload: { id: 'm-new-2', name: 'Generated Merchant', ownerId: 'user-new-2' }
     });
 
     t.equal(res2.statusCode, 201, 'creation with generated secret succeeds');
