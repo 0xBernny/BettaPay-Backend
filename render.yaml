@@ -1,0 +1,153 @@
+services:
+  # ── API Gateway (Public Web Service) ──────────────────────────────────────────
+  - type: web
+    name: api-gateway
+    env: node
+    buildCommand: ./render-build.sh
+    startCommand: pnpm --filter api-gateway start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: ALLOWED_ORIGINS
+        value: "*" # User should change this to their frontend URL
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bettapay-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: bettapay-redis
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: INTER_SERVICE_SECRET
+        generateValue: true
+      - key: FX_ENGINE_URL
+        value: http://fx-engine:3002
+      - key: SETTLEMENT_ENGINE_URL
+        value: http://settlement-engine:3001
+      - key: INDEXER_URL
+        value: http://indexer:3003
+      - key: STELLAR_RPC_URL
+        value: https://soroban-testnet.stellar.org
+      - key: STELLAR_NETWORK_PASSPHRASE
+        value: "Test SDF Network ; September 2015"
+      - key: SETTLEMENT_CONTRACT_ID
+        sync: false
+      - key: GOVERNANCE_CONTRACT_ID
+        sync: false
+      - key: ADMIN_ADDRESS
+        sync: false
+      - key: ADMIN_SECRET
+        sync: false
+
+  # ── FX Engine (Private Service) ───────────────────────────────────────────────
+  - type: pserv
+    name: fx-engine
+    env: node
+    buildCommand: ./render-build.sh
+    startCommand: pnpm --filter fx-engine start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3002
+      - key: INTER_SERVICE_SECRET
+        fromService:
+          type: web
+          name: api-gateway
+          envVarKey: INTER_SERVICE_SECRET
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bettapay-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: bettapay-redis
+          property: connectionString
+
+  # ── Settlement Engine (Private Service) ───────────────────────────────────────
+  - type: pserv
+    name: settlement-engine
+    env: node
+    buildCommand: ./render-build.sh
+    startCommand: pnpm --filter settlement-engine start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3001
+      - key: INTER_SERVICE_SECRET
+        fromService:
+          type: web
+          name: api-gateway
+          envVarKey: INTER_SERVICE_SECRET
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bettapay-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: bettapay-redis
+          property: connectionString
+      - key: STELLAR_RPC_URL
+        value: https://soroban-testnet.stellar.org
+      - key: STELLAR_NETWORK_PASSPHRASE
+        value: "Test SDF Network ; September 2015"
+      - key: SETTLEMENT_CONTRACT_ID
+        sync: false
+      - key: GOVERNANCE_CONTRACT_ID
+        sync: false
+      - key: ADMIN_ADDRESS
+        sync: false
+      - key: ADMIN_SECRET
+        sync: false
+
+  # ── Indexer (Private Service) ─────────────────────────────────────────────────
+  - type: pserv
+    name: indexer
+    env: node
+    buildCommand: ./render-build.sh
+    startCommand: pnpm --filter indexer start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3003
+      - key: INTER_SERVICE_SECRET
+        fromService:
+          type: web
+          name: api-gateway
+          envVarKey: INTER_SERVICE_SECRET
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bettapay-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: bettapay-redis
+          property: connectionString
+      - key: STELLAR_RPC_URL
+        value: https://soroban-testnet.stellar.org
+      - key: STELLAR_NETWORK_PASSPHRASE
+        value: "Test SDF Network ; September 2015"
+      - key: SETTLEMENT_CONTRACT_ID
+        sync: false
+      - key: GOVERNANCE_CONTRACT_ID
+        sync: false
+
+databases:
+  - name: bettapay-db
+    databaseName: bettapay
+    user: bettapay_user
+    plan: free # Update to pro for production
+
+  - type: redis
+    name: bettapay-redis
+    plan: free # Update to pro for production

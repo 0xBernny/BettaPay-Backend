@@ -42,11 +42,14 @@ import {
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
 
-const env = validateEnv(process.env);
+export const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3000');
 
-export const fastify = Fastify({ logger: true });
-const fastify = Fastify({ logger: createLoggerOptions({ level: env.LOG_LEVEL }) });
+import helmet from '@fastify/helmet';
+import rateLimit from '@fastify/rate-limit';
+
+const fastifyInstance = Fastify({ logger: createLoggerOptions({ level: env.LOG_LEVEL }) });
+export const fastify = fastifyInstance;
 registerRequestId(fastify);
 const pool = new pg.Pool({
   connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
@@ -71,7 +74,7 @@ fastify.register(rateLimit, {
 });
 
 // In-memory event ring buffer (50 events max)
-const events: any[] = [];
+export const events: any[] = [];
 let latestLedgerCursor: number | undefined = undefined;
 let latestLedgerSequence: number | undefined = undefined;
 const BASE_BACKOFF = 1000;
@@ -552,5 +555,3 @@ process.on('SIGTERM', async () => {
 if (process.env.NODE_ENV !== 'test') {
   start();
 }
-
-export { fastify };

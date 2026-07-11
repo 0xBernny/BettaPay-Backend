@@ -35,7 +35,6 @@ import {
   createSettlementClient,
   SettlementEngineUnavailableError,
 } from './clients/settlement-client.js';
-import { createFxClient } from './clients/fx-client.js';
 import {
   CreateMerchantBody,
   CreatePaymentBody,
@@ -90,7 +89,6 @@ interface CreatePaymentRouteBody {
   asset?: unknown;
   convertTo?: unknown;
   reference?: unknown;
-  convertTo?: unknown;
 }
 
 interface CreateSettlementRouteBody {
@@ -661,12 +659,19 @@ fastify.patch<{ Params: { id: string }; Body: UpdateSettlementStatusRouteBody }>
   try {
     d = UpdateSettlementStatusBody.parse(request.body);
   } catch (error) {
-    return badRequest(reply, error);
+    return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid request body', error));
   }
 
   const { id } = request.params;
   const settlement = await prisma.settlement.findUnique({ where: { id } });
   if (!settlement) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Settlement not found'));
+
+  const SETTLEMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
+    PENDING: ['PROCESSING', 'FAILED'],
+    PROCESSING: ['COMPLETED', 'FAILED'],
+    COMPLETED: [],
+    FAILED: []
+  };
 
   const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
   if (!allowed.includes(d.status)) {

@@ -135,6 +135,9 @@ export const EnvSchema = z.object({
 
   // Indexer — lag warning threshold (number of ledgers behind the Stellar tip)
   INDEXER_LAG_WARN_THRESHOLD: z.string().transform((s) => parseInt(s, 10)).default('10'),
+
+  // Indexer — Event retention policy
+  EVENT_RETENTION_DAYS: z.string().transform((s) => parseInt(s, 10)).default('30'),
 });
 
 export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS'> & {

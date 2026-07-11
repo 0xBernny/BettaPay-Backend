@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { CurrencyCode } from './currency.js';
+import { validateStellarAddress } from '@bettapay/stellar-utils';
 
 // Entity schemas
 export const idSchema = z.string().min(1);

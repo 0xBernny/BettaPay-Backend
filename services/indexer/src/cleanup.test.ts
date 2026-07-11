@@ -79,8 +79,8 @@ test('2. Cleanup enabled and correct retention cutoff', (t) => {
   const deleted = cleanupOldEvents();
   t.equal(deleted, 2, 'should delete exactly 2 events');
   t.equal(events.length, 2, '2 events should remain');
-  t.ok(events.find(e => e.id === 'evt_3'), 'evt_3 should remain');
-  t.ok(events.find(e => e.id === 'evt_4'), 'evt_4 should remain');
+  t.ok(events.find((e: any) => e.id === 'evt_3'), 'evt_3 should remain');
+  t.ok(events.find((e: any) => e.id === 'evt_4'), 'evt_4 should remain');
   t.end();
 });
 
