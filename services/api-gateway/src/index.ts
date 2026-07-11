@@ -314,7 +314,8 @@ setupPrismaQueryLogging(prisma, fastify.log);
 fastify.register(helmet, { contentSecurityPolicy: false, hsts: { maxAge: 31536000 }, referrerPolicy: { policy: 'no-referrer' } });
 
 fastify.register(cors, {
-  origin: env.ALLOWED_ORIGINS
+  origin: env.ALLOWED_ORIGINS,
+  credentials: true
 });
 
 fastify.register(fastifyJwt, {
