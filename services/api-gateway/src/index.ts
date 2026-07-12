@@ -6,7 +6,6 @@
  *
  * Endpoints:
  *   GET    /api/health               — liveness probe
- *   POST   /api/auth/token           — login / get JWT
  *   POST   /api/merchants            — register merchant (protected)
  *   GET    /api/merchants/:id        — fetch merchant (protected)
  *   DELETE /api/merchants/:id        — soft-delete merchant (protected)
@@ -39,7 +38,6 @@ import {
   CreateMerchantBody,
   CreatePaymentBody,
   CreateSettlementBody,
-  AuthTokenBody,
   UpdatePaymentStatusBody,
   UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
@@ -73,11 +71,6 @@ interface MerchantParams {
 
 interface PaymentParams {
   id: string;
-}
-
-interface AuthTokenRouteBody {
-  merchantId?: unknown;
-  secret?: unknown;
 }
 
 interface CreateMerchantRouteBody {
@@ -422,24 +415,6 @@ fastify.get('/api/health', async (request, reply) => {
       }
     };
   }
-});
-
-fastify.post<{ Body: AuthTokenRouteBody }>('/api/auth/token', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
-    const d = AuthTokenBody.parse(request.body);
-    const merchant = await prisma.merchant.findFirst({ where: { id: d.merchantId, deletedAt: null } });
-
-    const storedHash = merchant?.secretHash || '0'.repeat(64);
-    const inputHash = hashSecret(d.secret);
-    const hashBuffer = Buffer.from(storedHash, 'hex');
-    const inputBuffer = Buffer.from(inputHash, 'hex');
-
-    const isValid = merchant && merchant.secretHash && crypto.timingSafeEqual(hashBuffer, inputBuffer);
-    if (!isValid) {
-      return reply.code(401).send({ error: 'Invalid credentials' });
-    }
-
-    const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
-    return reply.send({ token });
 });
 
 // --- Wallet Auth Challenge Store ----------------------------------------------
