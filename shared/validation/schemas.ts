@@ -28,6 +28,23 @@ export const userSchema = z.object({
   metadata: z.record(z.any()).optional()
 });
 
+export const GoogleAuthBody = z.object({
+  idToken: z.string().min(1)
+});
+export type GoogleAuthBody = z.infer<typeof GoogleAuthBody>;
+
+export const WalletChallengeQuery = z.object({
+  address: StellarAddressSchema
+});
+export type WalletChallengeQuery = z.infer<typeof WalletChallengeQuery>;
+
+export const WalletVerifyBody = z.object({
+  address: StellarAddressSchema,
+  challenge: z.string().min(1),
+  signature: z.string().min(1)
+});
+export type WalletVerifyBody = z.infer<typeof WalletVerifyBody>;
+
 export const merchantSchema = z.object({
   id: idSchema,
   name: z.string(),
@@ -316,6 +333,11 @@ export const UpdateMerchantSettingsBody = z.object({
   dailySettlementLimit: z.string().regex(/^\d+(\.\d+)?$/, 'dailySettlementLimit must be a numeric string').optional(),
   webhookUrl: WebhookUrlSchema.optional(),
 });
+
+export const UpdateMerchantNameBody = z.object({
+  name: z.string().min(2, 'Name must be at least 2 characters')
+});
+export type UpdateMerchantNameBody = z.infer<typeof UpdateMerchantNameBody>;
 
 export const PaginationQuery = z.object({
   limit: z.coerce.number().max(200).default(50),

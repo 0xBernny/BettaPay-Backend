@@ -43,6 +43,10 @@ import {
   UpdatePaymentStatusBody,
   UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
+  UpdateMerchantNameBody,
+  GoogleAuthBody,
+  WalletChallengeQuery,
+  WalletVerifyBody,
   createErrorResponse,
   ErrorCodes,
   registerErrorHandler
@@ -54,6 +58,8 @@ import pg from 'pg';
 import helmet from '@fastify/helmet';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { fetchUpstream, UpstreamTimeoutError } from './upstream-fetch.js';
+import { Keypair } from '@stellar/stellar-sdk';
+import { OAuth2Client } from 'google-auth-library';
 
 declare module 'fastify' {
   export interface FastifyInstance {
@@ -434,6 +440,100 @@ fastify.post<{ Body: AuthTokenRouteBody }>('/api/auth/token', { config: { rateLi
 
     const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
     return reply.send({ token });
+});
+
+// --- Wallet Auth Challenge Store ----------------------------------------------
+// TODO: migrate to Redis for multi-instance deployments
+const challengeMap = new Map<string, { challenge: string; expiresAt: number }>();
+
+fastify.get<{ Querystring: WalletChallengeQuery }>('/api/auth/wallet/challenge', {
+  config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const { address } = WalletChallengeQuery.parse(request.query);
+  const nonce = crypto.randomBytes(32).toString('hex');
+  const challenge = `BettaPay:${address}:${nonce}`;
+  const expiresAt = Date.now() + 2 * 60 * 1000; // 2 minutes
+  challengeMap.set(address, { challenge, expiresAt });
+  return reply.send({ challenge, expiresAt });
+});
+
+fastify.post<{ Body: WalletVerifyBody }>('/api/auth/wallet/verify', {
+  config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const d = WalletVerifyBody.parse(request.body);
+  const stored = challengeMap.get(d.address);
+  
+  if (!stored) {
+    return reply.code(400).send({ error: 'Challenge expired or not found' });
+  }
+  if (Date.now() > stored.expiresAt) {
+    challengeMap.delete(d.address);
+    return reply.code(400).send({ error: 'Challenge expired' });
+  }
+  if (stored.challenge !== d.challenge) {
+    return reply.code(400).send({ error: 'Invalid challenge' });
+  }
+  
+  challengeMap.delete(d.address); // Single use
+  
+  try {
+    const keypair = Keypair.fromPublicKey(d.address);
+    const isValid = keypair.verify(Buffer.from(d.challenge, 'utf-8'), Buffer.from(d.signature, 'base64'));
+    if (!isValid) {
+      return reply.code(401).send({ error: 'Invalid signature' });
+    }
+  } catch (err) {
+    return reply.code(401).send({ error: 'Signature verification failed' });
+  }
+  
+  const merchant = await prisma.merchant.upsert({
+    where: { ownerId: d.address },
+    update: {},
+    create: {
+      id: crypto.randomUUID(),
+      name: 'My Business',
+      ownerId: d.address,
+      settings: {}
+    }
+  });
+  
+  const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
+  return reply.send({ token });
+});
+
+const googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID);
+
+fastify.post<{ Body: GoogleAuthBody }>('/api/auth/google', {
+  config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const d = GoogleAuthBody.parse(request.body);
+  
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: d.idToken,
+      audience: env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    if (!payload || !payload.email) {
+      return reply.code(401).send({ error: 'Invalid Google payload' });
+    }
+    
+    const merchant = await prisma.merchant.upsert({
+      where: { ownerId: payload.email },
+      update: {},
+      create: {
+        id: crypto.randomUUID(),
+        name: payload.name || 'My Business',
+        ownerId: payload.email,
+        settings: {}
+      }
+    });
+    
+    const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
+    return reply.send({ token });
+  } catch (err) {
+    return reply.code(401).send({ error: 'Google authentication failed' });
+  }
 });
 
 // Merchants

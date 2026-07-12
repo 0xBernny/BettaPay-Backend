@@ -73,6 +73,7 @@ export const EnvSchema = z.object({
   // Auth
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   JWT_EXPIRES_IN: z.string().default('24h'),
+  GOOGLE_CLIENT_ID: z.string().min(1, 'GOOGLE_CLIENT_ID is required'),
 
   // Inter-service auth — shared secret presented in the `x-service-token` header
   // on internal (service-to-service) calls. Required so services fail fast

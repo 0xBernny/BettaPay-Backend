@@ -30,6 +30,8 @@ model Merchant {
   secretHash  String?
   payments    Payment[]
   settlements Settlement[]
+
+  @@unique([ownerId])
 }
 
 model Payment {
