@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { CurrencyCode } from './currency.js';
 import { validateStellarAddress } from '@bettapay/stellar-utils';
+import { WebhookUrlSchema } from './webhookSchema.js';
+
 
 // Entity schemas
 export const idSchema = z.string().min(1);
@@ -212,32 +214,10 @@ export function safeParseEvent(raw: unknown) {
 
 // ─── Webhook URL validation ───────────────────────────────────────────────────
 
-const PRIVATE_HOST_PATTERN =
-  /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|::1|\[::1\]|0\.0\.0\.0)$/i;
-
-function isPrivateOrLocalhost(urlString: string): boolean {
-  try {
-    const { hostname } = new URL(urlString);
-    return PRIVATE_HOST_PATTERN.test(hostname);
-  } catch {
-    return false;
-  }
-}
-
-export const WebhookUrlSchema = z
-  .string()
-  .url('Webhook URL must be a valid URL')
-  .max(2048, 'Webhook URL must not exceed 2048 characters')
-  .refine(
-    (url) => process.env.NODE_ENV !== 'production' || url.startsWith('https://'),
-    'Webhook URL must use HTTPS in production'
-  )
-  .refine(
-    (url) => process.env.NODE_ENV !== 'production' || !isPrivateOrLocalhost(url),
-    'Webhook URL must not point to localhost or private IP addresses'
-  );
-
-export type WebhookUrl = z.infer<typeof WebhookUrlSchema>;
+// Canonical WebhookUrlSchema now lives in ./webhookSchema.ts (imported above)
+// and is re-exported from the package root via index.ts's
+// `export * from './webhookSchema.js'`. It is only imported here (not
+// re-exported) to avoid a duplicate-export collision in index.ts's barrel
 
 // ─── Health Check Schemas ──────────────────────────────────────────────────────
 
@@ -260,7 +240,7 @@ export type IdempotencyKey = z.infer<typeof IdempotencyKeySchema>;
 
 export const MerchantSettings = z.object({
   feeBps: z.number().int().min(0).max(10000).optional(),
-  webhookUrl: z.string().url().optional(),
+  webhookUrl: WebhookUrlSchema.optional(),
   preferredAsset: z.string().optional(),
   autoSettle: z.boolean().optional(),
   maxSettlementAmount: z.number().positive().optional(),
