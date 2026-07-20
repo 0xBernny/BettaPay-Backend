@@ -67,50 +67,7 @@ declare module 'fastify' {
   }
 }
 
-interface MerchantParams {
-  id: string;
-}
 
-interface PaymentParams {
-  id: string;
-}
-
-interface CreateMerchantRouteBody {
-  id?: unknown;
-  name?: unknown;
-  ownerId?: unknown;
-  settings?: unknown;
-  secret?: unknown;
-}
-
-interface CreatePaymentRouteBody {
-  merchantId?: unknown;
-  payerId?: unknown;
-  amount?: unknown;
-  asset?: unknown;
-  convertTo?: unknown;
-  reference?: unknown;
-}
-
-interface CreateSettlementRouteBody {
-  merchantId?: unknown;
-  amount?: unknown;
-  asset?: unknown;
-  items?: unknown;
-}
-
-interface UpdateMerchantSettingsRouteBody {
-  feeBps?: unknown;
-  tier?: unknown;
-}
-
-interface UpdatePaymentStatusRouteBody {
-  status?: unknown;
-}
-
-interface UpdateSettlementStatusRouteBody {
-  status?: unknown;
-}
 
 // Allowed payment status transitions. `initiated` is the only non-terminal state;
 // completed, failed, and cancelled are terminal and cannot transition further.
@@ -516,7 +473,7 @@ fastify.post<{ Body: GoogleAuthBody }>('/api/auth/google', {
 });
 
 // Merchants
-fastify.post<{ Body: CreateMerchantRouteBody }>('/api/merchants', {
+fastify.post<{ Body: z.infer<typeof CreateMerchantBody> }>('/api/merchants', {
   preValidation: [fastify.authenticate],
   preHandler: [logRequestBody],
   config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
@@ -540,7 +497,7 @@ fastify.post<{ Body: CreateMerchantRouteBody }>('/api/merchants', {
     return reply.code(201).send({ success: true, merchant, secret });
 });
 
-fastify.get<{ Params: MerchantParams }>('/api/merchants/:id', {
+fastify.get<{ Params: { id: string } }>('/api/merchants/:id', {
   preValidation: [fastify.authenticate]
 }, async (request, reply): Promise<ApiResponse<Merchant>> => {
   const { id } = request.params;
@@ -554,7 +511,7 @@ fastify.get<{ Params: MerchantParams }>('/api/merchants/:id', {
   return { data: merchant };
 });
 
-fastify.delete<{ Params: MerchantParams }>('/api/merchants/:id', {
+fastify.delete<{ Params: { id: string } }>('/api/merchants/:id', {
   preValidation: [fastify.authenticate],
   config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
 }, async (request, reply) => {
@@ -575,7 +532,7 @@ fastify.delete<{ Params: MerchantParams }>('/api/merchants/:id', {
   return reply.code(200).send({ success: true });
 });
 
-fastify.post<{ Params: MerchantParams }>('/api/merchants/:id/restore', {
+fastify.post<{ Params: { id: string } }>('/api/merchants/:id/restore', {
   preValidation: [fastify.authenticate],
   config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
 }, async (request, reply) => {
@@ -597,7 +554,7 @@ fastify.post<{ Params: MerchantParams }>('/api/merchants/:id/restore', {
 // Update per-merchant settings (fee rules, tier). Merges into existing settings so
 // a partial update does not wipe unrelated keys. The settlement engine reads
 // settings.feeBps from here when computing fees.
-fastify.patch<{ Params: MerchantParams; Body: UpdateMerchantSettingsRouteBody }>('/api/merchants/:id/settings', {
+fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantSettingsBody> }>('/api/merchants/:id/settings', {
   preValidation: [fastify.authenticate],
   preHandler: [logRequestBody],
   config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
@@ -624,7 +581,7 @@ fastify.patch<{ Params: MerchantParams; Body: UpdateMerchantSettingsRouteBody }>
 });
 
 // Payments
-fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
+fastify.post<{ Body: z.infer<typeof CreatePaymentBody> }>('/api/payments', {
   preValidation: [fastify.authenticate],
   preHandler: [logRequestBody],
   config: { rateLimit: { max: 300, timeWindow: '1 minute' } }
@@ -700,7 +657,7 @@ fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
     return reply.code(201).send(payment);
 });
 
-fastify.get<{ Params: PaymentParams; Querystring: { includeEvents?: string } }>('/api/payments/:id', async (request, reply) => {
+fastify.get<{ Params: { id: string }; Querystring: { includeEvents?: string } }>('/api/payments/:id', async (request, reply) => {
   const { id } = request.params;
   const payment = await prisma.payment.findUnique({ where: { id } });
   if (!payment) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Payment not found'));
@@ -719,7 +676,7 @@ fastify.get<{ Params: PaymentParams; Querystring: { includeEvents?: string } }>(
 
 // Enforce valid status transitions. The DB enum and Prisma allow any status, so
 // this route is the single place that guards the payment state machine.
-fastify.patch<{ Params: PaymentParams; Body: UpdatePaymentStatusRouteBody }>('/api/payments/:id/status', {
+fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdatePaymentStatusBody> }>('/api/payments/:id/status', {
   preValidation: [fastify.authenticate],
   preHandler: [logRequestBody],
   config: { rateLimit: { max: 300, timeWindow: '1 minute' } }
@@ -749,7 +706,7 @@ fastify.patch<{ Params: PaymentParams; Body: UpdatePaymentStatusRouteBody }>('/a
   return reply.send(updated);
 });
 
-fastify.patch<{ Params: { id: string }; Body: UpdateSettlementStatusRouteBody }>('/api/settlements/:id/status', {
+fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementStatusBody> }>('/api/settlements/:id/status', {
   preValidation: [fastify.authenticate],
   preHandler: [logRequestBody],
   config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
@@ -822,7 +779,7 @@ fastify.get('/api/settlements', {
   return { settlements: records, total: records.length };
 });
 
-fastify.post<{ Body: CreateSettlementRouteBody }>('/api/settlements', {
+fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>('/api/settlements', {
   preValidation: [fastify.authenticate],
   preHandler: [logRequestBody],
   config: { rateLimit: { max: 30, timeWindow: '1 minute' } }

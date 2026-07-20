@@ -21,6 +21,7 @@
  */
 
 import Fastify from 'fastify';
+import { z } from 'zod';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
@@ -49,11 +50,7 @@ import {
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
-interface CreateSettlementRouteBody {
-  merchantId?: unknown;
-  amount?: unknown;
-  asset?: unknown;
-}
+
 
 const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3001');
@@ -524,7 +521,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
   }
 });
 
-fastify.post<{ Body: CreateSettlementRouteBody }>(
+fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
   '/api/settlements',
   {
     config: {
