@@ -312,207 +312,147 @@ interface ReconcileQuery {
   to?: string;
 }
 
-// Signs a minimal HS256 JWT using Node's native crypto
-function signHS256(payload: object, secret: string): string {
-  const header = { alg: 'HS256', typ: 'JWT' };
-  const base64UrlEncode = (obj: object) => 
-    Buffer.from(JSON.stringify(obj))
-      .toString('base64url');
-  
-  const tokenInput = `${base64UrlEncode(header)}.${base64UrlEncode(payload)}`;
-  const signature = crypto
-    .createHmac('sha256', secret)
-    .update(tokenInput)
-    .digest('base64url');
-  
-  return `${tokenInput}.${signature}`;
-}
-
+/**
+ * Local Consistency Check for Settlements
+ *
+ * This endpoint performs internal validation of settlement records to ensure
+ * data integrity. It verifies:
+ * - Mathematical consistency: grossAmount - feeAmount = netAmount
+ * - Fee calculation accuracy: feeAmount matches feeBps applied to grossAmount
+ * - Merchant reference validity: all settlements reference existing merchants
+ *
+ * This is a LOCAL consistency check - it does not make external HTTP calls.
+ * All validation is performed against the settlement engine's own database.
+ */
 fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async (request, reply) => {
   try {
     const { merchantId, from, to } = request.query;
 
-    const localWhere: any = {};
+    const where: Record<string, unknown> = {};
     if (merchantId) {
-      localWhere.merchantId = merchantId;
+      where.merchantId = merchantId;
     }
     if (from || to) {
-      localWhere.initiatedAt = {};
+      where.initiatedAt = {};
       if (from) {
-        localWhere.initiatedAt.gte = new Date(from);
+        (where.initiatedAt as Record<string, Date>).gte = new Date(from);
       }
       if (to) {
-        localWhere.initiatedAt.lte = new Date(to);
+        (where.initiatedAt as Record<string, Date>).lte = new Date(to);
       }
     }
 
-    // 1. Query local settlements
-    const localRecords = await prisma.settlement.findMany({
-      where: localWhere,
+    // Query settlements from local database
+    const settlements = await prisma.settlement.findMany({
+      where,
       orderBy: { initiatedAt: 'desc' },
     });
 
-    // 2. Fetch api-gateway records via HTTP call
-    const gatewayUrl = process.env.API_GATEWAY_URL || 'http://localhost:3000';
-    const url = new URL(`${gatewayUrl}/api/settlements`);
-    if (merchantId) url.searchParams.append('merchantId', merchantId);
-    if (from) url.searchParams.append('from', from);
-    if (to) url.searchParams.append('to', to);
+    // Get all unique merchant IDs and verify they exist
+    const merchantIds = [...new Set(settlements.map(s => s.merchantId))];
+    const existingMerchants = await prisma.merchant.findMany({
+      where: { id: { in: merchantIds } },
+      select: { id: true },
+    });
+    const existingMerchantIds = new Set(existingMerchants.map(m => m.id));
 
-    const jwtPayload = {
-      sub: 'settlement-engine-reconciler',
-      iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + 60, // 1 minute expiration
-    };
-    const token = signHS256(jwtPayload, env.JWT_SECRET);
-
-    let gatewayRecords: any[] = [];
-    try {
-      const response = await fetch(url.toString(), {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error(`API Gateway returned status ${response.status}`);
-      }
-
-      const data = await response.json() as { settlements: any[] };
-      gatewayRecords = data.settlements;
-    } catch (error) {
-      fastify.log.error({ error }, 'Failed to fetch settlements from API Gateway');
-      return reply.code(502).send({
-        error: 'Failed to fetch settlement records from api-gateway',
-        details: error instanceof Error ? error.message : String(error)
-      });
-    }
-
-    // 3. Diff the two sets by settlement ID and compare records
-    const localMap = new Map<string, SettlementRecord>();
-    for (const r of localRecords) {
-      localMap.set(r.id, r);
-    }
-
-    const gatewayMap = new Map<string, any>();
-    for (const r of gatewayRecords) {
-      gatewayMap.set(r.id, r);
-    }
-
-    const matchedIds = new Set<string>();
-    const missing: any[] = []; // In gateway, but missing in local
-    const extra: any[] = [];   // In local, but missing in gateway
-    const mismatched: any[] = []; // In both, but fields differ
-
-    let localGrossTotal = new BigNumber(0);
-    let localFeeTotal = new BigNumber(0);
-    let localNetTotal = new BigNumber(0);
-
-    let gatewayGrossTotal = new BigNumber(0);
-    let gatewayFeeTotal = new BigNumber(0);
-    let gatewayNetTotal = new BigNumber(0);
-
-    const parseBN = (val: any) => {
-      const bn = new BigNumber(val ?? 0);
+    const parseBN = (val: unknown): BigNumber => {
+      const bn = new BigNumber(val as string ?? 0);
       return bn.isFinite() ? bn : new BigNumber(0);
     };
 
-    // Process local records
-    for (const localRec of localRecords) {
-      localGrossTotal = localGrossTotal.plus(parseBN(localRec.grossAmount || localRec.totalAmount));
-      localFeeTotal = localFeeTotal.plus(parseBN(localRec.feeAmount));
-      localNetTotal = localNetTotal.plus(parseBN(localRec.netAmount));
+    const inconsistencies: Array<{
+      settlementId: string;
+      type: 'amount_mismatch' | 'fee_calculation' | 'missing_merchant';
+      details: Record<string, unknown>;
+    }> = [];
 
-      if (!gatewayMap.has(localRec.id)) {
-        extra.push(localRec);
-      }
-    }
+    let totalGross = new BigNumber(0);
+    let totalFee = new BigNumber(0);
+    let totalNet = new BigNumber(0);
+    let validCount = 0;
 
-    // Process gateway records
-    for (const gatewayRec of gatewayRecords) {
-      gatewayGrossTotal = gatewayGrossTotal.plus(parseBN(gatewayRec.grossAmount || gatewayRec.totalAmount));
-      gatewayFeeTotal = gatewayFeeTotal.plus(parseBN(gatewayRec.feeAmount));
-      gatewayNetTotal = gatewayNetTotal.plus(parseBN(gatewayRec.netAmount));
+    const statusCounts: Record<string, number> = {
+      pending: 0,
+      processing: 0,
+      completed: 0,
+      failed: 0,
+    };
 
-      if (!localMap.has(gatewayRec.id)) {
-        missing.push(gatewayRec);
-      } else {
-        matchedIds.add(gatewayRec.id);
-      }
-    }
+    for (const settlement of settlements) {
+      const gross = parseBN(settlement.grossAmount);
+      const fee = parseBN(settlement.feeAmount);
+      const net = parseBN(settlement.netAmount);
 
-    // Check mismatches
-    for (const id of matchedIds) {
-      const localRec = localMap.get(id)!;
-      const gatewayRec = gatewayMap.get(id);
+      totalGross = totalGross.plus(gross);
+      totalFee = totalFee.plus(fee);
+      totalNet = totalNet.plus(net);
 
-      const diffFields: string[] = [];
-      const fieldsToCompare = ['merchantId', 'totalAmount', 'grossAmount', 'feeAmount', 'netAmount', 'feeBps', 'asset', 'status'];
-      
-      for (const field of fieldsToCompare) {
-        const localVal = String((localRec as any)[field] ?? '');
-        const gatewayVal = String(gatewayRec[field] ?? '');
-        if (localVal !== gatewayVal) {
-          diffFields.push(field);
-        }
-      }
+      statusCounts[settlement.status] = (statusCounts[settlement.status] || 0) + 1;
 
-      if (diffFields.length > 0) {
-        mismatched.push({
-          id,
-          local: {
-            merchantId: localRec.merchantId,
-            totalAmount: localRec.totalAmount,
-            grossAmount: localRec.grossAmount,
-            feeAmount: localRec.feeAmount,
-            netAmount: localRec.netAmount,
-            feeBps: localRec.feeBps,
-            asset: localRec.asset,
-            status: localRec.status,
+      // Check 1: Verify grossAmount - feeAmount = netAmount
+      const expectedNet = gross.minus(fee);
+      if (!expectedNet.isEqualTo(net)) {
+        inconsistencies.push({
+          settlementId: settlement.id,
+          type: 'amount_mismatch',
+          details: {
+            grossAmount: settlement.grossAmount,
+            feeAmount: settlement.feeAmount,
+            netAmount: settlement.netAmount,
+            expectedNet: expectedNet.toString(),
           },
-          gateway: {
-            merchantId: gatewayRec.merchantId,
-            totalAmount: gatewayRec.totalAmount,
-            grossAmount: gatewayRec.grossAmount,
-            feeAmount: gatewayRec.feeAmount,
-            netAmount: gatewayRec.netAmount,
-            feeBps: gatewayRec.feeBps,
-            asset: gatewayRec.asset,
-            status: gatewayRec.status,
-          },
-          diff: diffFields,
         });
+        continue;
       }
-    }
 
-    const matchedCount = matchedIds.size - mismatched.length;
+      // Check 2: Verify fee calculation matches feeBps
+      // feeAmount = floor(grossAmount × feeBps / 10000)
+      const expectedFee = gross.times(settlement.feeBps).dividedBy(10000).integerValue(BigNumber.ROUND_DOWN);
+      // Allow for minor precision differences (within 1 unit)
+      if (expectedFee.minus(fee).abs().isGreaterThan(1)) {
+        inconsistencies.push({
+          settlementId: settlement.id,
+          type: 'fee_calculation',
+          details: {
+            grossAmount: settlement.grossAmount,
+            feeBps: settlement.feeBps,
+            actualFee: settlement.feeAmount,
+            expectedFee: expectedFee.toString(),
+          },
+        });
+        continue;
+      }
+
+      // Check 3: Verify merchant exists
+      if (!existingMerchantIds.has(settlement.merchantId)) {
+        inconsistencies.push({
+          settlementId: settlement.id,
+          type: 'missing_merchant',
+          details: {
+            merchantId: settlement.merchantId,
+          },
+        });
+        continue;
+      }
+
+      validCount++;
+    }
 
     return {
-      matched: matchedCount,
-      missing,
-      extra,
-      mismatches: mismatched,
-      counts: {
-        local: localRecords.length,
-        gateway: gatewayRecords.length,
-        matched: matchedCount,
-        missing: missing.length,
-        extra: extra.length,
-        mismatched: mismatched.length,
+      summary: {
+        total: settlements.length,
+        valid: validCount,
+        inconsistent: inconsistencies.length,
       },
+      statusBreakdown: statusCounts,
       totals: {
-        local: {
-          gross: localGrossTotal.toString(),
-          fee: localFeeTotal.toString(),
-          net: localNetTotal.toString(),
-        },
-        gateway: {
-          gross: gatewayGrossTotal.toString(),
-          fee: gatewayFeeTotal.toString(),
-          net: gatewayNetTotal.toString(),
-        },
-      }
+        gross: totalGross.toString(),
+        fee: totalFee.toString(),
+        net: totalNet.toString(),
+      },
+      inconsistencies,
+      reconciliationType: 'local_consistency_check',
     };
   } catch (error) {
     fastify.log.error({ error }, 'Reconciliation error');
