@@ -48,7 +48,9 @@ import {
   WalletVerifyBody,
   createErrorResponse,
   ErrorCodes,
-  registerErrorHandler
+  registerErrorHandler,
+  registerServiceAuth,
+  createAuditLogger,
 } from '@bettapay/validation';
 import type { Merchant } from '@prisma/client';
 import type { ApiResponse, PaginatedResponse } from '@bettapay/shared-types';
@@ -169,6 +171,7 @@ registerErrorHandler(fastify);
 // Distributed tracing: normalise x-request-id / x-trace-id and bind to the
 // request logger so trace context is logged and propagated downstream (#118).
 registerTracing(fastify);
+registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 
 // Indexer HTTP client for optional on-chain event enrichment (Issue #116).
 // Enrichment is best-effort: indexer failures degrade to payment-only responses.
@@ -313,6 +316,7 @@ const pool = new pg.Pool({
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
 setupPrismaQueryLogging(prisma, fastify.log);
+const logAuditEvent = createAuditLogger(prisma as unknown as Parameters<typeof createAuditLogger>[0], fastify.log);
 
 // Setup plugins
 fastify.register(helmet, { contentSecurityPolicy: false, hsts: { maxAge: 31536000 }, referrerPolicy: { policy: 'no-referrer' } });
@@ -497,14 +501,18 @@ fastify.post<{ Body: CreateMerchantRouteBody }>('/api/merchants', {
     const d = CreateMerchantBody.parse(request.body);
     const secret = d.secret || crypto.randomBytes(24).toString('hex');
     const secretHash = hashSecret(secret);
-    const merchant = await prisma.merchant.create({
-      data: {
-        id: d.id,
-        name: d.name,
-        ownerId: d.ownerId,
-        settings: d.settings as any ?? {},
-        secretHash,
-      }
+    const merchant = await prisma.$transaction(async (tx) => {
+      const created = await tx.merchant.create({
+        data: {
+          id: d.id,
+          name: d.name,
+          ownerId: d.ownerId,
+          settings: d.settings as any ?? {},
+          secretHash,
+        }
+      });
+      await logAuditEvent('merchant.created', 'merchant', created.id, { before: null, after: created }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+      return created;
     });
     return reply.code(201).send({ success: true, merchant, secret });
 });
@@ -533,9 +541,12 @@ fastify.delete<{ Params: MerchantParams }>('/api/merchants/:id', {
   });
   if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
 
-  await prisma.merchant.update({
-    where: { id },
-    data: { deletedAt: new Date() },
+  await prisma.$transaction(async (tx) => {
+    const updated = await tx.merchant.update({
+      where: { id },
+      data: { deletedAt: new Date() },
+    });
+    await logAuditEvent('merchant.deleted', 'merchant', updated.id, { before: merchant, after: updated }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
   });
 
   return reply.code(200).send({ success: true });
@@ -577,9 +588,13 @@ fastify.patch<{ Params: MerchantParams; Body: UpdateMerchantSettingsRouteBody }>
   const currentSettings = (merchant.settings ?? {}) as Record<string, unknown>;
   const nextSettings = { ...currentSettings, ...d };
 
-  const updated = await prisma.merchant.update({
-    where: { id },
-    data: { settings: nextSettings as object },
+  const updated = await prisma.$transaction(async (tx) => {
+    const merchantUpdate = await tx.merchant.update({
+      where: { id },
+      data: { settings: nextSettings as object },
+    });
+    await logAuditEvent('merchant.updated', 'merchant', merchantUpdate.id, { before: merchant, after: merchantUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+    return merchantUpdate;
   });
 
   return reply.code(200).send({ success: true, merchant: updated });
@@ -632,18 +647,22 @@ fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
         )
       : null;
 
-    const payment = await prisma.payment.create({
-      data: {
-        id: 'pay_' + crypto.randomUUID().replace(/-/g, ''),
-        merchantId: d.merchantId,
-        payerId: d.payerId,
-        amount: d.amount,
-        asset: d.asset,
-        reference: d.reference,
-        status: 'initiated',
-        idempotencyKey: idempotencyKey ?? undefined,
-        idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
-      },
+    const payment = await prisma.$transaction(async (tx) => {
+      const created = await tx.payment.create({
+        data: {
+          id: 'pay_' + crypto.randomUUID().replace(/-/g, ''),
+          merchantId: d.merchantId,
+          payerId: d.payerId,
+          amount: d.amount,
+          asset: d.asset,
+          reference: d.reference,
+          status: 'initiated',
+          idempotencyKey: idempotencyKey ?? undefined,
+          idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
+        },
+      });
+      await logAuditEvent('payment.created', 'payment', created.id, { before: null, after: created }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+      return created;
     });
 
     request.log.info(
@@ -696,9 +715,13 @@ fastify.patch<{ Params: PaymentParams; Body: UpdatePaymentStatusRouteBody }>('/a
     }));
   }
 
-  const updated = await prisma.payment.update({
-    where: { id },
-    data: { status: d.status },
+  const updated = await prisma.$transaction(async (tx) => {
+    const paymentUpdate = await tx.payment.update({
+      where: { id },
+      data: { status: d.status },
+    });
+    await logAuditEvent('payment.status.changed', 'payment', paymentUpdate.id, { before: payment, after: paymentUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+    return paymentUpdate;
   });
   return reply.send(updated);
 });
@@ -735,12 +758,16 @@ fastify.patch<{ Params: { id: string }; Body: UpdateSettlementStatusRouteBody }>
     });
   }
 
-  const updated = await prisma.settlement.update({
-    where: { id },
-    data: {
-      status: d.status,
-      ...(d.status === 'completed' || d.status === 'failed' ? { completedAt: new Date() } : {}),
-    }
+  const updated = await prisma.$transaction(async (tx) => {
+    const settlementUpdate = await tx.settlement.update({
+      where: { id },
+      data: {
+        status: d.status,
+        ...(d.status === 'completed' || d.status === 'failed' ? { completedAt: new Date() } : {}),
+      }
+    });
+    await logAuditEvent('settlement.status.changed', 'settlement', settlementUpdate.id, { before: settlement, after: settlementUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+    return settlementUpdate;
   });
   return reply.send(updated);
 });
@@ -871,6 +898,44 @@ fastify.post<{ Body: CreateSettlementRouteBody }>('/api/settlements', {
       }
       throw err;
     }
+});
+
+fastify.get('/api/admin/audit-log', {
+  preValidation: [fastify.serviceAuth],
+  config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const query = request.query as Record<string, string | undefined>;
+  const limit = Math.min(Number(query.limit ?? 50), 200);
+  const offset = Math.max(Number(query.offset ?? 0), 0);
+  const where: Record<string, unknown> = {};
+
+  if (query.entityType) {
+    where.entityType = query.entityType;
+  }
+  if (query.action) {
+    where.action = query.action;
+  }
+  if (query.startDate || query.endDate) {
+    where.createdAt = {};
+    if (query.startDate) {
+      (where.createdAt as Record<string, Date>).gte = new Date(query.startDate);
+    }
+    if (query.endDate) {
+      (where.createdAt as Record<string, Date>).lte = new Date(query.endDate);
+    }
+  }
+
+  const [rows, total] = await Promise.all([
+    prisma.auditLog.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      skip: offset,
+    }),
+    prisma.auditLog.count({ where }),
+  ]);
+
+  return reply.send({ logs: rows, total, limit, offset, hasMore: offset + limit < total });
 });
 
 fastify.get('/api/deployments', async (request, reply) => {

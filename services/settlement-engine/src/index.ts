@@ -29,6 +29,7 @@ import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
 import { PrismaClient } from '@prisma/client';
 import BigNumber from 'bignumber.js';
+import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { computeSettlementAmounts } from './settlement-amounts.js';
 import {
   validateEnv,
@@ -128,57 +129,7 @@ const connectionParams = {
   },
 };
 
-async function sendWebhookWithRetries(url: string, payload: any, maxRetries = 3, initialDelay = 1000): Promise<void> {
-  let attempt = 0;
-  while (attempt <= maxRetries) {
-    attempt++;
-    fastify.log.info({ url, attempt, payload }, 'Attempting to send webhook notification');
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5-second timeout
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      const responseBody = await response.text().catch(() => '');
-      
-      fastify.log.info({
-        url,
-        attempt,
-        status: response.status,
-        response: responseBody,
-      }, 'Webhook delivery attempt completed');
-
-      if (response.ok) {
-        return; // Success!
-      }
-
-      throw new Error(`Webhook responded with status ${response.status}`);
-    } catch (error) {
-      fastify.log.warn({
-        url,
-        attempt,
-        error: error instanceof Error ? error.message : String(error),
-      }, 'Webhook delivery attempt failed');
-
-      if (attempt > maxRetries) {
-        throw new Error(`Webhook delivery failed after ${maxRetries} retries: ${error instanceof Error ? error.message : String(error)}`);
-      }
-
-      // Exponential backoff
-      const delay = initialDelay * Math.pow(2, attempt - 1);
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-}
+// ── Settlement processing queue ────────────────────────────────────────────────
 
 const settlementQueue = new Queue('settlements', {
   connection: connectionParams,
@@ -191,9 +142,31 @@ const settlementQueue = new Queue('settlements', {
 });
 const settlementDLQ = new Queue('settlements-dlq', { connection: connectionParams });
 
+// ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
+//
+// Webhook delivery is now decoupled from the settlement worker: after updating
+// the settlement status the worker enqueues a WebhookJobData onto
+// 'settlement-webhooks' and returns immediately.  The shared webhookWorker
+// handles retries with BullMQ's built-in exponential back-off — no in-process
+// sleep loop required.
+//
+// Migration note: the previous sendWebhookWithRetries had no persistence, so
+// there are no in-flight webhook jobs to migrate.  The queue name
+// 'settlement-webhooks' is fresh.
+const webhookQueue = createWebhookQueue('settlement-webhooks', connectionParams);
+const webhookWorker = createWebhookWorker('settlement-webhooks', connectionParams, {
+  logger: {
+    info: (obj, msg) => fastify.log.info(obj, msg),
+    warn: (obj, msg) => fastify.log.warn(obj, msg),
+    error: (obj, msg) => fastify.log.error(obj, msg),
+  },
+});
+
+// ── Settlement processor ───────────────────────────────────────────────────────
+
 const worker = new Worker('settlements', async job => {
   const settlementId = job.data.id;
-  
+
   if (job.attemptsMade > 0) {
     fastify.log.warn({
       jobId: job.id,
@@ -208,46 +181,39 @@ const worker = new Worker('settlements', async job => {
     merchantId: job.data.merchantId,
     amount: job.data.grossAmount,
     asset: job.data.asset,
-    jobName: job.name
+    jobName: job.name,
   }, 'Processing settlement job');
 
-  const settlement = await prisma.settlement.findUnique({
-    where: { id: settlementId }
-  });
-
+  const settlement = await prisma.settlement.findUnique({ where: { id: settlementId } });
   if (!settlement) {
     throw new Error(`Settlement ${settlementId} not found`);
   }
 
-  // If already in a terminal state, we just make sure the webhook is delivered
+  // If already in a terminal state, ensure the webhook is (re-)delivered.
   if (settlement.status === 'completed' || settlement.status === 'failed') {
-    fastify.log.info({ settlementId, status: settlement.status }, 'Settlement already processed, sending webhook');
+    fastify.log.info({ settlementId, status: settlement.status }, 'Settlement already processed, enqueuing webhook');
     if (settlement.webhookUrl) {
-      await sendWebhookWithRetries(settlement.webhookUrl, {
-        event: `settlement.${settlement.status}`,
-        data: settlement,
+      await webhookQueue.add('deliver', {
+        url: settlement.webhookUrl,
+        event: { event: `settlement.${settlement.status}`, data: settlement as unknown as Record<string, unknown> },
       });
     }
     return;
   }
 
   try {
-    // In a real app, this interacts with Soroban
-    // Simulate settlement processing success
+    // In a real app this interacts with Soroban; here we mark completed.
     const updatedSettlement = await prisma.settlement.update({
       where: { id: settlementId },
-      data: {
-        status: 'completed',
-        completedAt: new Date(),
-      },
+      data: { status: 'completed', completedAt: new Date() },
     });
 
     fastify.log.info({ settlementId }, 'Settlement completed in database');
 
     if (updatedSettlement.webhookUrl) {
-      await sendWebhookWithRetries(updatedSettlement.webhookUrl, {
-        event: 'settlement.completed',
-        data: updatedSettlement,
+      await webhookQueue.add('deliver', {
+        url: updatedSettlement.webhookUrl,
+        event: { event: 'settlement.completed', data: updatedSettlement as unknown as Record<string, unknown> },
       });
     }
   } catch (error) {
@@ -255,18 +221,16 @@ const worker = new Worker('settlements', async job => {
 
     const updatedSettlement = await prisma.settlement.update({
       where: { id: settlementId },
-      data: {
-        status: 'failed',
-        completedAt: new Date(),
-      },
+      data: { status: 'failed', completedAt: new Date() },
     }).catch(() => null);
 
-    if (updatedSettlement && updatedSettlement.webhookUrl) {
-      await sendWebhookWithRetries(updatedSettlement.webhookUrl, {
-        event: 'settlement.failed',
-        data: updatedSettlement,
-      }).catch(err => {
-        fastify.log.error({ err, settlementId }, 'Failed to send failure webhook');
+    if (updatedSettlement?.webhookUrl) {
+      // Best-effort enqueue — don't let a queue error mask the original failure.
+      await webhookQueue.add('deliver', {
+        url: updatedSettlement.webhookUrl,
+        event: { event: 'settlement.failed', data: updatedSettlement as unknown as Record<string, unknown> },
+      }).catch((err: unknown) => {
+        fastify.log.error({ err, settlementId }, 'Failed to enqueue failure webhook');
       });
     }
 
@@ -301,6 +265,12 @@ settlementDLQ.on('error', (err) => {
 });
 worker.on('error', (err) => {
   fastify.log.error({ err: err.message }, 'BullMQ worker connection error');
+});
+webhookQueue.on('error', (err) => {
+  fastify.log.error({ err: err.message }, 'BullMQ webhook queue connection error');
+});
+webhookWorker.on('error', (err) => {
+  fastify.log.error({ err: err.message }, 'BullMQ webhook worker connection error');
 });
 
 fastify.get('/api/health', async (_request, reply) => {
@@ -667,6 +637,8 @@ async function gracefulShutdown(signal: string): Promise<void> {
     fastify.log.info('Closing BullMQ queues...');
     await settlementQueue.close();
     await settlementDLQ.close();
+    await webhookWorker.close();
+    await webhookQueue.close();
     fastify.log.info('BullMQ queues closed');
 
     // 4. Close Redis connection
