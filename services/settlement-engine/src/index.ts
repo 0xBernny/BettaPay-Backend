@@ -4,7 +4,7 @@
  * Handles settlement processing with fee deduction and audit trail.
  *
  * Endpoints:
- *   GET  /api/health              — liveness and Redis connectivity probe
+ *   GET  /api/health              — dependency and upstream health probe
  *   GET  /api/settlements         — list settlements (paginated)
  *   POST /api/settlements         — create and process a settlement
  *
@@ -46,6 +46,8 @@ import {
   connectWithRetry,
   createLoggerOptions,
   registerTracing,
+  buildSettlementEngineHealthResponse,
+  readServiceVersion,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
@@ -58,6 +60,7 @@ interface CreateSettlementRouteBody {
 const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3001');
 const startTime = Date.now();
+const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
 process.env.DATABASE_URL = buildPrismaConnectionUrl(
   env.DATABASE_URL,
@@ -271,20 +274,16 @@ webhookWorker.on('error', (err) => {
 });
 
 fastify.get('/api/health', async (_request, reply) => {
-  let redisConnected = false;
-  try {
-    await settlementQueue.getJobCounts();
-    redisConnected = true;
-  } catch (error) {
-    fastify.log.warn({ error }, 'Settlement Redis health check failed');
-  }
-  return reply.code(200).send({
-    status: redisConnected ? 'ok' : 'degraded',
-    uptime: Math.floor((Date.now() - startTime) / 1000),
-    redis: {
-      connected: redisConnected,
-    },
+  const health = await buildSettlementEngineHealthResponse({
+    queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+    pingRedis: () => redis.ping(),
+    getQueueJobCounts: () => settlementQueue.getJobCounts(),
+    startTime,
+    service: 'settlement-engine',
+    version: SERVICE_VERSION,
   });
+  const statusCode = health.status === 'unhealthy' ? 503 : 200;
+  return reply.code(statusCode).send(health);
 });
 
 fastify.get('/api/settlements', async (request, reply): Promise<PaginatedResponse<SettlementRecord>> => {

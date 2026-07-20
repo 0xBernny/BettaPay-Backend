@@ -14,6 +14,7 @@ export * from './fastify-plugins.js';
 export * from './logger.js';
 export * from './envAwareSchema.js';
 export * from './webhookSchema.js';
+export * from './health.js';
 export * from './audit.js';
 import "dotenv/config";
 
