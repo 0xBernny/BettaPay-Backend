@@ -114,7 +114,9 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           echo "PR title: $PR_TITLE"
-          if ! echo "$PR_TITLE" | grep -Ei '^(feat|fix|docs|refactor|test|chore|ci)(\(.+\))?: .+'; then
+          if ! echo "$PR_TITLE" | grep -Ei '^(feat|fix|docs|refactor|test|chore|ci)(\(.+\))?[:/]\s?.+'; then
+          echo "::error::PR title must follow Conventional Commits: type(scope): description or type/description"
+          exit 1
             echo "::error::PR title must follow Conventional Commits: type(scope): description"
             exit 1
           fi
