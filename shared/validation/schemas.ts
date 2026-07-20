@@ -273,7 +273,7 @@ export type MerchantSettings = z.infer<typeof MerchantSettings>;
 export const CreateMerchantBody = z.object({
   id: z.string().min(1, 'id is required'),
   name: z.string().min(1, 'name is required'),
-  ownerId: z.string().min(1, 'ownerId is required'),
+  ownerId: StellarAddressSchema, // validated Stellar public key
   settings: MerchantSettings.optional(),
   secret: z.string().optional(),
 });
@@ -289,7 +289,7 @@ export const CreatePaymentBody = z.object({
 });
 
 export const CreateSettlementBody = z.object({
-  merchantId: StellarAddressSchema,
+  merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
   amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').optional(),
   asset: CurrencyCode.optional(),
   items: z.array(z.object({
