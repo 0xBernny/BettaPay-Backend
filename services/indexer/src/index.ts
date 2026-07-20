@@ -17,7 +17,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import crypto from 'crypto';
 import { Redis } from 'ioredis';
-import { Queue, Worker } from 'bullmq';
+import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { PrismaClient } from '@prisma/client';
 import { rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
 import pg from 'pg';
@@ -88,39 +88,19 @@ const connectionParams = {
   maxRetriesPerRequest: 3,
 };
 
-const webhookQueue = new Queue('indexer-webhooks', {
-  connection: connectionParams,
-  defaultJobOptions: {
-    attempts: 5,
-    backoff: { type: 'exponential', delay: 1000 },
-    removeOnComplete: { count: 100 },
-    removeOnFail: { count: 500 },
+// ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
+//
+// Queue name kept as 'indexer-webhooks' so any jobs already in Redis from the
+// previous inline implementation are picked up without data loss (migration
+// safety — see shared/webhook-delivery/index.ts for details).
+const webhookQueue = createWebhookQueue('indexer-webhooks', connectionParams);
+const webhookWorker = createWebhookWorker('indexer-webhooks', connectionParams, {
+  logger: {
+    info: (obj, msg) => fastify.log.info(obj, msg),
+    warn: (obj, msg) => fastify.log.warn(obj, msg),
+    error: (obj, msg) => fastify.log.error(obj, msg),
   },
 });
-
-const webhookWorker = new Worker<{ url: string; event: Record<string, unknown> }>(
-  'indexer-webhooks',
-  async (job) => {
-    const { url, event } = job.data;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      fastify.log.info({ url, jobId: job.id }, '[Indexer] Webhook delivered');
-    } catch (err) {
-      clearTimeout(timeoutId);
-      throw err;
-    }
-  },
-  { connection: connectionParams, concurrency: 10 }
-);
 
 webhookWorker.on('error', (err) => {
   fastify.log.error({ err: err.message }, '[Indexer] Webhook worker error');
