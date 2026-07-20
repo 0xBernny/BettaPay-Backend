@@ -1,6 +1,45 @@
 import test from 'tape';
 import { fastify } from './index.js';
 
+test('POST /api/webhooks - rejects a non-URL string', async (t) => {
+  await fastify.ready();
+
+  try {
+    const res = await fastify.inject({
+      method: 'POST',
+      url: '/api/webhooks',
+      payload: { url: 'not-a-url' },
+    });
+    t.equal(res.statusCode, 400, 'should return 400 for a malformed URL');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'VALIDATION_ERROR', 'error code should be VALIDATION_ERROR');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    t.end();
+  }
+});
+
+test('POST /api/webhooks - rejects a URL exceeding 2048 characters', async (t) => {
+  await fastify.ready();
+
+  try {
+    const long = 'https://example.com/' + 'a'.repeat(2048);
+    const res = await fastify.inject({
+      method: 'POST',
+      url: '/api/webhooks',
+      payload: { url: long },
+    });
+    t.equal(res.statusCode, 400, 'should return 400 for an over-length URL');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'VALIDATION_ERROR', 'error code should be VALIDATION_ERROR');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    t.end();
+  }
+});
+
 test('GET /api/events/stats - rejects requests without service token', async (t) => {
   await fastify.ready();
 
