@@ -27,6 +27,8 @@ jobs:
           corepack prepare pnpm@latest --activate
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
+      - name: Generate Prisma Client
+        run: npx prisma generate
       - name: Run lint
         run: pnpm -r --if-present lint
 
@@ -47,6 +49,8 @@ jobs:
           corepack prepare pnpm@latest --activate
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
+      - name: Generate Prisma Client
+        run: npx prisma generate
       - name: Build all packages
         run: pnpm -r build
       - name: Run type checking
@@ -69,6 +73,8 @@ jobs:
           corepack prepare pnpm@latest --activate
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
+      - name: Generate Prisma Client
+        run: npx prisma generate
       - name: Build project
         run: pnpm build
       - name: Run tests
