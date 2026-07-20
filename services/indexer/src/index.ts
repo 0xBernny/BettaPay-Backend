@@ -39,6 +39,7 @@ import {
   setupPrismaQueryLogging,
   registerTracing,
   genReqId,
+  createAuditLogger,
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
 
@@ -59,6 +60,7 @@ const pool = new pg.Pool({
 const prismaAdapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter: prismaAdapter, log: getPrismaLogLevels() });
 setupPrismaQueryLogging(prisma, fastify.log);
+const logAuditEvent = createAuditLogger(prisma as unknown as Parameters<typeof createAuditLogger>[0], fastify.log);
 
 fastify.register(cors, { origin: env.ALLOWED_ORIGINS });
 fastify.register(helmet, { contentSecurityPolicy: false });
@@ -360,8 +362,12 @@ const WebhookBody = z.object({
 
 fastify.post('/api/webhooks', async (request, reply) => {
   const { url } = WebhookBody.parse(request.body);
-  const sub = await prisma.webhookSubscription.create({
-    data: { id: 'wh_' + crypto.randomUUID().replace(/-/g, ''), url },
+  const sub = await prisma.$transaction(async (tx) => {
+    const created = await tx.webhookSubscription.create({
+      data: { id: 'wh_' + crypto.randomUUID().replace(/-/g, ''), url },
+    });
+    await logAuditEvent('webhook.registered', 'webhook', created.id, { before: null, after: created }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+    return created;
   });
   return reply.code(201).send(sub);
 });
@@ -378,7 +384,10 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, 
       error: { code: 'NOT_FOUND', message: `Webhook subscription ${id} not found` },
     });
   }
-  await prisma.webhookSubscription.delete({ where: { id } });
+  await prisma.$transaction(async (tx) => {
+    await tx.webhookSubscription.delete({ where: { id } });
+    await logAuditEvent('webhook.deleted', 'webhook', id, { before: existing, after: null }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+  });
   return reply.code(204).send();
 });
 
