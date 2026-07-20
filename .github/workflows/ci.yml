@@ -107,7 +107,7 @@ jobs:
       - name: Enable Corepack
         run: corepack enable
       - name: Install pnpm
-        run: corepair prepare pnpm@latest --activate
+        run: corepack prepare pnpm@latest --activate
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Run dependency audit
