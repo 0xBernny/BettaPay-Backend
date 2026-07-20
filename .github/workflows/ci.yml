@@ -26,7 +26,7 @@ jobs:
           corepack enable
           corepack prepare pnpm@latest --activate
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install
       - name: Run lint
         run: pnpm lint
 
@@ -46,7 +46,7 @@ jobs:
           corepack enable
           corepack prepare pnpm@latest --activate
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install
       - name: Run type checking
         run: pnpm type-check
 
@@ -66,7 +66,7 @@ jobs:
           corepack enable
           corepack prepare pnpm@latest --activate
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install
       - name: Build project
         run: pnpm build
       - name: Run tests
@@ -94,7 +94,7 @@ jobs:
           corepack enable
           corepack prepare pnpm@latest --activate
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install
       - name: Run dependency audit
         run: |
           pnpm audit || exit 0
