@@ -104,7 +104,7 @@ jobs:
         run: |
           echo "PR title: $PR_TITLE"
           # Conventional Commits pattern (case-insensitive)
-          if ! echo "$PR_TITLE" | grep -Ei "^(feat|fix|docs|refactor|test|chore|ci):"; then
+          if ! echo "$PR_TITLE" | grep -Ei "^(feat|fix|docs|refactor|test|chore|ci)(:|/| ).*"; then
             echo "::error::Pull request title does not follow Conventional Commits (type: description)"
             exit 1
           fi
