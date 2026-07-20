@@ -10,7 +10,7 @@
  *   POST /api/webhooks            — register a webhook URL subscription
  *   GET  /api/webhooks            — list all webhook subscriptions
  *   DELETE /api/webhooks/:id      — unsubscribe a webhook
- *   GET  /api/health              — liveness probe
+ *   GET  /api/health              — dependency and upstream health probe
  */
 
 import Fastify from 'fastify';
@@ -39,11 +39,15 @@ import {
   setupPrismaQueryLogging,
   registerTracing,
   genReqId,
+  buildIndexerHealthResponse,
+  readServiceVersion,
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
 
 export const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3000');
+const startTime = Date.now();
+const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
@@ -98,6 +102,12 @@ const webhookQueue = new Queue('indexer-webhooks', {
     removeOnComplete: { count: 100 },
     removeOnFail: { count: 500 },
   },
+});
+
+const redisHealth = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
+redisHealth.on('error', (err) => fastify.log.warn({ err: err.message }, '[Indexer] Redis health client error'));
+fastify.addHook('onClose', async () => {
+  await redisHealth.quit().catch(() => {});
 });
 
 const webhookWorker = new Worker<{ url: string; event: Record<string, unknown> }>(
@@ -157,6 +167,9 @@ const CONTRACT_NAMES: Record<string, string> = (() => {
 function getContractName(contractId: string): string {
   return CONTRACT_NAMES[contractId] ?? 'unknown';
 }
+
+// ── Stellar RPC client ────────────────────────────────────────────────────────
+const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
 
 // ── XDR decoding ─────────────────────────────────────────────────────────────
 
@@ -223,11 +236,21 @@ async function persistEvent(
 
 // ── HTTP API ──────────────────────────────────────────────────────────────────
 
-fastify.get('/api/health', async () => {
-  const lag = latestLedgerSequence !== undefined && latestLedgerCursor !== undefined
-    ? latestLedgerSequence - latestLedgerCursor
-    : 0;
-  return { status: 'ok', latestLedgerCursor, lag };
+fastify.get('/api/health', async (_request, reply) => {
+  const health = await buildIndexerHealthResponse({
+    queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+    pingRedis: () => redisHealth.ping(),
+    getQueueJobCounts: () => webhookQueue.getJobCounts(),
+    getLatestLedger: () => server.getLatestLedger(),
+    latestLedgerCursor,
+    latestLedgerSequence,
+    lagWarnThreshold: env.INDEXER_LAG_WARN_THRESHOLD,
+    startTime,
+    service: 'indexer',
+    version: SERVICE_VERSION,
+  });
+  const statusCode = health.status === 'unhealthy' ? 503 : 200;
+  return reply.code(statusCode).send(health);
 });
 
 // Issue #67 — paginated events endpoint with { total, limit, offset, hasMore }
@@ -383,7 +406,6 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, 
 });
 
 // ── Stellar RPC polling loop ──────────────────────────────────────────────────
-const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
 
 async function pollEvents() {
   // On each poll, fetch the latest Stellar ledger to track lag

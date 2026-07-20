@@ -5,7 +5,8 @@
  * Handles merchant registration, payment sessions, and settlement requests.
  *
  * Endpoints:
- *   GET    /api/health               — liveness probe
+ *   GET    /api/health               — liveness and dependency probe
+ *   GET    /api/health/all           — aggregated health across all services
  *   POST   /api/merchants            — register merchant (protected)
  *   GET    /api/merchants/:id        — fetch merchant (protected)
  *   DELETE /api/merchants/:id        — soft-delete merchant (protected)
@@ -58,6 +59,8 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { fetchUpstream, UpstreamTimeoutError } from './upstream-fetch.js';
 import { Keypair } from '@stellar/stellar-sdk';
 import { OAuth2Client } from 'google-auth-library';
+import { registerGatewayHealthRoutes } from './health.js';
+import { readServiceVersion } from '@bettapay/validation';
 
 declare module 'fastify' {
   export interface FastifyInstance {
@@ -133,6 +136,8 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3000');
+const startTime = Date.now();
+const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
 // --- Request lifecycle timeouts ---------------------------------------------
 // REQUEST_TIMEOUT_MS bounds how long a single request may run. If a handler
@@ -377,44 +382,16 @@ fastify.addHook('preHandler', async (request) => {
 // schemas receive trimmed, control-character-free, NFC-normalized strings.
 
 // Routes
-fastify.get('/api/health', async (request, reply) => {
-  const startTime = Date.now();
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-
-  try {
-    const dbPromise = prisma.$queryRaw`SELECT 1`;
-    const timeoutPromise = new Promise((_, reject) => {
-      timeoutId = setTimeout(() => reject(new Error('Database query timed out')), 3000);
-    });
-
-    await Promise.race([dbPromise, timeoutPromise]);
-
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-
-    const latencyMs = Date.now() - startTime;
-    return {
-      status: 'healthy',
-      env: env.NODE_ENV,
-      db: {
-        connected: true,
-        latencyMs
-      }
-    };
-  } catch (error) {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-    fastify.log.error(error);
-    return {
-      status: 'degraded',
-      env: env.NODE_ENV,
-      db: {
-        connected: false
-      }
-    };
-  }
+registerGatewayHealthRoutes({
+  fastify,
+  prisma,
+  env: {
+    FX_ENGINE_URL: env.FX_ENGINE_URL,
+    SETTLEMENT_ENGINE_URL: env.SETTLEMENT_ENGINE_URL,
+    INDEXER_URL: env.INDEXER_URL,
+  },
+  startTime,
+  serviceVersion: SERVICE_VERSION,
 });
 
 // --- Wallet Auth Challenge Store ----------------------------------------------
