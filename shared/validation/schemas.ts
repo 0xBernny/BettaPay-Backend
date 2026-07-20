@@ -279,7 +279,7 @@ export const CreateMerchantBody = z.object({
 });
 
 export const CreatePaymentBody = z.object({
-  merchantId: idSchema, // accept any identifier
+  merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
   amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
   asset: CurrencyCode,
   convertTo: CurrencyCode.optional(),
@@ -289,7 +289,7 @@ export const CreatePaymentBody = z.object({
 });
 
 export const CreateSettlementBody = z.object({
-  merchantId: idSchema, // accept any identifier
+  merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
   amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').optional(),
   asset: CurrencyCode.optional(),
   items: z.array(z.object({
