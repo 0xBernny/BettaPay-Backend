@@ -73,8 +73,6 @@ fastify.register(rateLimit, {
   timeWindow: '1 minute'
 });
 
-// In-memory event ring buffer (50 events max)
-export const events: any[] = [];
 let latestLedgerCursor: number | undefined = undefined;
 let latestLedgerSequence: number | undefined = undefined;
 const BASE_BACKOFF = 1000;
@@ -455,49 +453,37 @@ async function pollEvents() {
   }
 }
 
-export function cleanupOldEvents(): number {
-  const retentionDays = env.EVENT_RETENTION_DAYS;
-  if (retentionDays <= 0) {
-    return 0;
-  }
-
-  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
-  let totalDeleted = 0;
-  const batchSize = 1000;
-
-  while (true) {
-    const toDeleteIndices: number[] = [];
-    for (let i = 0; i < events.length; i++) {
-      const indexedAt = events[i].indexedAt;
-      if (indexedAt) {
-        const date = new Date(indexedAt);
-        if (!isNaN(date.getTime()) && date < cutoff) {
-          toDeleteIndices.push(i);
-          if (toDeleteIndices.length === batchSize) {
-            break;
-          }
-        }
-      }
-    }
-
-    if (toDeleteIndices.length === 0) {
-      break;
-    }
-
-    // Delete matching records from the events array (back to front to preserve correct indices during deletion)
-    for (let i = toDeleteIndices.length - 1; i >= 0; i--) {
-      events.splice(toDeleteIndices[i], 1);
-    }
-
-    totalDeleted += toDeleteIndices.length;
-  }
-
-  return totalDeleted;
+/**
+ * Builds the Prisma `where` clause for the DB cleanup query.
+ * Extracted as a pure function so it can be unit-tested without a DB connection.
+ *
+ * @internal exported for testing only
+ */
+export function buildCleanupWhere(retentionDays: number, now: Date): { indexedAt: { lt: Date } } | null {
+  if (retentionDays <= 0) return null;
+  const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
+  return { indexedAt: { lt: cutoff } };
 }
 
-export function runCleanupJob(): void {
+/**
+ * Deletes IndexedEvent rows from the database that are older than
+ * `EVENT_RETENTION_DAYS`. Returns the number of rows deleted.
+ *
+ * When `EVENT_RETENTION_DAYS` is 0 (the default), cleanup is disabled and the
+ * function returns 0 immediately.
+ */
+export async function cleanupOldEvents(): Promise<number> {
+  const retentionDays = env.EVENT_RETENTION_DAYS;
+  const where = buildCleanupWhere(retentionDays, new Date());
+  if (!where) return 0;
+
+  const { count } = await prisma.indexedEvent.deleteMany({ where });
+  return count;
+}
+
+export async function runCleanupJob(): Promise<void> {
   try {
-    const deletedCount = cleanupOldEvents();
+    const deletedCount = await cleanupOldEvents();
     fastify.log.info({
       retentionDays: env.EVENT_RETENTION_DAYS,
       deletedCount,
@@ -514,16 +500,16 @@ export function runCleanupJob(): void {
 
 let cleanupInterval: NodeJS.Timeout | undefined = undefined;
 
-export function startCleanupScheduler() {
+export function startCleanupScheduler(): void {
   if (env.EVENT_RETENTION_DAYS > 0) {
-    // Run once during startup
-    runCleanupJob();
-    // Schedule every 24 hours
-    cleanupInterval = setInterval(runCleanupJob, 24 * 60 * 60 * 1000);
+    // Run once during startup, then every 24 hours.
+    // Fire-and-forget: errors are caught and logged inside runCleanupJob().
+    void runCleanupJob();
+    cleanupInterval = setInterval(() => void runCleanupJob(), 24 * 60 * 60 * 1000);
   }
 }
 
-export function stopCleanupScheduler() {
+export function stopCleanupScheduler(): void {
   if (cleanupInterval) {
     clearInterval(cleanupInterval);
     cleanupInterval = undefined;
