@@ -279,7 +279,7 @@ export const CreateMerchantBody = z.object({
 });
 
 export const CreatePaymentBody = z.object({
-  merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
+  merchantId: StellarAddressSchema,
   amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
   asset: CurrencyCode,
   convertTo: CurrencyCode.optional(),
