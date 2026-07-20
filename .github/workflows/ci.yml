@@ -40,7 +40,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: 'pnpm'
+
       - name: Enable Corepack and install pnpm
         run: |
           corepack enable
@@ -60,7 +60,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: 'pnpm'
+
       - name: Enable Corepack and install pnpm
         run: |
           corepack enable
@@ -88,7 +88,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: 'pnpm'
+
       - name: Enable Corepack and install pnpm
         run: |
           corepack enable
