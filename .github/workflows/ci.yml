@@ -21,8 +21,8 @@ jobs:
         with:
           node-version: '24'
           cache: 'pnpm'
-      - name: Enable corepack and install pnpm
-        run: corepack enable && corepack prepare pnpm@latest --activate
+      - name: Install pnpm globally
+        run: npm i -g pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Run lint
@@ -39,8 +39,8 @@ jobs:
         with:
           node-version: '24'
           cache: 'pnpm'
-      - name: Enable corepack and install pnpm
-        run: corepack enable && corepack prepare pnpm@latest --activate
+      - name: Install pnpm globally
+        run: npm i -g pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Run type checking
@@ -83,8 +83,8 @@ jobs:
         with:
           node-version: '24'
           cache: 'pnpm'
-      - name: Enable corepack and install pnpm
-        run: corepack enable && corepack prepare pnpm@latest --activate
+      - name: Install pnpm globally
+        run: npm i -g pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Run dependency audit
