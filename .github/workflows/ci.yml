@@ -19,10 +19,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'pnpm'
-      - name: Install pnpm
-        run: npm install -g pnpm
+      - name: Enable corepack and install pnpm
+        run: corepack enable && corepack prepare pnpm@latest --activate
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Run lint
@@ -37,10 +37,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'pnpm'
-      - name: Install pnpm
-        run: npm install -g pnpm
+      - name: Enable corepack and install pnpm
+        run: corepack enable && corepack prepare pnpm@latest --activate
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Run type checking
@@ -55,10 +55,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'pnpm'
-      - name: Install pnpm
-        run: npm install -g pnpm
+      - name: Enable corepack and install pnpm
+        run: corepack enable && corepack prepare pnpm@latest --activate
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Build project
@@ -81,17 +81,15 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'pnpm'
-      - name: Install pnpm
-        run: npm install -g pnpm
+      - name: Enable corepack and install pnpm
+        run: corepack enable && corepack prepare pnpm@latest --activate
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Run dependency audit
         run: |
           pnpm audit || exit 0
-        # Fail on high/critical vulnerabilities
-        # (pnpm audit returns non‑zero on vulnerabilities)
       - name: Fail on high/critical
         if: failure()
         run: echo "Dependency audit failed – high/critical vulnerabilities present" && exit 1
@@ -105,8 +103,8 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           echo "PR title: $PR_TITLE"
-          # Conventional Commits pattern (allow types: feat, fix, docs, refactor, test, chore, ci)
-          if ! echo "$PR_TITLE" | grep -E "^(feat|fix|docs|refactor|test|chore|ci):"; then
+          # Conventional Commits pattern (case-insensitive)
+          if ! echo "$PR_TITLE" | grep -Ei "^(feat|fix|docs|refactor|test|chore|ci):"; then
             echo "::error::Pull request title does not follow Conventional Commits (type: description)"
             exit 1
           fi
