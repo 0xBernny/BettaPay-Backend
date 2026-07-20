@@ -96,3 +96,20 @@ model WebhookSubscription {
   url       String
   createdAt DateTime @default(now())
 }
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  action     String
+  entityType String
+  entityId   String
+  actorId    String?
+  actorType  String?
+  changes    Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType])
+  @@index([action])
+  @@index([createdAt])
+  @@index([entityId])
+}
