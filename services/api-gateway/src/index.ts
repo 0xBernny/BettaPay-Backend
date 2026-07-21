@@ -28,6 +28,8 @@ import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { z } from 'zod';
+import { Keypair } from '@stellar/stellar-sdk';
+import { OAuth2Client } from 'google-auth-library';
 import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
 import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient } from './clients/indexer-client.js';
@@ -422,6 +424,135 @@ fastify.post<{ Body: AuthTokenRouteBody }>('/api/auth/token', { config: { rateLi
 
     const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
     return reply.send({ token });
+});
+
+const walletChallenges = new Map<string, { challenge: string; expiresAt: number }>();
+
+interface WalletChallengeRouteBody {
+  address?: unknown;
+}
+
+const WalletChallengeBody = z.object({
+  address: z.string().min(1, 'address is required'),
+});
+
+fastify.post<{ Body: WalletChallengeRouteBody }>('/api/auth/challenge', async (request, reply) => {
+  const d = WalletChallengeBody.parse(request.body);
+  const challenge = crypto.randomBytes(32).toString('hex');
+  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 mins
+  walletChallenges.set(d.address, { challenge, expiresAt });
+  return reply.send({ challenge, expiresAt: new Date(expiresAt).toISOString() });
+});
+
+interface WalletVerifyRouteBody {
+  address?: unknown;
+  signature?: unknown;
+}
+
+const WalletVerifyBody = z.object({
+  address: z.string().min(1, 'address is required'),
+  signature: z.string().min(1, 'signature is required'),
+});
+
+fastify.post<{ Body: WalletVerifyRouteBody }>('/api/auth/verify', async (request, reply) => {
+  const d = WalletVerifyBody.parse(request.body);
+  const challengeInfo = walletChallenges.get(d.address);
+
+  if (!challengeInfo) {
+    return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge not found or expired'));
+  }
+
+  if (Date.now() > challengeInfo.expiresAt) {
+    walletChallenges.delete(d.address);
+    return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired'));
+  }
+
+  try {
+    const keypair = Keypair.fromPublicKey(d.address);
+    const isValid = keypair.verify(Buffer.from(challengeInfo.challenge), Buffer.from(d.signature, 'hex'));
+    if (!isValid) {
+      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid signature'));
+    }
+  } catch (err) {
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid signature'));
+  }
+
+  walletChallenges.delete(d.address);
+
+  let merchant;
+  try {
+    merchant = await prisma.merchant.upsert({
+      where: { id: d.address },
+      update: {},
+      create: {
+        id: d.address,
+        name: `Merchant ${d.address.substring(0, 6)}`,
+        ownerId: `owner-${d.address.substring(0, 6)}`,
+        settings: {},
+      }
+    });
+  } catch (err: any) {
+    if (err.code === 'P2002') {
+      merchant = await prisma.merchant.findUnique({ where: { id: d.address } });
+    } else {
+      throw err;
+    }
+  }
+
+  if (!merchant) {
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Failed to upsert merchant'));
+  }
+
+  const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
+  return reply.send({ token });
+});
+
+interface GoogleAuthRouteBody {
+  token?: unknown;
+}
+
+const GoogleAuthBody = z.object({
+  token: z.string().min(1, 'token is required'),
+});
+
+fastify.post<{ Body: GoogleAuthRouteBody }>('/api/auth/google', async (request, reply) => {
+  const d = GoogleAuthBody.parse(request.body);
+  
+  try {
+    const client = new OAuth2Client();
+    const ticket = await client.verifyIdToken({
+      idToken: d.token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    if (!payload) {
+      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid token payload'));
+    }
+    const email = payload.email;
+    if (!email) {
+      return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Email missing in Google payload'));
+    }
+
+    let merchant = await prisma.merchant.findFirst({
+      where: { ownerId: email, deletedAt: null }
+    });
+    if (!merchant) {
+      const merchantId = `google_${crypto.randomBytes(8).toString('hex')}`;
+      merchant = await prisma.merchant.create({
+        data: {
+          id: merchantId,
+          name: email.split('@')[0] + ' Merchant',
+          ownerId: email,
+          settings: {},
+        }
+      });
+    }
+
+    const jwtToken = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
+    return reply.send({ token: jwtToken });
+  } catch (err: any) {
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid Google token'));
+  }
 });
 
 // Merchants
