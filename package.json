@@ -42,10 +42,5 @@
   },
   "prisma": {
     "seed": "ts-node --esm prisma/seed.ts"
-  },
-  "pnpm": {
-    "overrides": {
-      "axios": "^1.7.4"
-    }
   }
 }
