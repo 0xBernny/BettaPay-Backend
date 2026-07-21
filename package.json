@@ -21,7 +21,7 @@
     "settlement:dev": "pnpm --filter settlement-engine dev",
     "indexer:dev": "pnpm --filter indexer dev",
     "clean": "pnpm -r clean && rm -rf node_modules",
-    "test": "pnpm --filter @bettapay/validation test && pnpm --filter api-gateway test"
+    "test": "pnpm --filter @bettapay/validation test && pnpm --filter @bettapay/webhook-delivery test && pnpm --filter api-gateway test"
   },
   "devDependencies": {
     "cross-env": "^7.0.3",
@@ -38,7 +38,11 @@
     "@stellar/stellar-sdk": "^15.1.0",
     "bullmq": "^5.78.0",
     "fastify": "^5.8.5",
-    "ioredis": "^5.11.1"
+    "ioredis": "^5.11.1",
+    "stellar-utils": "link:../stellar-utils"
+  },
+  "prisma": {
+    "seed": "ts-node --esm prisma/seed.ts"
   },
   "pnpm": {
     "overrides": {

@@ -4,7 +4,9 @@
  */
 
 import { StrKey } from '@stellar/stellar-sdk';
-import type { Amount, Stroops } from '@bettapay/shared-types';
+
+type Amount = string;
+type Stroops = string;
 
 export function validateStellarAddress(address: string): boolean {
   return StrKey.isValidEd25519PublicKey(address);
@@ -96,10 +98,25 @@ export function toStellarAmount(decimalStr: Amount, decimals = 7): Stroops {
   return stroops.toString();
 }
 
+/**
+ * Converts a stroops integer string to a decimal amount string.
+ *
+ * Expected format: a non-negative integer string matching `/^\d+$/`
+ * (e.g. `"15000000"`, `"1"`, `"0"`). Empty strings, decimal strings,
+ * negative numbers, and alpha-numeric values are all rejected.
+ *
+ * @param stroopsStr - Non-negative integer string representing stroops.
+ * @param decimals   - Number of decimal places for the asset (default 7, matching XLM/USDC).
+ * @returns The equivalent amount expressed as a decimal string.
+ * @throws {TypeError} If `stroopsStr` is not a valid non-negative integer string.
+ */
 export function fromStellarAmount(stroopsStr: Stroops, decimals = 7): Amount {
+  if (!/^\d+$/.test(stroopsStr)) {
+    throw new TypeError('fromStellarAmount: input must be a valid integer string');
+  }
   const n = BigInt(stroopsStr);
   const whole = n / BigInt(10 ** decimals);
-  const frac = (n % BigInt(10 ** decimals)).toString().padStart(decimals, '0').replace(/0+$/,'');
+  const frac = (n % BigInt(10 ** decimals)).toString().padStart(decimals, '0').replace(/0+$/, '');
   return frac ? `${whole.toString()}.${frac}` : whole.toString();
 }
 
@@ -121,6 +138,46 @@ export function buildPaymentOperation(params: { source?: string; destination: st
     asset: params.asset,
     amount: params.amount
   };
+}
+
+const UINT64_MAX = (2n ** 64n) - 1n;
+const HEX_32_BYTES = /^[0-9a-fA-F]{64}$/;
+
+/**
+ * Validates a Stellar transaction memo field.
+ *
+ * @param type  One of: "text" | "id" | "hash" | "return"
+ * @param value The memo value as a string
+ * @returns     true if the value is valid for the given type, false otherwise
+ *
+ * Validation rules:
+ *  - text:   UTF-8 encoded byte length must be ≤ 28
+ *  - id:     unsigned 64-bit integer (0 – 2^64-1), no sign, no decimals
+ *  - hash:   exactly 64 hexadecimal characters (32 bytes)
+ *  - return: exactly 64 hexadecimal characters (32 bytes)
+ */
+export function validateMemo(type: string, value: string): boolean {
+  switch (type) {
+    case 'text':
+      return Buffer.byteLength(value, 'utf8') <= 28;
+
+    case 'id': {
+      if (!/^\d+$/.test(value)) return false;
+      try {
+        const n = BigInt(value);
+        return n >= 0n && n <= UINT64_MAX;
+      } catch {
+        return false;
+      }
+    }
+
+    case 'hash':
+    case 'return':
+      return HEX_32_BYTES.test(value);
+
+    default:
+      return false;
+  }
 }
 
 /**

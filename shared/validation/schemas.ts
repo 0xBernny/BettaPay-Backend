@@ -1,8 +1,24 @@
 import { z } from 'zod';
+import { CurrencyCode } from './currency.js';
+import { validateStellarAddress } from '@bettapay/stellar-utils';
 
 // Entity schemas
 export const idSchema = z.string().min(1);
 export const isoDateString = z.string().refine((s) => !Number.isNaN(Date.parse(s)), { message: 'Invalid ISO date string' });
+
+export const AmountString = z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string');
+export const PositiveAmountString = AmountString.refine(
+  (val) => {
+    const parsed = parseFloat(val);
+    return !isNaN(parsed) && parsed > 0;
+  },
+  { message: 'Amount must be greater than zero' }
+);
+
+export const StellarAddressSchema = z.string().refine(validateStellarAddress, {
+  message: 'Invalid Stellar public key',
+});
+export type StellarAddress = z.infer<typeof StellarAddressSchema>;
 
 export const userSchema = z.object({
   id: idSchema,
@@ -12,10 +28,27 @@ export const userSchema = z.object({
   metadata: z.record(z.any()).optional()
 });
 
+export const GoogleAuthBody = z.object({
+  idToken: z.string().min(1)
+});
+export type GoogleAuthBody = z.infer<typeof GoogleAuthBody>;
+
+export const WalletChallengeQuery = z.object({
+  address: StellarAddressSchema
+});
+export type WalletChallengeQuery = z.infer<typeof WalletChallengeQuery>;
+
+export const WalletVerifyBody = z.object({
+  address: StellarAddressSchema,
+  challenge: z.string().min(1),
+  signature: z.string().min(1)
+});
+export type WalletVerifyBody = z.infer<typeof WalletVerifyBody>;
+
 export const merchantSchema = z.object({
   id: idSchema,
   name: z.string(),
-  ownerId: idSchema,
+  ownerId: StellarAddressSchema,
   createdAt: isoDateString,
   deletedAt: isoDateString.optional(),
   settings: z.record(z.any()).optional()
@@ -30,8 +63,8 @@ export type FeeRule = z.infer<typeof FeeRule>;
 
 export const walletSchema = z.object({
   id: idSchema,
-  ownerId: idSchema,
-  address: z.string(),
+  ownerId: StellarAddressSchema,
+  address: StellarAddressSchema,
   asset: z.string(),
   balance: z.string()
 });
@@ -40,19 +73,19 @@ export const transactionSchema = z.object({
   id: idSchema,
   type: z.enum(['payment','settlement','anchor_transfer','fx']),
   amount: z.string(),
-  asset: z.string(),
-  from: z.string().nullable(),
-  to: z.string().nullable(),
+  asset: CurrencyCode,
+  from: CurrencyCode.nullable(),
+  to: CurrencyCode.nullable(),
   createdAt: isoDateString,
   metadata: z.record(z.any()).optional()
 });
 
 export const paymentSchema = z.object({
   id: idSchema,
-  merchantId: idSchema,
-  payerId: idSchema.optional(),
+  merchantId: StellarAddressSchema,
+  payerId: StellarAddressSchema.optional(),
   amount: z.string(),
-  asset: z.string(),
+  asset: CurrencyCode,
   status: z.enum(['initiated','completed','failed','cancelled']),
   createdAt: isoDateString,
   reference: z.string().optional(),
@@ -61,13 +94,13 @@ export const paymentSchema = z.object({
 
 export const settlementSchema = z.object({
   id: idSchema,
-  merchantId: idSchema,
+  merchantId: StellarAddressSchema,
   totalAmount: z.string(),
   grossAmount: z.string(),
   feeAmount: z.string(),
   netAmount: z.string(),
   feeBps: z.number(),
-  asset: z.string(),
+  asset: CurrencyCode,
   batchId: z.string().optional(),
   initiatedAt: isoDateString,
   completedAt: isoDateString.optional(),
@@ -76,17 +109,17 @@ export const settlementSchema = z.object({
 
 export const fxQuoteSchema = z.object({
   id: idSchema,
-  fromCurrency: z.string(),
-  toCurrency: z.string(),
+  fromCurrency: CurrencyCode,
+  toCurrency: CurrencyCode,
   rate: z.string(),
   expiresAt: isoDateString
 });
 
 export const billPaymentSchema = z.object({
   id: idSchema,
-  merchantId: idSchema,
+  merchantId: StellarAddressSchema,
   amount: z.string(),
-  asset: z.string(),
+  asset: CurrencyCode,
   billerReference: z.string(),
   status: z.enum(['initiated','paid','failed']),
   createdAt: isoDateString
@@ -96,7 +129,7 @@ export const anchorTransferSchema = z.object({
   id: idSchema,
   anchorName: z.string(),
   amount: z.string(),
-  asset: z.string(),
+  asset: CurrencyCode,
   externalReference: z.string().optional(),
   status: z.enum(['pending','completed','failed']),
   createdAt: isoDateString
@@ -165,6 +198,8 @@ export type FXQuote = z.infer<typeof fxQuoteSchema>;
 export type BillPayment = z.infer<typeof billPaymentSchema>;
 export type AnchorTransfer = z.infer<typeof anchorTransferSchema>;
 export type EventPayloads = z.infer<typeof eventSchemas>;
+export type AmountString = z.infer<typeof AmountString>;
+export type PositiveAmountString = z.infer<typeof PositiveAmountString>;
 
 // Convenience parsers
 export function parseEvent(raw: unknown) {
@@ -175,6 +210,86 @@ export function safeParseEvent(raw: unknown) {
   return eventSchemas.safeParse(raw);
 }
 
+// ─── Webhook URL validation ───────────────────────────────────────────────────
+
+const PRIVATE_HOST_PATTERN =
+  /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|::1|\[::1\]|0\.0\.0\.0)$/i;
+
+function isPrivateOrLocalhost(urlString: string): boolean {
+  try {
+    const { hostname } = new URL(urlString);
+    return PRIVATE_HOST_PATTERN.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
+export const WebhookUrlSchema = z
+  .string()
+  .url('Webhook URL must be a valid URL')
+  .max(2048, 'Webhook URL must not exceed 2048 characters')
+  .refine(
+    (url) => process.env.NODE_ENV !== 'production' || url.startsWith('https://'),
+    'Webhook URL must use HTTPS in production'
+  )
+  .refine(
+    (url) => process.env.NODE_ENV !== 'production' || !isPrivateOrLocalhost(url),
+    'Webhook URL must not point to localhost or private IP addresses'
+  );
+
+export type WebhookUrl = z.infer<typeof WebhookUrlSchema>;
+
+// ─── Health Check Schemas ──────────────────────────────────────────────────────
+
+export const HealthStatus = z.enum(['healthy', 'degraded', 'unhealthy']);
+export type HealthStatus = z.infer<typeof HealthStatus>;
+
+export const DependencyConnectionStatus = z.enum(['connected', 'disconnected']);
+export type DependencyConnectionStatus = z.infer<typeof DependencyConnectionStatus>;
+
+export const DependencyHealth = z.object({
+  name: z.string(),
+  status: DependencyConnectionStatus,
+  latencyMs: z.number().optional(),
+  details: z.record(z.unknown()).optional(),
+});
+export type DependencyHealth = z.infer<typeof DependencyHealth>;
+
+export const HealthResponse = z.object({
+  status: HealthStatus,
+  service: z.string(),
+  version: z.string(),
+  uptime: z.number(),
+  lastDependencyCheck: z.string(),
+  dependencies: z.array(DependencyHealth),
+  upstream: z.array(DependencyHealth).optional(),
+});
+export type HealthResponse = z.infer<typeof HealthResponse>;
+
+export const ServiceHealthSnapshot = z.object({
+  status: HealthStatus,
+  service: z.string().optional(),
+  version: z.string().optional(),
+  uptime: z.number().optional(),
+  lastDependencyCheck: z.string().optional(),
+  dependencies: z.array(DependencyHealth).optional(),
+  upstream: z.array(DependencyHealth).optional(),
+  error: z.string().optional(),
+});
+export type ServiceHealthSnapshot = z.infer<typeof ServiceHealthSnapshot>;
+
+export const AggregatedHealthResponse = z.object({
+  status: HealthStatus,
+  service: z.literal('api-gateway'),
+  version: z.string(),
+  uptime: z.number(),
+  lastDependencyCheck: z.string(),
+  dependencies: z.array(DependencyHealth),
+  upstream: z.array(DependencyHealth).optional(),
+  services: z.record(ServiceHealthSnapshot),
+});
+export type AggregatedHealthResponse = z.infer<typeof AggregatedHealthResponse>;
+
 // ─── Request Body Schemas (used by API Gateway route handlers) ────────────────
 
 // Idempotency key must be a valid UUID v4 (e.g. "550e8400-e29b-41d4-a716-446655440000").
@@ -183,31 +298,43 @@ export function safeParseEvent(raw: unknown) {
 export const IdempotencyKeySchema = z.string().uuid({ message: 'idempotencyKey must be a valid UUID' });
 export type IdempotencyKey = z.infer<typeof IdempotencyKeySchema>;
 
+export const MerchantSettings = z.object({
+  feeBps: z.number().int().min(0).max(10000).optional(),
+  webhookUrl: z.string().url().optional(),
+  preferredAsset: z.string().optional(),
+  autoSettle: z.boolean().optional(),
+  maxSettlementAmount: z.number().positive().optional(),
+  minSettlementAmount: z.number().positive().optional(),
+  dailySettlementLimit: z.number().positive().optional(),
+});
+
+export type MerchantSettings = z.infer<typeof MerchantSettings>;
+
 export const CreateMerchantBody = z.object({
   id: z.string().min(1, 'id is required'),
   name: z.string().min(1, 'name is required'),
-  ownerId: z.string().min(1, 'ownerId is required'),
-  settings: z.record(z.unknown()).optional(),
+  ownerId: StellarAddressSchema, // validated Stellar public key
+  settings: MerchantSettings.optional(),
   secret: z.string().optional(),
 });
 
 export const CreatePaymentBody = z.object({
-  merchantId: z.string().min(1, 'merchantId is required'),
+  merchantId: StellarAddressSchema,
   amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
-  asset: z.string().min(1, 'asset is required'),
-  convertTo: z.string().min(1, 'convertTo is required').optional(),
+  asset: CurrencyCode,
+  convertTo: CurrencyCode.optional(),
   payerId: z.string().optional(),
   reference: z.string().optional(),
   idempotencyKey: IdempotencyKeySchema.optional(),
 });
 
 export const CreateSettlementBody = z.object({
-  merchantId: z.string().min(1, 'merchantId is required'),
+  merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
   amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').optional(),
-  asset: z.string().min(1, 'asset is required').optional(),
+  asset: CurrencyCode.optional(),
   items: z.array(z.object({
     amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
-    asset: z.string().min(1, 'asset is required'),
+    asset: CurrencyCode,
   })).optional(),
   idempotencyKey: IdempotencyKeySchema.optional(),
 }).refine((data) => {
@@ -220,7 +347,7 @@ export const CreateSettlementBody = z.object({
 });
 
 export const AuthTokenBody = z.object({
-  merchantId: z.string().min(1, 'merchantId is required'),
+  merchantId: StellarAddressSchema,
   secret: z.string().min(1, 'secret is required'),
 });
 
@@ -229,6 +356,11 @@ export const AuthTokenBody = z.object({
 export const UpdatePaymentStatusBody = z.object({
   status: z.enum(['completed', 'failed', 'cancelled']),
 });
+
+export const UpdateSettlementStatusBody = z.object({
+  status: z.enum(['processing', 'completed', 'failed']),
+});
+export type UpdateSettlementStatusBody = z.infer<typeof UpdateSettlementStatusBody>;
 
 // Per-merchant fee rule configuration. feeBps is basis points (1% = 100 bps),
 // capped at 10000 (100%). Unknown keys are stripped; the route merges these into
@@ -239,7 +371,13 @@ export const UpdateMerchantSettingsBody = z.object({
   minSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'minSettlementAmount must be a numeric string').optional(),
   maxSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'maxSettlementAmount must be a numeric string').optional(),
   dailySettlementLimit: z.string().regex(/^\d+(\.\d+)?$/, 'dailySettlementLimit must be a numeric string').optional(),
+  webhookUrl: WebhookUrlSchema.optional(),
 });
+
+export const UpdateMerchantNameBody = z.object({
+  name: z.string().min(2, 'Name must be at least 2 characters')
+});
+export type UpdateMerchantNameBody = z.infer<typeof UpdateMerchantNameBody>;
 
 export const PaginationQuery = z.object({
   limit: z.coerce.number().max(200).default(50),

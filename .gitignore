@@ -9,6 +9,7 @@ build/
 
 # Shared package dist directories
 shared/*/dist/
+services/*/dist/
 
 # Environment — never commit secrets
 .env
@@ -49,3 +50,9 @@ coverage/
 Thumbs.db
 
 /generated/prisma
+
+# PostgreSQL local development databases & temp files
+pgdata/
+pgsql/
+*.zip
+

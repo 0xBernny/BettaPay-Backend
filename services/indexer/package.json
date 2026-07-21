@@ -9,20 +9,26 @@
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test": "cross-env DOTENV_CONFIG_PATH=../../.env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/index.test.ts"
+    "test": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/cleanup.test.ts && cross-env DOTENV_CONFIG_PATH=../../.env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/index.test.ts"
   },
   "dependencies": {
+    "@bettapay/webhook-delivery": "workspace:*",
     "@bettapay/validation": "workspace:*",
+    "@fastify/cors": "*",
+    "@fastify/rate-limit": "^11.1.0",
+    "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "*",
     "@stellar/stellar-sdk": "*",
     "bullmq": "*",
     "fastify": "*",
-    "@fastify/cors": "*",
+    "@fastify/helmet": "*",
     "ioredis": "*",
+    "pg": "^8.22.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
+    "@types/pg": "^8.20.0",
     "@types/tape": "^5.6.4",
     "cross-env": "^7.0.3",
     "tape": "^5.9.0",

@@ -4,7 +4,7 @@
  * Handles settlement processing with fee deduction and audit trail.
  *
  * Endpoints:
- *   GET  /api/health              — liveness and Redis connectivity probe
+ *   GET  /api/health              — dependency and upstream health probe
  *   GET  /api/settlements         — list settlements (paginated)
  *   POST /api/settlements         — create and process a settlement
  *
@@ -21,6 +21,7 @@
  */
 
 import Fastify from 'fastify';
+import { z } from 'zod';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
@@ -29,6 +30,7 @@ import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
 import { PrismaClient } from '@prisma/client';
 import BigNumber from 'bignumber.js';
+import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { computeSettlementAmounts } from './settlement-amounts.js';
 import {
   validateEnv,
@@ -41,21 +43,27 @@ import {
   SettlementListQuery,
   getPrismaLogLevels,
   setupPrismaQueryLogging,
+  buildPrismaConnectionUrl,
   connectWithRetry,
   createLoggerOptions,
   registerTracing,
+  buildSettlementEngineHealthResponse,
+  readServiceVersion,
 } from "@bettapay/validation";
+import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
-interface CreateSettlementRouteBody {
-  merchantId?: unknown;
-  amount?: unknown;
-  asset?: unknown;
-}
+
 
 const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3001');
 const startTime = Date.now();
+const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
+process.env.DATABASE_URL = buildPrismaConnectionUrl(
+  env.DATABASE_URL,
+  env.DATABASE_POOL_SIZE,
+  env.DATABASE_POOL_TIMEOUT,
+);
 const prisma = new PrismaClient({ log: getPrismaLogLevels() });
 
 type SettlementJobData = {
@@ -118,57 +126,7 @@ const connectionParams = {
   },
 };
 
-async function sendWebhookWithRetries(url: string, payload: any, maxRetries = 3, initialDelay = 1000): Promise<void> {
-  let attempt = 0;
-  while (attempt <= maxRetries) {
-    attempt++;
-    fastify.log.info({ url, attempt, payload }, 'Attempting to send webhook notification');
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5-second timeout
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      const responseBody = await response.text().catch(() => '');
-      
-      fastify.log.info({
-        url,
-        attempt,
-        status: response.status,
-        response: responseBody,
-      }, 'Webhook delivery attempt completed');
-
-      if (response.ok) {
-        return; // Success!
-      }
-
-      throw new Error(`Webhook responded with status ${response.status}`);
-    } catch (error) {
-      fastify.log.warn({
-        url,
-        attempt,
-        error: error instanceof Error ? error.message : String(error),
-      }, 'Webhook delivery attempt failed');
-
-      if (attempt > maxRetries) {
-        throw new Error(`Webhook delivery failed after ${maxRetries} retries: ${error instanceof Error ? error.message : String(error)}`);
-      }
-
-      // Exponential backoff
-      const delay = initialDelay * Math.pow(2, attempt - 1);
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-}
+// ── Settlement processing queue ────────────────────────────────────────────────
 
 const settlementQueue = new Queue('settlements', {
   connection: connectionParams,
@@ -181,9 +139,31 @@ const settlementQueue = new Queue('settlements', {
 });
 const settlementDLQ = new Queue('settlements-dlq', { connection: connectionParams });
 
+// ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
+//
+// Webhook delivery is now decoupled from the settlement worker: after updating
+// the settlement status the worker enqueues a WebhookJobData onto
+// 'settlement-webhooks' and returns immediately.  The shared webhookWorker
+// handles retries with BullMQ's built-in exponential back-off — no in-process
+// sleep loop required.
+//
+// Migration note: the previous sendWebhookWithRetries had no persistence, so
+// there are no in-flight webhook jobs to migrate.  The queue name
+// 'settlement-webhooks' is fresh.
+const webhookQueue = createWebhookQueue('settlement-webhooks', connectionParams);
+const webhookWorker = createWebhookWorker('settlement-webhooks', connectionParams, {
+  logger: {
+    info: (obj, msg) => fastify.log.info(obj, msg),
+    warn: (obj, msg) => fastify.log.warn(obj, msg),
+    error: (obj, msg) => fastify.log.error(obj, msg),
+  },
+});
+
+// ── Settlement processor ───────────────────────────────────────────────────────
+
 const worker = new Worker('settlements', async job => {
   const settlementId = job.data.id;
-  
+
   if (job.attemptsMade > 0) {
     fastify.log.warn({
       jobId: job.id,
@@ -198,46 +178,39 @@ const worker = new Worker('settlements', async job => {
     merchantId: job.data.merchantId,
     amount: job.data.grossAmount,
     asset: job.data.asset,
-    jobName: job.name
+    jobName: job.name,
   }, 'Processing settlement job');
 
-  const settlement = await prisma.settlement.findUnique({
-    where: { id: settlementId }
-  });
-
+  const settlement = await prisma.settlement.findUnique({ where: { id: settlementId } });
   if (!settlement) {
     throw new Error(`Settlement ${settlementId} not found`);
   }
 
-  // If already in a terminal state, we just make sure the webhook is delivered
+  // If already in a terminal state, ensure the webhook is (re-)delivered.
   if (settlement.status === 'completed' || settlement.status === 'failed') {
-    fastify.log.info({ settlementId, status: settlement.status }, 'Settlement already processed, sending webhook');
+    fastify.log.info({ settlementId, status: settlement.status }, 'Settlement already processed, enqueuing webhook');
     if (settlement.webhookUrl) {
-      await sendWebhookWithRetries(settlement.webhookUrl, {
-        event: `settlement.${settlement.status}`,
-        data: settlement,
+      await webhookQueue.add('deliver', {
+        url: settlement.webhookUrl,
+        event: { event: `settlement.${settlement.status}`, data: settlement as unknown as Record<string, unknown> },
       });
     }
     return;
   }
 
   try {
-    // In a real app, this interacts with Soroban
-    // Simulate settlement processing success
+    // In a real app this interacts with Soroban; here we mark completed.
     const updatedSettlement = await prisma.settlement.update({
       where: { id: settlementId },
-      data: {
-        status: 'completed',
-        completedAt: new Date(),
-      },
+      data: { status: 'completed', completedAt: new Date() },
     });
 
     fastify.log.info({ settlementId }, 'Settlement completed in database');
 
     if (updatedSettlement.webhookUrl) {
-      await sendWebhookWithRetries(updatedSettlement.webhookUrl, {
-        event: 'settlement.completed',
-        data: updatedSettlement,
+      await webhookQueue.add('deliver', {
+        url: updatedSettlement.webhookUrl,
+        event: { event: 'settlement.completed', data: updatedSettlement as unknown as Record<string, unknown> },
       });
     }
   } catch (error) {
@@ -245,18 +218,16 @@ const worker = new Worker('settlements', async job => {
 
     const updatedSettlement = await prisma.settlement.update({
       where: { id: settlementId },
-      data: {
-        status: 'failed',
-        completedAt: new Date(),
-      },
+      data: { status: 'failed', completedAt: new Date() },
     }).catch(() => null);
 
-    if (updatedSettlement && updatedSettlement.webhookUrl) {
-      await sendWebhookWithRetries(updatedSettlement.webhookUrl, {
-        event: 'settlement.failed',
-        data: updatedSettlement,
-      }).catch(err => {
-        fastify.log.error({ err, settlementId }, 'Failed to send failure webhook');
+    if (updatedSettlement?.webhookUrl) {
+      // Best-effort enqueue — don't let a queue error mask the original failure.
+      await webhookQueue.add('deliver', {
+        url: updatedSettlement.webhookUrl,
+        event: { event: 'settlement.failed', data: updatedSettlement as unknown as Record<string, unknown> },
+      }).catch((err: unknown) => {
+        fastify.log.error({ err, settlementId }, 'Failed to enqueue failure webhook');
       });
     }
 
@@ -292,25 +263,27 @@ settlementDLQ.on('error', (err) => {
 worker.on('error', (err) => {
   fastify.log.error({ err: err.message }, 'BullMQ worker connection error');
 });
-
-fastify.get('/api/health', async (_request, reply) => {
-  let redisConnected = false;
-  try {
-    await settlementQueue.getJobCounts();
-    redisConnected = true;
-  } catch (error) {
-    fastify.log.warn({ error }, 'Settlement Redis health check failed');
-  }
-  return reply.code(200).send({
-    status: redisConnected ? 'ok' : 'degraded',
-    uptime: Math.floor((Date.now() - startTime) / 1000),
-    redis: {
-      connected: redisConnected,
-    },
-  });
+webhookQueue.on('error', (err) => {
+  fastify.log.error({ err: err.message }, 'BullMQ webhook queue connection error');
+});
+webhookWorker.on('error', (err) => {
+  fastify.log.error({ err: err.message }, 'BullMQ webhook worker connection error');
 });
 
-fastify.get('/api/settlements', async (request, reply) => {
+fastify.get('/api/health', async (_request, reply) => {
+  const health = await buildSettlementEngineHealthResponse({
+    queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+    pingRedis: () => redis.ping(),
+    getQueueJobCounts: () => settlementQueue.getJobCounts(),
+    startTime,
+    service: 'settlement-engine',
+    version: SERVICE_VERSION,
+  });
+  const statusCode = health.status === 'unhealthy' ? 503 : 200;
+  return reply.code(statusCode).send(health);
+});
+
+fastify.get('/api/settlements', async (request, reply): Promise<PaginatedResponse<SettlementRecord>> => {
   const { limit, offset, status, from, to } = SettlementListQuery.parse(request.query ?? {});
   const where: any = {};
   if (status) where.status = status;
@@ -327,7 +300,10 @@ fastify.get('/api/settlements', async (request, reply) => {
   });
   const total = await prisma.settlement.count({ where });
   const hasMore = offset + limit < total;
-  return { settlements: records, total, limit, offset, hasMore };
+  return {
+    data: records,
+    pagination: { total, limit, offset, hasMore }
+  };
 });
 
 interface ReconcileQuery {
@@ -544,7 +520,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
   }
 });
 
-fastify.post<{ Body: CreateSettlementRouteBody }>(
+fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
   '/api/settlements',
   {
     config: {
@@ -621,20 +597,91 @@ fastify.post<{ Body: CreateSettlementRouteBody }>(
     return reply.code(201).send(settlement);
 });
 
+// ============================================================================
+// GRACEFUL SHUTDOWN
+// ============================================================================
+
+let isShuttingDown = false;
+
+async function gracefulShutdown(signal: string): Promise<void> {
+  // Prevent multiple shutdown attempts
+  if (isShuttingDown) {
+    fastify.log.warn({ signal }, 'Shutdown already in progress, ignoring duplicate signal');
+    return;
+  }
+  
+  isShuttingDown = true;
+  fastify.log.info({ signal }, 'Received shutdown signal, starting graceful shutdown');
+
+  // Set a timeout to force exit if shutdown hangs
+  const forceExitTimeout = setTimeout(() => {
+    fastify.log.error('Graceful shutdown timed out after 30 seconds, forcing exit');
+    process.exit(1);
+  }, 30000);
+
+  try {
+    // 1. Close Fastify server (stops accepting new connections)
+    fastify.log.info('Closing Fastify server...');
+    await fastify.close();
+    fastify.log.info('Fastify server closed');
+
+    // 2. Close BullMQ worker (drain and close gracefully)
+    fastify.log.info('Closing BullMQ worker...');
+    await worker.close();
+    fastify.log.info('BullMQ worker closed');
+
+    // 3. Close BullMQ queues
+    fastify.log.info('Closing BullMQ queues...');
+    await settlementQueue.close();
+    await settlementDLQ.close();
+    await webhookWorker.close();
+    await webhookQueue.close();
+    fastify.log.info('BullMQ queues closed');
+
+    // 4. Close Redis connection
+    fastify.log.info('Closing Redis connection...');
+    await redis.quit();
+    fastify.log.info('Redis connection closed');
+
+    // 5. Disconnect Prisma
+    fastify.log.info('Disconnecting Prisma...');
+    await prisma.$disconnect();
+    fastify.log.info('Prisma disconnected');
+
+    // Clear the force exit timeout
+    clearTimeout(forceExitTimeout);
+
+    fastify.log.info({ signal }, 'Graceful shutdown completed successfully');
+    process.exit(0);
+  } catch (error) {
+    fastify.log.error({ error, signal }, 'Error during graceful shutdown');
+    clearTimeout(forceExitTimeout);
+    process.exit(1);
+  }
+}
+
+// Register shutdown handlers for SIGTERM and SIGINT
+process.on('SIGTERM', () => {
+  void gracefulShutdown('SIGTERM');
+});
+
+process.on('SIGINT', () => {
+  void gracefulShutdown('SIGINT');
+});
+
+// ============================================================================
+// STARTUP
+// ============================================================================
+
 const start = async () => {
   try {
     await connectWithRetry(prisma, fastify.log);
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    fastify.log.info({ port: PORT }, 'Settlement Engine started successfully');
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
   }
 };
-
-process.on('SIGTERM', async () => {
-  await prisma.$disconnect();
-  await fastify.close();
-  process.exit(0);
-});
 
 start();

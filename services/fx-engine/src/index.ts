@@ -27,11 +27,15 @@ import {
   ErrorCodes,
   createLoggerOptions,
   registerTracing,
+  CurrencyCode,
+  buildFxEngineHealthResponse,
+  readServiceVersion,
 } from '@bettapay/validation';
 
 const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3002');
 const startTime = Date.now();
+const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
 // ── Fallback / seed rates (issue #47) ──────────────────────────────────────
 // Used on first startup before the external API responds, and whenever the
@@ -173,11 +177,16 @@ registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
 
-fastify.get('/api/health', async (_request, _reply) => {
-  return {
-    status: 'ok',
-    uptime: Math.floor((Date.now() - startTime) / 1000),
-  };
+fastify.get('/api/health', async (_request, reply) => {
+  const health = await buildFxEngineHealthResponse({
+    pingRedis: () => redis.ping(),
+    ratesApiUrl: env.RATES_API_URL,
+    startTime,
+    service: 'fx-engine',
+    version: SERVICE_VERSION,
+  });
+  const statusCode = health.status === 'unhealthy' ? 503 : 200;
+  return reply.code(statusCode).send(health);
 });
 
 fastify.get('/api/rates', async (_request, _reply) => {
@@ -196,8 +205,8 @@ fastify.get('/api/currencies', async (_request, _reply) => {
 // ── GET /api/quote (issues #48 & #49) ────────────────────────────────────
 
 const QuoteQuerySchema = z.object({
-  from:        z.string().default('USDC'),
-  to:          z.string().default('NGN'),
+  from:        CurrencyCode.default('USDC'),
+  to:          CurrencyCode.default('NGN'),
   amount:      z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').default('1'),
   slippageBps: z.string().regex(/^\d+$/, 'slippageBps must be a non-negative integer').optional(),
 });
@@ -310,8 +319,8 @@ fastify.get(
 // ── GET /api/rates/history (issue #56) ───────────────────────────────────
 
 const HistoryQuerySchema = z.object({
-  from: z.string(),
-  to:   z.string(),
+  from: CurrencyCode,
+  to:   CurrencyCode,
   at:   z.string().optional(), // ISO 8601; defaults to now
 });
 

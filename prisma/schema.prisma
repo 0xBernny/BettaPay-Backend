@@ -30,6 +30,8 @@ model Merchant {
   secretHash  String?
   payments    Payment[]
   settlements Settlement[]
+
+  @@unique([ownerId])
 }
 
 model Payment {
@@ -47,29 +49,38 @@ model Payment {
   // duplicate creation even under concurrent requests.
   idempotencyKey          String?       @unique
   idempotencyKeyExpiresAt DateTime?
+  // FX conversion metadata (populated when convertTo is supplied at creation)
+  convertTo              String?
+  convertedAmount         String?
+  fxRate                  String?
+  fxQuoteId               String?
+  fxQuoteExpiresAt        DateTime?
 }
 
 model Settlement {
-  id          String           @id
-  merchantId  String
-  merchant    Merchant         @relation(fields: [merchantId], references: [id])
-  totalAmount String
-  grossAmount String
-  feeAmount   String
-  netAmount   String
-  feeBps      Int
-  asset       String
-  status      SettlementStatus @default(pending)
-  webhookUrl  String?
-  batchId     String?
-  initiatedAt DateTime         @default(now())
-  completedAt DateTime?
+  id                      String           @id
+  merchantId              String
+  merchant                Merchant         @relation(fields: [merchantId], references: [id])
+  totalAmount             String
+  grossAmount             String
+  feeAmount               String
+  netAmount               String
+  feeBps                  Int
+  asset                   String
+  status                  SettlementStatus @default(pending)
+  webhookUrl              String?
+  batchId                 String?
+  initiatedAt             DateTime         @default(now())
+  completedAt             DateTime?
+  idempotencyKey          String?          @unique
+  idempotencyKeyExpiresAt DateTime?
 }
 
 model IndexedEvent {
   id             String   @id
   stellarId      String?  @unique
   contractId     String
+  contractName   String?
   topics         String[]
   type           String
   rawValue       String
@@ -80,10 +91,30 @@ model IndexedEvent {
   @@index([ledger])
   @@index([type])
   @@index([contractId])
+  @@index([indexedAt])
 }
 
 model WebhookSubscription {
-  id        String   @id
-  url       String
-  createdAt DateTime @default(now())
+  id            String   @id
+  url           String
+  createdAt     DateTime @default(now())
+  signingSecret String?
+  merchantId    String?
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  action     String
+  entityType String
+  entityId   String
+  actorId    String?
+  actorType  String?
+  changes    Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType])
+  @@index([action])
+  @@index([createdAt])
+  @@index([entityId])
 }
