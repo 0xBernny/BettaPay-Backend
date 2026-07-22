@@ -10,7 +10,7 @@ import {
   PaginationQuery,
   PositiveAmountString,
   StellarAddressSchema,
-  WebhookUrlSchema,
+  UpdateMerchantSettingsBody,
   merchantSchema,
   paymentSchema,
   walletSchema,
@@ -19,130 +19,30 @@ import {
 const VALID_STELLAR_PUBLIC_KEY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const INVALID_STELLAR_PUBLIC_KEY = 'merchant-1';
 
-test('WebhookUrlSchema validation', async (t) => {
-  await t.test('Valid HTTPS URL passes', () => {
-    const result = WebhookUrlSchema.parse('https://example.com/hook');
-    assert.strictEqual(result, 'https://example.com/hook');
+// Webhook URL format/HTTPS/SSRF rules are exercised directly against
+// createWebhookUrlSchema in webhookSchema.test.ts. These tests only confirm
+// that UpdateMerchantSettingsBody actually wires webhookUrl through that
+// schema, since that wiring is the thing most likely to silently break.
+test('UpdateMerchantSettingsBody webhookUrl validation', async (t) => {
+  await t.test('accepts a valid HTTPS webhook URL', () => {
+    const result = UpdateMerchantSettingsBody.safeParse({ webhookUrl: 'https://example.com/hook' });
+    assert.strictEqual(result.success, true);
   });
 
-  await t.test('Valid HTTP URL passes in non-production', () => {
-    const original = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'development';
-    try {
-      const result = WebhookUrlSchema.parse('http://example.com/hook');
-      assert.strictEqual(result, 'http://example.com/hook');
-    } finally {
-      process.env.NODE_ENV = original;
-    }
+  await t.test('webhookUrl is optional', () => {
+    const result = UpdateMerchantSettingsBody.safeParse({});
+    assert.strictEqual(result.success, true);
   });
 
-  await t.test('Non-URL string fails', () => {
-    assert.throws(() => WebhookUrlSchema.parse('not-a-url'), /valid URL/);
+  await t.test('rejects a non-URL string', () => {
+    const result = UpdateMerchantSettingsBody.safeParse({ webhookUrl: 'not-a-url' });
+    assert.strictEqual(result.success, false);
   });
 
-  await t.test('URL exceeding 2048 characters fails', () => {
+  await t.test('rejects a URL exceeding 2048 characters', () => {
     const long = 'https://example.com/' + 'a'.repeat(2048);
-    assert.throws(() => WebhookUrlSchema.parse(long), /2048/);
-  });
-
-  await t.test('HTTP URL rejected in production', () => {
-    const original = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-    try {
-      assert.throws(
-        () => WebhookUrlSchema.parse('http://example.com/hook'),
-        /HTTPS/
-      );
-    } finally {
-      process.env.NODE_ENV = original;
-    }
-  });
-
-  await t.test('localhost rejected in production', () => {
-    const original = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-    try {
-      assert.throws(
-        () => WebhookUrlSchema.parse('https://localhost/hook'),
-        /localhost|private/
-      );
-    } finally {
-      process.env.NODE_ENV = original;
-    }
-  });
-
-  await t.test('127.0.0.1 rejected in production', () => {
-    const original = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-    try {
-      assert.throws(
-        () => WebhookUrlSchema.parse('https://127.0.0.1/hook'),
-        /localhost|private/
-      );
-    } finally {
-      process.env.NODE_ENV = original;
-    }
-  });
-
-  await t.test('Private IP 192.168.x.x rejected in production', () => {
-    const original = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-    try {
-      assert.throws(
-        () => WebhookUrlSchema.parse('https://192.168.1.1/hook'),
-        /localhost|private/
-      );
-    } finally {
-      process.env.NODE_ENV = original;
-    }
-  });
-
-  await t.test('Private IP 10.x.x.x rejected in production', () => {
-    const original = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-    try {
-      assert.throws(
-        () => WebhookUrlSchema.parse('https://10.0.0.1/hook'),
-        /localhost|private/
-      );
-    } finally {
-      process.env.NODE_ENV = original;
-    }
-  });
-
-  await t.test('Private IP 172.16.x.x rejected in production', () => {
-    const original = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-    try {
-      assert.throws(
-        () => WebhookUrlSchema.parse('https://172.16.0.1/hook'),
-        /localhost|private/
-      );
-    } finally {
-      process.env.NODE_ENV = original;
-    }
-  });
-
-  await t.test('Public IP passes in production', () => {
-    const original = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-    try {
-      const result = WebhookUrlSchema.parse('https://93.184.216.34/hook');
-      assert.strictEqual(result, 'https://93.184.216.34/hook');
-    } finally {
-      process.env.NODE_ENV = original;
-    }
-  });
-
-  await t.test('localhost allowed in development', () => {
-    const original = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'development';
-    try {
-      const result = WebhookUrlSchema.parse('http://localhost:3000/hook');
-      assert.strictEqual(result, 'http://localhost:3000/hook');
-    } finally {
-      process.env.NODE_ENV = original;
-    }
+    const result = UpdateMerchantSettingsBody.safeParse({ webhookUrl: long });
+    assert.strictEqual(result.success, false);
   });
 });
 
