@@ -29,6 +29,8 @@ import * as crypto from 'crypto';
 import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
 import { PrismaClient } from '@prisma/client';
+import pg from 'pg';
+import { PrismaPg } from '@prisma/adapter-pg';
 import BigNumber from 'bignumber.js';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { computeSettlementAmounts } from './settlement-amounts.js';
@@ -59,12 +61,13 @@ const PORT = Number(process.env.PORT ?? '3001');
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
-process.env.DATABASE_URL = buildPrismaConnectionUrl(
-  env.DATABASE_URL,
-  env.DATABASE_POOL_SIZE,
-  env.DATABASE_POOL_TIMEOUT,
-);
-const prisma = new PrismaClient({ log: getPrismaLogLevels() });
+const pool = new pg.Pool({
+  connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
+  max: env.DATABASE_POOL_SIZE,
+  connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
+});
+const adapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
 
 type SettlementJobData = {
   id: string;
