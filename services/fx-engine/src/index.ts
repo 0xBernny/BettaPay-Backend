@@ -134,6 +134,108 @@ function updateBaseRates(newRates: Record<string, number>): void {
   storeRateSnapshot(newRates).catch(() => {}); // Redis errors are non-fatal
 }
 
+// ── Live rate refresh loop (issue #251) ────────────────────────────────────
+//
+// The external rates API (RATES_API_URL) is polled every RATES_REFRESH_INTERVAL_MS
+// to keep cache.rates in sync with the source. On any failure the existing
+// cache is preserved and the next interval retries — the fallback rates stay
+// live until the next successful tick.
+//
+// The response shape is the CoinGecko `simple/price` payload:
+//   { "<asset-id>": { "<vs-currency>": <price> } }
+// e.g. { "usd-coin": { "ngn": 1545.5 } }
+//
+// We map the known asset ids to the keys in cache.rates (USDC, EURT, NGN).
+// Any asset id missing from the response is left at its previous value.
+
+const RATE_FETCH_TIMEOUT_MS = 10_000;
+const ASSET_ID_TO_KEY: Record<string, string> = {
+  'usd-coin':  'USDC',
+  'tether-eurt': 'EURT',
+  // NGN is the base currency (rate === 1.0) and not fetched.
+};
+
+let refreshIntervalHandle: ReturnType<typeof setInterval> | null = null;
+let lastRefresh: { at: number; ok: boolean; durationMs: number; error?: string } | null = null;
+
+async function fetchBaseRates(): Promise<Record<string, number> | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), RATE_FETCH_TIMEOUT_MS);
+  const startedAt = Date.now();
+  try {
+    const res = await fetch(env.RATES_API_URL, { signal: controller.signal });
+    if (!res.ok) {
+      const msg = `RATES_API_URL responded ${res.status} ${res.statusText}`;
+      fastify.log.warn({ status: res.status, url: env.RATES_API_URL }, msg);
+      lastRefresh = { at: Date.now(), ok: false, durationMs: Date.now() - startedAt, error: msg };
+      return null;
+    }
+    const body = (await res.json()) as Record<string, Record<string, number>>;
+    const fetched: Record<string, number> = {};
+    for (const [assetId, byVs] of Object.entries(body)) {
+      const key = ASSET_ID_TO_KEY[assetId];
+      if (!key) continue;
+      const value = byVs?.ngn;
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) continue;
+      fetched[key] = value;
+    }
+    if (Object.keys(fetched).length === 0) {
+      const msg = 'RATES_API_URL response had no recognised assets';
+      fastify.log.warn({ body }, msg);
+      lastRefresh = { at: Date.now(), ok: false, durationMs: Date.now() - startedAt, error: msg };
+      return null;
+    }
+    lastRefresh = { at: Date.now(), ok: true, durationMs: Date.now() - startedAt };
+    return fetched;
+  } catch (err) {
+    const e = err as Error;
+    const msg = e.name === 'AbortError' ? 'RATES_API_URL fetch timed out' : `RATES_API_URL fetch failed: ${e.message}`;
+    fastify.log.warn({ err: e.message }, msg);
+    lastRefresh = { at: Date.now(), ok: false, durationMs: Date.now() - startedAt, error: msg };
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function refreshTick(): Promise<void> {
+  try {
+    const fetched = await fetchBaseRates();
+    if (fetched) {
+      // Merge fetched rates into the existing cache so any currency not in the
+      // response (e.g. NGN) keeps its current value.
+      const merged: Record<string, number> = { ...cache.rates, ...fetched };
+      updateBaseRates(merged);
+      fastify.log.info(
+        {
+          durationMs: lastRefresh?.durationMs,
+          assets: Object.keys(fetched),
+          cacheAgeMs: 0,
+        },
+        'FX rates refreshed',
+      );
+    }
+    // On null (failure) we keep the existing cache; fetchBaseRates has already logged warn.
+  } catch (err) {
+    // Defensive: fetchBaseRates catches its own errors, so this is only for
+    // programming bugs in refreshTick itself. Don't crash the interval.
+    fastify.log.error({ err }, 'Unexpected error in refresh tick');
+  }
+}
+
+function startRefreshLoop(): void {
+  if (refreshIntervalHandle !== null) return;
+  refreshIntervalHandle = setInterval(refreshTick, env.RATES_REFRESH_INTERVAL_MS);
+  // Don't keep the process alive solely for this interval.
+  if (typeof refreshIntervalHandle.unref === 'function') {
+    refreshIntervalHandle.unref();
+  }
+  fastify.log.info(
+    { intervalMs: env.RATES_REFRESH_INTERVAL_MS, url: env.RATES_API_URL },
+    'FX rate refresh loop started',
+  );
+}
+
 // ── Quote storage (issue #57) ────────────────────────────────────────────
 // Quotes are stored in Redis under fx:quote:<quoteId>.
 //
@@ -481,6 +583,10 @@ async function shutdown(signal: string) {
   fastify.log.info(`Received ${signal}, shutting down gracefully...`);
 
   try {
+    if (refreshIntervalHandle !== null) {
+      clearInterval(refreshIntervalHandle);
+      refreshIntervalHandle = null;
+    }
     await fastify.close();
     process.exit(0);
   } catch (err) {
@@ -498,6 +604,10 @@ const start = async () => {
     await storeRateSnapshot(cache.rates).catch((err) => {
       fastify.log.warn({ err }, 'Failed to store initial rate snapshot');
     });
+    // First refresh before we start serving: if it succeeds, cache is
+    // updated; if it fails, we keep the FALLBACK_RATES seed.
+    await refreshTick();
+    startRefreshLoop();
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {
     fastify.log.error(err);
