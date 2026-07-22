@@ -108,8 +108,6 @@ const webhookWorker = createWebhookWorker('indexer-webhooks', connectionParams, 
   },
 });
 
-});
-
 const redisHealth = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
 redisHealth.on('error', (err) => fastify.log.warn({ err: err.message }, '[Indexer] Redis health client error'));
 fastify.addHook('onClose', async () => {

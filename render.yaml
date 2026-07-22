@@ -1,8 +1,27 @@
+# BettaPay Backend — Render Blueprint
+#
+# Production checklist: docs/deploy-production.md
+#
+# Before first deploy, set every `sync: false` env var in the Render Dashboard
+# (ALLOWED_ORIGINS, INTER_SERVICE_SECRET, contract IDs, admin keys).
+# Use the SAME INTER_SERVICE_SECRET value on all four services.
+
 services:
   # ── API Gateway (Public Web Service) ──────────────────────────────────────────
   - type: web
     name: api-gateway
     env: node
+    plan: starter # Upgrade path: starter → standard → pro (see docs/deploy-production.md)
+    # HA + autoscaling (Pro workspace required for autoscaling).
+    # minInstances: 2 keeps at least two replicas for high availability.
+    # If your workspace does not support autoscaling, remove `scaling` and set
+    # `numInstances: 2` instead (manual HA).
+    scaling:
+      minInstances: 2
+      maxInstances: 5
+      targetCPUPercent: 60
+      targetMemoryPercent: 60
+    healthCheckPath: /api/health
     buildCommand: pnpm install --prod=false && pnpm exec prisma generate && pnpm build
     startCommand: pnpm --filter api-gateway start
     envVars:
@@ -10,8 +29,13 @@ services:
         value: production
       - key: PORT
         value: 3000
+      # REQUIRED at deploy time — set an explicit HTTPS frontend origin (comma-separated).
+      # Do NOT use "*": wildcard CORS is invalid with credentials:true and is rejected
+      # by production env validation (shared/validation/cors.ts).
+      # Example: https://betta-pay-frontend.vercel.app
+      # Example (multi): https://app.example.com,https://www.example.com
       - key: ALLOWED_ORIGINS
-        value: "*" # User should change this to their frontend URL
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: bettapay-db
@@ -23,8 +47,12 @@ services:
           property: connectionString
       - key: JWT_SECRET
         generateValue: true
+      # Shared manually across all services — do NOT use generateValue here.
+      # First-time Blueprint sync can fail if the gateway generates the secret
+      # while private services try to read it via fromService.
+      # Generate a 32+ char secret once and paste the same value on every service.
       - key: INTER_SERVICE_SECRET
-        generateValue: true
+        sync: false
       - key: FX_ENGINE_URL
         value: http://fx-engine:3002
       - key: SETTLEMENT_ENGINE_URL
@@ -45,9 +73,23 @@ services:
         sync: false
 
   # ── FX Engine (Private Service) ───────────────────────────────────────────────
+  # Private services are not publicly reachable; they are still reachable by other
+  # services (and Render project members) on the internal network.
   - type: pserv
     name: fx-engine
     env: node
+    plan: starter # Upgrade path: starter → standard → pro
+    # HA recommendation: 2 instances. Use 1 on starter to save cost if acceptable.
+    # If Pro autoscaling is unavailable, keep numInstances and remove `scaling`.
+    numInstances: 2
+    scaling:
+      minInstances: 2
+      maxInstances: 4
+      targetCPUPercent: 70
+      targetMemoryPercent: 70
+    # Included for readiness probes. Render documents healthCheckPath as web-only;
+    # private services still expose GET /api/health for internal monitoring.
+    healthCheckPath: /api/health
     buildCommand: pnpm install --prod=false && pnpm exec prisma generate && pnpm build
     startCommand: pnpm --filter fx-engine start
     envVars:
@@ -55,11 +97,9 @@ services:
         value: production
       - key: PORT
         value: 3002
+      # Must match api-gateway / settlement-engine / indexer exactly.
       - key: INTER_SERVICE_SECRET
-        fromService:
-          type: web
-          name: api-gateway
-          envVarKey: INTER_SERVICE_SECRET
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: bettapay-db
@@ -74,6 +114,14 @@ services:
   - type: pserv
     name: settlement-engine
     env: node
+    plan: starter # Upgrade path: starter → standard → pro
+    numInstances: 2
+    scaling:
+      minInstances: 2
+      maxInstances: 4
+      targetCPUPercent: 70
+      targetMemoryPercent: 70
+    healthCheckPath: /api/health
     buildCommand: pnpm install --prod=false && pnpm exec prisma generate && pnpm build
     startCommand: pnpm --filter settlement-engine start
     envVars:
@@ -82,10 +130,7 @@ services:
       - key: PORT
         value: 3001
       - key: INTER_SERVICE_SECRET
-        fromService:
-          type: web
-          name: api-gateway
-          envVarKey: INTER_SERVICE_SECRET
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: bettapay-db
@@ -112,6 +157,17 @@ services:
   - type: pserv
     name: indexer
     env: node
+    plan: starter # Upgrade path: starter → standard → pro
+    # Prefer a single indexer replica unless you have leader-election / shard logic.
+    # Documented HA path: raise to numInstances: 2 only after coordinating cursors.
+    numInstances: 1
+    # Optional autoscaling — leave commented until multi-instance indexing is safe.
+    # scaling:
+    #   minInstances: 1
+    #   maxInstances: 2
+    #   targetCPUPercent: 70
+    #   targetMemoryPercent: 70
+    healthCheckPath: /api/health
     buildCommand: pnpm install --prod=false && pnpm exec prisma generate && pnpm build
     startCommand: pnpm --filter indexer start
     envVars:
@@ -120,10 +176,7 @@ services:
       - key: PORT
         value: 3003
       - key: INTER_SERVICE_SECRET
-        fromService:
-          type: web
-          name: api-gateway
-          envVarKey: INTER_SERVICE_SECRET
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: bettapay-db
@@ -146,8 +199,8 @@ databases:
   - name: bettapay-db
     databaseName: bettapay
     user: bettapay_user
-    plan: free # Update to pro for production
+    plan: free # Production upgrade path: free → basic → pro / pro-plus
 
   - type: redis
     name: bettapay-redis
-    plan: free # Update to pro for production
+    plan: free # Production upgrade path: free → starter → standard / pro

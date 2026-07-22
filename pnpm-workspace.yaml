@@ -1,6 +1,11 @@
 packages:
   - 'services/*'
   - 'shared/*'
+
+# Keep axios on a patched line for transitive deps (Stellar SDK, etc.)
+overrides:
+  axios: ^1.7.4
+
 allowBuilds:
   '@prisma/engines': true
   msgpackr-extract: true
