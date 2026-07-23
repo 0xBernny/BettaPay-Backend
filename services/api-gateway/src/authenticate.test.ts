@@ -1,35 +1,14 @@
 import test from 'tape';
-import Fastify from 'fastify';
-import fastifyJwt from '@fastify/jwt';
-import { FastifyRequest, FastifyReply } from 'fastify';
-import { createErrorResponse, ErrorCodes } from '@bettapay/validation';
-test('authenticate decorator should return generic 401 on invalid JWT', async (t) => {
-  const fastify = Fastify({ logger: false });
+import { createTestApp, generateTestJwt } from './test-utils.js';
 
-  fastify.register(fastifyJwt, {
-    secret: 'test-secret-key',
-    sign: { expiresIn: '24h' }
-  });
-
-  // Decorate with fixed authenticate function
-  fastify.decorate('authenticate', async function (request: FastifyRequest, reply: FastifyReply) {
-    try {
-      await request.jwtVerify();
-    } catch (err) {
-      request.log.error(err);
-      reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
-    }
-  });
-
-  fastify.post('/test', { preValidation: [fastify.authenticate] }, async (request, reply) => {
-    return { success: true };
-  });
+test('authenticate decorator should return generic 401 on invalid JWT on gateway app', async (t) => {
+  const { app } = createTestApp();
 
   try {
-    // Test 1: Invalid JWT token should return 401 with generic message
-    const response1 = await fastify.inject({
+    // Test 1: Invalid JWT token should return 401 with generic message on a protected gateway endpoint
+    const response1 = await app.inject({
       method: 'POST',
-      url: '/test',
+      url: '/api/payments',
       headers: { authorization: 'Bearer invalid_token' }
     });
 
@@ -40,9 +19,9 @@ test('authenticate decorator should return generic 401 on invalid JWT', async (t
     t.notOk(response1.body.includes('ERR_'), 'Response should not contain error codes');
 
     // Test 2: Missing authorization header should return 401
-    const response2 = await fastify.inject({
+    const response2 = await app.inject({
       method: 'POST',
-      url: '/test'
+      url: '/api/payments'
     });
 
     t.equal(response2.statusCode, 401, 'Status code should be 401 for missing auth');
@@ -51,20 +30,21 @@ test('authenticate decorator should return generic 401 on invalid JWT', async (t
     t.notOk(response2.body.includes('Missing'), 'Response should not contain "Missing" error text');
 
     // Test 3: Valid JWT token should pass through
-    const token = fastify.jwt.sign({ userId: 'test-user' });
-    const response3 = await fastify.inject({
+    const token = generateTestJwt(app);
+    const response3 = await app.inject({
       method: 'POST',
-      url: '/test',
-      headers: { authorization: `Bearer ${token}` }
+      url: '/api/payments',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { merchantId: 'm1', amount: '10.00', asset: 'USDC' }
     });
 
-    t.equal(response3.statusCode, 200, 'Valid JWT should pass authentication');
+    t.notEqual(response3.statusCode, 401, 'Valid JWT should pass authentication');
 
-    await fastify.close();
+    await app.close();
     t.end();
   } catch (err) {
     t.fail(err as any);
-    await fastify.close();
+    await app.close();
     t.end();
   }
 });
