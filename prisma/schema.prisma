@@ -74,6 +74,9 @@ model Settlement {
   completedAt             DateTime?
   idempotencyKey          String?          @unique
   idempotencyKeyExpiresAt DateTime?
+
+  @@index([initiatedAt(sort: Desc)])
+  @@index([merchantId, initiatedAt(sort: Desc)])
 }
 
 model IndexedEvent {
