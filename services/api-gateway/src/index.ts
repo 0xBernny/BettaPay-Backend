@@ -120,6 +120,7 @@ export interface AppOptions {
   settlementClient?: ReturnType<typeof createSettlementClient>;
   fxClient?: ReturnType<typeof createFxClient>;
   logger?: any;
+  fetchImpl?: typeof fetch;
 }
 
 let defaultPrisma: PrismaClient | null = null;
@@ -305,6 +306,7 @@ registerGatewayHealthRoutes({
   },
   startTime,
   serviceVersion: SERVICE_VERSION,
+  fetchImpl: opts.fetchImpl,
 });
 
 // --- Wallet Auth Challenge Store ----------------------------------------------

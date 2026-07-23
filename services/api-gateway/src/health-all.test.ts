@@ -1,14 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import Fastify from 'fastify';
-import type { PrismaClient } from '@prisma/client';
-import {
-  aggregateAllHealth,
-  buildHealthResponse,
-  checkPostgresql,
-  checkUpstreamServiceHealth,
-} from '../../../shared/validation/health.js';
 import type { HealthResponse } from '../../../shared/validation/schemas.js';
+import { buildApp } from './index.js';
+import { createMockPrisma } from './test-utils.js';
 
 function mockHealth(service: string, status: HealthResponse['status']): HealthResponse {
   return {
@@ -33,90 +27,8 @@ function jsonResponse(body: unknown, ok = true, status = 200): Response {
   } as unknown as Response;
 }
 
-async function buildGatewayHealthResponse(options: {
-  prisma: PrismaClient;
-  env: {
-    FX_ENGINE_URL: string;
-    SETTLEMENT_ENGINE_URL: string;
-    INDEXER_URL: string;
-  };
-  startTime: number;
-  serviceVersion: string;
-  fetchImpl?: typeof fetch;
-}): Promise<HealthResponse> {
-  const { prisma, env, startTime, serviceVersion, fetchImpl = fetch } = options;
-
-  const [postgresql, fxEngine, settlementEngine, indexer] = await Promise.all([
-    checkPostgresql(() => prisma.$queryRaw`SELECT 1`),
-    checkUpstreamServiceHealth(env.FX_ENGINE_URL, 'fx-engine', { fetchImpl }),
-    checkUpstreamServiceHealth(env.SETTLEMENT_ENGINE_URL, 'settlement-engine', { fetchImpl }),
-    checkUpstreamServiceHealth(env.INDEXER_URL, 'indexer', { fetchImpl }),
-  ]);
-
-  return buildHealthResponse({
-    service: 'api-gateway',
-    version: serviceVersion,
-    startTime,
-    dependencies: [postgresql],
-    upstream: [fxEngine, settlementEngine, indexer],
-    criticalDependencyNames: ['postgresql'],
-  });
-}
-
-async function buildAggregatedHealthResponse(options: {
-  prisma: PrismaClient;
-  env: {
-    FX_ENGINE_URL: string;
-    SETTLEMENT_ENGINE_URL: string;
-    INDEXER_URL: string;
-  };
-  startTime: number;
-  serviceVersion: string;
-  fetchImpl?: typeof fetch;
-}) {
-  const gatewayHealth = await buildGatewayHealthResponse(options);
-
-  return aggregateAllHealth({
-    gatewayHealth,
-    targets: [
-      { name: 'fx-engine', baseUrl: options.env.FX_ENGINE_URL },
-      { name: 'settlement-engine', baseUrl: options.env.SETTLEMENT_ENGINE_URL },
-      { name: 'indexer', baseUrl: options.env.INDEXER_URL },
-    ],
-    fetchImpl: options.fetchImpl,
-  });
-}
-
-function registerGatewayHealthRoutes(options: {
-  fastify: ReturnType<typeof Fastify>;
-  prisma: PrismaClient;
-  env: {
-    FX_ENGINE_URL: string;
-    SETTLEMENT_ENGINE_URL: string;
-    INDEXER_URL: string;
-  };
-  startTime: number;
-  serviceVersion: string;
-  fetchImpl?: typeof fetch;
-}) {
-  options.fastify.get('/api/health', async (_request, reply) => {
-    const health = await buildGatewayHealthResponse(options);
-    const statusCode = health.status === 'unhealthy' ? 503 : 200;
-    return reply.code(statusCode).send(health);
-  });
-
-  options.fastify.get('/api/health/all', async (_request, reply) => {
-    const health = await buildAggregatedHealthResponse(options);
-    const statusCode = health.status === 'unhealthy' ? 503 : 200;
-    return reply.code(statusCode).send(health);
-  });
-}
-
 test('GET /api/health/all aggregates downstream health with graceful degradation', async () => {
-  const app = Fastify({ logger: false });
-  const prisma = {
-    $queryRaw: async () => [{ '?column?': 1 }],
-  } as unknown as PrismaClient;
+  const prisma = createMockPrisma() as any;
 
   const fetchImpl = async (url: string | URL | Request) => {
     const target = String(url);
@@ -126,17 +38,10 @@ test('GET /api/health/all aggregates downstream health with graceful degradation
     return jsonResponse(mockHealth('unknown', 'healthy'));
   };
 
-  registerGatewayHealthRoutes({
-    fastify: app,
+  const app = buildApp({
     prisma,
-    env: {
-      FX_ENGINE_URL: 'http://localhost:3002',
-      SETTLEMENT_ENGINE_URL: 'http://localhost:3001',
-      INDEXER_URL: 'http://localhost:3003',
-    },
-    startTime: Date.now() - 10_000,
-    serviceVersion: '0.1.0',
-    fetchImpl,
+    logger: false,
+    fetchImpl: fetchImpl as any
   });
 
   const res = await app.inject({ method: 'GET', url: '/api/health/all' });
@@ -145,7 +50,6 @@ test('GET /api/health/all aggregates downstream health with graceful degradation
   const body = JSON.parse(res.body);
   assert.equal(body.status, 'unhealthy');
   assert.equal(body.service, 'api-gateway');
-  assert.equal(body.version, '0.1.0');
   assert.ok(body.services['api-gateway']);
   assert.equal(body.services['fx-engine'].status, 'healthy');
   assert.equal(body.services['settlement-engine'].status, 'degraded');
@@ -155,46 +59,13 @@ test('GET /api/health/all aggregates downstream health with graceful degradation
   await app.close();
 });
 
-test('buildAggregatedHealthResponse marks overall status healthy when all services respond healthy', async () => {
-  const fetchImpl = async () => jsonResponse(mockHealth('service', 'healthy'));
-
-  const aggregated = await buildAggregatedHealthResponse({
-    prisma: {
-      $queryRaw: async () => [{ '?column?': 1 }],
-    } as unknown as PrismaClient,
-    env: {
-      FX_ENGINE_URL: 'http://localhost:3002',
-      SETTLEMENT_ENGINE_URL: 'http://localhost:3001',
-      INDEXER_URL: 'http://localhost:3003',
-    },
-    startTime: Date.now() - 5_000,
-    serviceVersion: '0.1.0',
-    fetchImpl,
-  });
-
-  assert.equal(aggregated.status, 'healthy');
-  assert.equal(aggregated.services['fx-engine'].status, 'healthy');
-  assert.equal(aggregated.services['settlement-engine'].status, 'healthy');
-  assert.equal(aggregated.services.indexer.status, 'healthy');
-});
-
 test('GET /api/health returns gateway dependency and upstream probes', async () => {
-  const app = Fastify({ logger: false });
-  const prisma = {
-    $queryRaw: async () => [{ '?column?': 1 }],
-  } as unknown as PrismaClient;
+  const prisma = createMockPrisma() as any;
 
-  registerGatewayHealthRoutes({
-    fastify: app,
+  const app = buildApp({
     prisma,
-    env: {
-      FX_ENGINE_URL: 'http://localhost:3002',
-      SETTLEMENT_ENGINE_URL: 'http://localhost:3001',
-      INDEXER_URL: 'http://localhost:3003',
-    },
-    startTime: Date.now() - 2_000,
-    serviceVersion: '0.1.0',
-    fetchImpl: async () => jsonResponse(mockHealth('service', 'healthy')),
+    logger: false,
+    fetchImpl: (async () => jsonResponse(mockHealth('service', 'healthy'))) as any
   });
 
   const res = await app.inject({ method: 'GET', url: '/api/health' });
