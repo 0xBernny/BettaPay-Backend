@@ -30,7 +30,7 @@ import crypto from 'crypto';
 import { z } from 'zod';
 import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
 import { createFxClient } from './clients/fx-client.js';
-import { createIndexerClient } from './clients/indexer-client.js';
+import { createIndexerClient, type IndexerClient } from './clients/indexer-client.js';
 import {
   createSettlementClient,
   SettlementEngineUnavailableError,
@@ -49,7 +49,7 @@ import {
   createErrorResponse,
   ErrorCodes,
   registerErrorHandler,
-  registerServiceAuth,
+  registerServiceAuth, // Assuming PAYMENT_ABANDONMENT_HOURS is added to EnvSchema in @bettapay/validation
   createAuditLogger,
 } from '@bettapay/validation';
 import type { Merchant } from '@prisma/client';
@@ -62,6 +62,7 @@ import { fetchUpstream, UpstreamTimeoutError } from './upstream-fetch.js';
 import { Keypair } from '@stellar/stellar-sdk';
 import { OAuth2Client } from 'google-auth-library';
 import { registerGatewayHealthRoutes } from './health.js';
+import { startAbandonedPaymentsCron, stopAbandonedPaymentsCron } from './abandoned-payments-cron.js';
 import { readServiceVersion } from '@bettapay/validation';
 
 declare module 'fastify' {
@@ -99,6 +100,12 @@ const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
 // --- Request lifecycle timeouts ---------------------------------------------
+
+declare module '@bettapay/validation' {
+    interface Env {
+        PAYMENT_ABANDONMENT_HOURS: number;
+    }
+}
 // REQUEST_TIMEOUT_MS bounds how long a single request may run. If a handler
 // (e.g. a slow DB query or a hung upstream service) exceeds it, the per-request
 // hook below replies 408 Request Timeout so the client connection is released
@@ -1085,6 +1092,7 @@ async function shutdown(signal: string) {
   try {
     await fastify.close();
     await prisma.$disconnect();
+    stopAbandonedPaymentsCron();
     process.exit(0);
   } catch (err) {
     fastify.log.error(err, 'Error during shutdown');
@@ -1099,6 +1107,7 @@ const start = async () => {
   try {
     await connectWithRetry(prisma, fastify.log);
 
+    startAbandonedPaymentsCron(prisma, fastify.log, env.PAYMENT_ABANDONMENT_HOURS);
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {
     fastify.log.error(err);
