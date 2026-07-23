@@ -31,7 +31,6 @@ import {
   buildFxEngineHealthResponse,
   readServiceVersion,
 } from '@bettapay/validation';
-import { validateCurrencyPair } from './utils/validation.js';
 
 const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3002');
@@ -348,9 +347,24 @@ fastify.get(
     }
 
     // Validate that both currencies are supported (issue #49)
-    const validation = validateCurrencyPair(from, to, SUPPORTED_CURRENCIES);
-    if (!validation.valid) {
-      return reply.code(400).send(validation.error);
+    const unsupported: string[] = [];
+    if (!SUPPORTED_CURRENCIES.includes(from)) unsupported.push(from);
+    if (!SUPPORTED_CURRENCIES.includes(to))   unsupported.push(to);
+
+    if (unsupported.length > 0) {
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.UNSUPPORTED_CURRENCY_PAIR,
+          `Unsupported currency: ${unsupported.join(', ')}`,
+          { unsupportedCurrencies: unsupported, supportedCurrencies: SUPPORTED_CURRENCIES },
+        ),
+      );
+    }
+
+    if (from === to) {
+      return reply.code(400).send(
+        createErrorResponse(ErrorCodes.INVALID_QUERY, 'from and to must be different currencies'),
+      );
     }
 
     const requestedBps  = query.slippageBps !== undefined
@@ -438,9 +452,24 @@ fastify.get(
     const from = query.from.toUpperCase();
     const to   = query.to.toUpperCase();
 
-    const validation = validateCurrencyPair(from, to, SUPPORTED_CURRENCIES);
-    if (!validation.valid) {
-      return reply.code(400).send(validation.error);
+    const unsupported: string[] = [];
+    if (!SUPPORTED_CURRENCIES.includes(from)) unsupported.push(from);
+    if (!SUPPORTED_CURRENCIES.includes(to))   unsupported.push(to);
+
+    if (unsupported.length > 0) {
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.UNSUPPORTED_CURRENCY_PAIR,
+          `Unsupported currency: ${unsupported.join(', ')}`,
+          { unsupportedCurrencies: unsupported, supportedCurrencies: SUPPORTED_CURRENCIES },
+        ),
+      );
+    }
+
+    if (from === to) {
+      return reply.code(400).send(
+        createErrorResponse(ErrorCodes.INVALID_QUERY, 'from and to must be different currencies'),
+      );
     }
 
     const atMs = query.at ? new Date(query.at).getTime() : Date.now();
