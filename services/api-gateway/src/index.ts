@@ -43,7 +43,6 @@ import {
   UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
   UpdateMerchantNameBody,
-  GoogleAuthBody,
   WalletChallengeQuery,
   WalletVerifyBody,
   createErrorResponse,
@@ -64,6 +63,7 @@ import { OAuth2Client } from 'google-auth-library';
 import { registerGatewayHealthRoutes } from './health.js';
 import { startAbandonedPaymentsCron, stopAbandonedPaymentsCron } from './abandoned-payments-cron.js';
 import { readServiceVersion } from '@bettapay/validation';
+import { Redis } from 'ioredis';
 
 declare module 'fastify' {
   export interface FastifyInstance {
@@ -101,11 +101,7 @@ const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
 // --- Request lifecycle timeouts ---------------------------------------------
 
-declare module '@bettapay/validation' {
-    interface Env {
-        PAYMENT_ABANDONMENT_HOURS: number;
-    }
-}
+
 // REQUEST_TIMEOUT_MS bounds how long a single request may run. If a handler
 // (e.g. a slow DB query or a hung upstream service) exceeds it, the per-request
 // hook below replies 408 Request Timeout so the client connection is released
@@ -363,8 +359,7 @@ registerGatewayHealthRoutes({
 });
 
 // --- Wallet Auth Challenge Store ----------------------------------------------
-// TODO: migrate to Redis for multi-instance deployments
-const challengeMap = new Map<string, { challenge: string; expiresAt: number }>();
+const redis = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
 
 fastify.get<{ Querystring: WalletChallengeQuery }>('/api/auth/wallet/challenge', {
   config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
@@ -373,7 +368,12 @@ fastify.get<{ Querystring: WalletChallengeQuery }>('/api/auth/wallet/challenge',
   const nonce = crypto.randomBytes(32).toString('hex');
   const challenge = `BettaPay:${address}:${nonce}`;
   const expiresAt = Date.now() + 2 * 60 * 1000; // 2 minutes
-  challengeMap.set(address, { challenge, expiresAt });
+  try {
+    await redis.set(`wallet_challenge:${address}`, JSON.stringify({ challenge, expiresAt }), 'PX', 120000);
+  } catch (err) {
+    request.log.error({ err }, 'Failed to set wallet challenge in Redis');
+    return reply.code(503).send({ error: 'Authentication service unavailable' });
+  }
   return reply.send({ challenge, expiresAt });
 });
 
@@ -381,20 +381,30 @@ fastify.post<{ Body: WalletVerifyBody }>('/api/auth/wallet/verify', {
   config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
 }, async (request, reply) => {
   const d = WalletVerifyBody.parse(request.body);
-  const stored = challengeMap.get(d.address);
   
-  if (!stored) {
+  let storedRaw;
+  try {
+    storedRaw = await redis.get(`wallet_challenge:${d.address}`);
+  } catch (err) {
+    request.log.error({ err }, 'Failed to get wallet challenge from Redis');
+    return reply.code(503).send({ error: 'Authentication service unavailable' });
+  }
+
+  if (!storedRaw) {
     return reply.code(400).send({ error: 'Challenge expired or not found' });
   }
+
+  const stored = JSON.parse(storedRaw);
+
   if (Date.now() > stored.expiresAt) {
-    challengeMap.delete(d.address);
+    await redis.del(`wallet_challenge:${d.address}`).catch(() => {});
     return reply.code(400).send({ error: 'Challenge expired' });
   }
   if (stored.challenge !== d.challenge) {
     return reply.code(400).send({ error: 'Invalid challenge' });
   }
   
-  challengeMap.delete(d.address); // Single use
+  await redis.del(`wallet_challenge:${d.address}`).catch(() => {}); // Single use
   
   try {
     const keypair = Keypair.fromPublicKey(d.address);
@@ -421,40 +431,6 @@ fastify.post<{ Body: WalletVerifyBody }>('/api/auth/wallet/verify', {
   return reply.send({ token });
 });
 
-const googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID);
-
-fastify.post<{ Body: GoogleAuthBody }>('/api/auth/google', {
-  config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
-}, async (request, reply) => {
-  const d = GoogleAuthBody.parse(request.body);
-  
-  try {
-    const ticket = await googleClient.verifyIdToken({
-      idToken: d.idToken,
-      audience: env.GOOGLE_CLIENT_ID,
-    });
-    const payload = ticket.getPayload();
-    if (!payload || !payload.email) {
-      return reply.code(401).send({ error: 'Invalid Google payload' });
-    }
-    
-    const merchant = await prisma.merchant.upsert({
-      where: { ownerId: payload.email },
-      update: {},
-      create: {
-        id: crypto.randomUUID(),
-        name: payload.name || 'My Business',
-        ownerId: payload.email,
-        settings: {}
-      }
-    });
-    
-    const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
-    return reply.send({ token });
-  } catch (err) {
-    return reply.code(401).send({ error: 'Google authentication failed' });
-  }
-});
 
 const walletChallenges = new Map<string, { challenge: string; expiresAt: number }>();
 
@@ -479,13 +455,13 @@ interface WalletVerifyRouteBody {
   signature?: unknown;
 }
 
-const WalletVerifyBody = z.object({
+const LegacyWalletVerifyBody = z.object({
   address: z.string().min(1, 'address is required'),
   signature: z.string().min(1, 'signature is required'),
 });
 
 fastify.post<{ Body: WalletVerifyRouteBody }>('/api/auth/verify', async (request, reply) => {
-  const d = WalletVerifyBody.parse(request.body);
+  const d = LegacyWalletVerifyBody.parse(request.body);
   const challengeInfo = walletChallenges.get(d.address);
 
   if (!challengeInfo) {
@@ -1106,8 +1082,9 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 const start = async () => {
   try {
     await connectWithRetry(prisma, fastify.log);
-
-    startAbandonedPaymentsCron(prisma, fastify.log, env.PAYMENT_ABANDONMENT_HOURS);
+    if (process.env.NODE_ENV !== 'test') {
+      startAbandonedPaymentsCron(prisma, fastify.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24);
+    }
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {
     fastify.log.error(err);
