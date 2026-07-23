@@ -583,7 +583,11 @@ fastify.post<{ Body: z.infer<typeof CreateMerchantBody> }>('/api/merchants', {
       await logAuditEvent('merchant.created', 'merchant', created.id, { before: null, after: created }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
       return created;
     });
-    return reply.code(201).send({ success: true, merchant, secret });
+    if (!d.secret) {
+      fastify.log.warn({ merchantId: merchant.id }, 'Auto-generated merchant secret returned in response. This will only be shown once.');
+    }
+    const { secretHash: _hash, ...safeMerchant } = merchant;
+    return reply.code(201).send({ data: { merchant: safeMerchant, secret } });
 });
 
 fastify.get<{ Params: { id: string } }>('/api/merchants/:id', {
