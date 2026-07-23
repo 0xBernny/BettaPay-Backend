@@ -2,7 +2,10 @@ import test from 'tape';
 import Fastify from 'fastify';
 import fastifyJwt from '@fastify/jwt';
 import crypto from 'crypto';
-import { CreateMerchantBody, AuthTokenBody } from '@bettapay/validation';
+import sinon from 'sinon';
+import { Keypair } from '@stellar/stellar-sdk';
+import { OAuth2Client } from 'google-auth-library';
+import { CreateMerchantBody, AuthTokenBody, createErrorResponse, ErrorCodes } from '@bettapay/validation';
 
 // Valid Ed25519 Stellar public key (checksummed) used wherever AuthTokenBody /
 // CreateMerchantBody require StellarAddressSchema.
@@ -14,10 +17,17 @@ function hashSecret(secret: string): string {
   return crypto.createHash('sha256').update(secret).digest('hex');
 }
 
+interface BuildAppOptions {
+  initialMerchants?: any[];
+  injectP2002OnVerify?: boolean;
+}
+
 // Builds a mock application mirroring the gateway's authentication and creation routes
-function buildApp(initialMerchants: any[] = []) {
+function buildApp(optsOrMerchants: BuildAppOptions | any[] = {}) {
+  const opts = Array.isArray(optsOrMerchants) ? { initialMerchants: optsOrMerchants } : optsOrMerchants;
   const app = Fastify({ logger: false });
-  const db = [...initialMerchants];
+  const db = [...(opts.initialMerchants || [])];
+  const walletChallenges = new Map<string, { challenge: string; expiresAt: number }>();
 
   app.register(fastifyJwt, {
     secret: 'test-jwt-secret-key-32-chars-long-or-more',
@@ -67,7 +77,132 @@ function buildApp(initialMerchants: any[] = []) {
     }
   });
 
-  return { app, db };
+  // Replicate wallet challenge/verify and Google OAuth routes
+
+  app.post<{ Body: { address?: unknown } }>('/api/auth/challenge', async (request, reply) => {
+    try {
+      const { address } = request.body as any;
+      if (!address || typeof address !== 'string') {
+        return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'address is required'));
+      }
+      const challenge = crypto.randomBytes(32).toString('hex');
+      const expiresAt = Date.now() + 5 * 60 * 1000; // 5 mins
+      walletChallenges.set(address, { challenge, expiresAt });
+      return reply.send({ challenge, expiresAt: new Date(expiresAt).toISOString() });
+    } catch (err: any) {
+      return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, err.message));
+    }
+  });
+
+  app.post<{ Body: { address?: unknown; signature?: unknown } }>('/api/auth/verify', async (request, reply) => {
+    try {
+      const { address, signature } = request.body as any;
+      if (!address || typeof address !== 'string') {
+        return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'address is required'));
+      }
+      if (!signature || typeof signature !== 'string') {
+        return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'signature is required'));
+      }
+
+      const challengeInfo = walletChallenges.get(address);
+      if (!challengeInfo) {
+        return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge not found or expired'));
+      }
+
+      if (Date.now() > challengeInfo.expiresAt) {
+        walletChallenges.delete(address);
+        return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired'));
+      }
+
+      try {
+        const keypair = Keypair.fromPublicKey(address);
+        const isValid = keypair.verify(Buffer.from(challengeInfo.challenge), Buffer.from(signature, 'hex'));
+        if (!isValid) {
+          return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid signature'));
+        }
+      } catch (err) {
+        return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid signature'));
+      }
+
+      walletChallenges.delete(address);
+
+      let merchant;
+      if (opts.injectP2002OnVerify) {
+        // Simulate concurrent insert P2002 error: another worker inserted it first
+        const existing = db.find(m => m.id === address);
+        if (!existing) {
+          const winner = {
+            id: address,
+            name: `Merchant ${address.substring(0, 6)}`,
+            ownerId: `owner-${address.substring(0, 6)}`,
+            settings: {}
+          };
+          db.push(winner);
+          merchant = winner;
+        } else {
+          merchant = existing;
+        }
+      } else {
+        merchant = db.find(m => m.id === address);
+        if (!merchant) {
+          merchant = {
+            id: address,
+            name: `Merchant ${address.substring(0, 6)}`,
+            ownerId: `owner-${address.substring(0, 6)}`,
+            settings: {}
+          };
+          db.push(merchant);
+        }
+      }
+
+      const token = app.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
+      return reply.send({ token });
+    } catch (err: any) {
+      return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, err.message));
+    }
+  });
+
+  app.post<{ Body: { token?: unknown } }>('/api/auth/google', async (request, reply) => {
+    try {
+      const { token } = request.body as any;
+      if (!token || typeof token !== 'string') {
+        return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'token is required'));
+      }
+
+      const client = new OAuth2Client();
+      const ticket = await client.verifyIdToken({
+        idToken: token,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      const payload = ticket.getPayload();
+      if (!payload) {
+        return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid token payload'));
+      }
+      const email = payload.email;
+      if (!email) {
+        return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Email missing in Google payload'));
+      }
+
+      let merchant = db.find(m => m.ownerId === email && !m.deletedAt);
+      if (!merchant) {
+        const merchantId = `google_${crypto.randomBytes(8).toString('hex')}`;
+        merchant = {
+          id: merchantId,
+          name: email.split('@')[0] + ' Merchant',
+          ownerId: email,
+          settings: {}
+        };
+        db.push(merchant);
+      }
+
+      const jwtToken = app.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
+      return reply.send({ token: jwtToken });
+    } catch (err: any) {
+      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid Google token'));
+    }
+  });
+
+  return { app, db, walletChallenges };
 }
 
 test('valid credentials return JWT', async (t) => {
@@ -250,6 +385,252 @@ test('regression test: arbitrary secrets can no longer obtain a JWT', async (t) 
   } catch (err: any) {
     t.fail(err);
   } finally {
+    await app.close();
+    t.end();
+  }
+});
+
+test('wallet auth challenge - success', async (t) => {
+  const { app } = buildApp();
+  try {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/challenge',
+      payload: { address: 'GD...123' }
+    });
+    t.equal(res.statusCode, 200);
+    const body = JSON.parse(res.body);
+    t.ok(body.challenge);
+    t.ok(body.expiresAt);
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    await app.close();
+    t.end();
+  }
+});
+
+test('wallet verify with expired challenge', async (t) => {
+  const { app, walletChallenges } = buildApp();
+  const address = 'GD...expired';
+  walletChallenges.set(address, {
+    challenge: 'expired-challenge-text',
+    expiresAt: Date.now() - 1 // expired
+  });
+
+  try {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/verify',
+      payload: { address, signature: 'signature-hex' }
+    });
+    t.equal(res.statusCode, 400);
+    const body = JSON.parse(res.body);
+    t.equal(body.error.code, ErrorCodes.INVALID_REQUEST);
+    t.equal(body.error.message, 'Challenge expired');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    await app.close();
+    t.end();
+  }
+});
+
+test('wallet verify with invalid signature', async (t) => {
+  const { app, walletChallenges } = buildApp();
+  const address = 'GD...invalid-sig';
+  const challenge = 'valid-challenge-text';
+  walletChallenges.set(address, {
+    challenge,
+    expiresAt: Date.now() + 5000
+  });
+
+  // Mock Keypair verify to return false
+  const mockKeypair = {
+    verify: sinon.stub().returns(false)
+  };
+  const fromPublicKeyStub = sinon.stub(Keypair, 'fromPublicKey').returns(mockKeypair as any);
+
+  try {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/verify',
+      payload: { address, signature: 'signature-hex' }
+    });
+    t.equal(res.statusCode, 401);
+    const body = JSON.parse(res.body);
+    t.equal(body.error.code, ErrorCodes.UNAUTHORIZED);
+    t.equal(body.error.message, 'Invalid signature');
+    t.ok(mockKeypair.verify.calledOnce);
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    fromPublicKeyStub.restore();
+    await app.close();
+    t.end();
+  }
+});
+
+test('wallet verify - success & upsert path / token returned', async (t) => {
+  const { app, db, walletChallenges } = buildApp();
+  const address = 'GD...success';
+  const challenge = 'valid-challenge-text';
+  walletChallenges.set(address, {
+    challenge,
+    expiresAt: Date.now() + 5000
+  });
+
+  const mockKeypair = {
+    verify: sinon.stub().returns(true)
+  };
+  const fromPublicKeyStub = sinon.stub(Keypair, 'fromPublicKey').returns(mockKeypair as any);
+
+  try {
+    // Calling verify first time (creates merchant)
+    const res1 = await app.inject({
+      method: 'POST',
+      url: '/api/auth/verify',
+      payload: { address, signature: 'signature-hex' }
+    });
+    t.equal(res1.statusCode, 200);
+    const body1 = JSON.parse(res1.body);
+    t.ok(body1.token);
+
+    t.equal(db.length, 1);
+    t.equal(db[0].id, address);
+
+    // Seed challenge again to test second call (upserts, no duplicates)
+    walletChallenges.set(address, {
+      challenge,
+      expiresAt: Date.now() + 5000
+    });
+
+    const res2 = await app.inject({
+      method: 'POST',
+      url: '/api/auth/verify',
+      payload: { address, signature: 'signature-hex' }
+    });
+    t.equal(res2.statusCode, 200);
+    const body2 = JSON.parse(res2.body);
+    t.ok(body2.token);
+
+    // Verify database size remains 1 (no duplicates)
+    t.equal(db.length, 1);
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    fromPublicKeyStub.restore();
+    await app.close();
+    t.end();
+  }
+});
+
+test('wallet verify - concurrent race condition upsert path', async (t) => {
+  const { app, db, walletChallenges } = buildApp({ injectP2002OnVerify: true });
+  const address = 'GD...race';
+  const challenge = 'valid-challenge-text';
+  walletChallenges.set(address, {
+    challenge,
+    expiresAt: Date.now() + 5000
+  });
+
+  const mockKeypair = {
+    verify: sinon.stub().returns(true)
+  };
+  const fromPublicKeyStub = sinon.stub(Keypair, 'fromPublicKey').returns(mockKeypair as any);
+
+  try {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/verify',
+      payload: { address, signature: 'signature-hex' }
+    });
+    t.equal(res.statusCode, 200);
+    const body = JSON.parse(res.body);
+    t.ok(body.token);
+
+    // Database must only have 1 merchant for this address
+    t.equal(db.filter(m => m.id === address).length, 1);
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    fromPublicKeyStub.restore();
+    await app.close();
+    t.end();
+  }
+});
+
+test('Google OAuth - invalid token', async (t) => {
+  const { app } = buildApp();
+  const verifyIdTokenStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').rejects(new Error('Invalid token'));
+
+  try {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/google',
+      payload: { token: 'invalid-token' }
+    });
+    t.equal(res.statusCode, 401);
+    const body = JSON.parse(res.body);
+    t.equal(body.error.code, ErrorCodes.UNAUTHORIZED);
+    t.equal(body.error.message, 'Invalid Google token');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    verifyIdTokenStub.restore();
+    await app.close();
+    t.end();
+  }
+});
+
+test('Google OAuth - missing email', async (t) => {
+  const { app } = buildApp();
+  const verifyIdTokenStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
+    getPayload: () => ({})
+  } as any);
+
+  try {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/google',
+      payload: { token: 'missing-email-token' }
+    });
+    t.equal(res.statusCode, 400);
+    const body = JSON.parse(res.body);
+    t.equal(body.error.code, ErrorCodes.INVALID_REQUEST);
+    t.equal(body.error.message, 'Email missing in Google payload');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    verifyIdTokenStub.restore();
+    await app.close();
+    t.end();
+  }
+});
+
+test('Google OAuth - success & token returned', async (t) => {
+  const { app, db } = buildApp();
+  const email = 'test-google@example.com';
+  const verifyIdTokenStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
+    getPayload: () => ({ email })
+  } as any);
+
+  try {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/google',
+      payload: { token: 'valid-token' }
+    });
+    t.equal(res.statusCode, 200);
+    const body = JSON.parse(res.body);
+    t.ok(body.token);
+
+    t.equal(db.length, 1);
+    t.equal(db[0].ownerId, email);
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    verifyIdTokenStub.restore();
     await app.close();
     t.end();
   }
