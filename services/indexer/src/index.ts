@@ -463,6 +463,29 @@ fastify.post(
   });
 });
 
+// Issue #229 — replay job progress status
+fastify.get<{ Params: { jobId: string } }>(
+  '/api/events/replay/:jobId/status',
+  async (request, reply) => {
+    const { jobId } = request.params;
+    try {
+      const raw = await replayProgressRedis.get(`${PROGRESS_KEY_PREFIX}${jobId}`);
+      if (!raw) {
+        return reply.code(404).send({
+          error: { code: 'NOT_FOUND', message: `Replay job ${jobId} not found` },
+        });
+      }
+      const progress = JSON.parse(raw);
+      return { jobId, ...progress };
+    } catch (err) {
+      fastify.log.warn({ err, jobId }, '[Indexer] Failed to read replay progress');
+      return reply.code(500).send({
+        error: { code: 'INTERNAL_ERROR', message: 'Failed to read replay progress' },
+      });
+    }
+  },
+);
+
 // Issue #70 — webhook subscription CRUD
 const WebhookBody = z.object({
   url: WebhookUrlSchema,
