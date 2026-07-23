@@ -19,7 +19,7 @@ import crypto from 'crypto';
 import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, WebhookSubscription } from '@prisma/client';
 import { rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
 import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
@@ -63,7 +63,7 @@ const pool = new pg.Pool({
   connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
 });
 const prismaAdapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter: prismaAdapter, log: getPrismaLogLevels() });
+export const prisma = new PrismaClient({ adapter: prismaAdapter, log: getPrismaLogLevels() });
 setupPrismaQueryLogging(prisma, fastify.log);
 const logAuditEvent = createAuditLogger(prisma as unknown as Parameters<typeof createAuditLogger>[0], fastify.log);
 
@@ -100,7 +100,7 @@ const connectionParams = {
 // Queue name kept as 'indexer-webhooks' so any jobs already in Redis from the
 // previous inline implementation are picked up without data loss (migration
 // safety — see shared/webhook-delivery/index.ts for details).
-const webhookQueue = createWebhookQueue('indexer-webhooks', connectionParams);
+export const webhookQueue = createWebhookQueue('indexer-webhooks', connectionParams);
 const webhookWorker = createWebhookWorker('indexer-webhooks', connectionParams, {
   logger: {
     info: (obj, msg) => fastify.log.info(obj, msg),
@@ -334,7 +334,9 @@ function decodeScVal(evtValue: xdr.ScVal, topicHint: string): unknown {
 
 // ── Event persistence ─────────────────────────────────────────────────────────
 
-async function persistEvent(
+export const cacheState: { subscriptions: { data: WebhookSubscription[]; cachedAt: number } | null } = { subscriptions: null };
+
+export async function persistEvent(
   stellarId: string | null,
   topics: string[],
   type: string,
@@ -363,7 +365,16 @@ async function persistEvent(
 
   fastify.log.info({ id, type, contractName, ledger }, '[Indexer] Event indexed');
 
-  const subs = await prisma.webhookSubscription.findMany();
+  const now = Date.now();
+  if (cacheState.subscriptions && now - cacheState.subscriptions.cachedAt < 30000) {
+    fastify.log.debug('[Indexer] Webhook subscriptions cache hit');
+  } else {
+    fastify.log.debug('[Indexer] Webhook subscriptions cache miss, fetching from DB');
+    const freshSubs = await prisma.webhookSubscription.findMany();
+    cacheState.subscriptions = { data: freshSubs, cachedAt: now };
+  }
+
+  const subs = cacheState.subscriptions.data;
   for (const sub of subs) {
     await webhookQueue.add('deliver', { url: sub.url, event: record as Record<string, unknown> });
   }
@@ -500,6 +511,7 @@ fastify.post('/api/webhooks', async (request, reply) => {
     await logAuditEvent('webhook.registered', 'webhook', created.id, { before: null, after: created }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
     return created;
   });
+  cacheState.subscriptions = null; // Invalidate cache
   return reply.code(201).send(sub);
 });
 
@@ -519,6 +531,7 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, 
     await tx.webhookSubscription.delete({ where: { id } });
     await logAuditEvent('webhook.deleted', 'webhook', id, { before: existing, after: null }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
   });
+  cacheState.subscriptions = null; // Invalidate cache
   return reply.code(204).send();
 });
 
