@@ -556,33 +556,21 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     const rawIdempotencyKey = request.headers['idempotency-key'];
     const idempotencyKey = Array.isArray(rawIdempotencyKey) ? rawIdempotencyKey[0] : rawIdempotencyKey;
 
-    const settlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
-
     if (idempotencyKey) {
-      let claimed: string | null = null;
-      try {
-        claimed = await redis.set(`idempotency:${idempotencyKey}`, settlementId, 'NX', 'EX', 86400);
-      } catch {
-        // Redis unavailable — fall through to DB @unique constraint
-      }
-
-      if (claimed === null) {
-        // Another request atomically claimed this idempotency key first
-        const existingId = await redis.get(`idempotency:${idempotencyKey}`).catch(() => null);
-        if (existingId) {
-          const existingSettlement = await prisma.settlement.findUnique({
-            where: { id: existingId },
-          });
-          if (existingSettlement) {
-            return reply.code(200).send(existingSettlement);
-          }
+      const existingSettlementId = await redis.get(`idempotency:${idempotencyKey}`);
+      if (existingSettlementId) {
+        const existingSettlement = await prisma.settlement.findUnique({
+          where: { id: existingSettlementId },
+        });
+        if (existingSettlement) {
+          return reply.code(200).send(existingSettlement);
         }
       }
     }
 
     const settlement = await prisma.settlement.create({
       data: {
-        id: settlementId,
+        id: 'set_' + crypto.randomUUID().replace(/-/g, ''),
         merchantId: d.merchantId,
         totalAmount: grossAmount,
         grossAmount,
@@ -592,8 +580,6 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
         asset: d.asset,
         status: 'pending',
         webhookUrl,
-        idempotencyKey: idempotencyKey ?? undefined,
-        idempotencyKeyExpiresAt: idempotencyKey ? new Date(Date.now() + 86400_000) : undefined,
       },
     });
 
@@ -605,6 +591,11 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     };
 
     await settlementQueue.add('process-settlement', jobData);
+
+    if (idempotencyKey) {
+      // 24-hour TTL (24 * 60 * 60 = 86400 seconds)
+      await redis.set(`idempotency:${idempotencyKey}`, settlement.id, 'EX', 86400);
+    }
 
     return reply.code(201).send(settlement);
 });

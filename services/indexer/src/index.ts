@@ -17,7 +17,6 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import crypto from 'crypto';
 import { Redis } from 'ioredis';
-import { Queue, Worker } from 'bullmq';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { PrismaClient } from '@prisma/client';
 import { rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
@@ -122,159 +121,6 @@ webhookQueue.on('error', (err) => {
   fastify.log.error({ err: err.message }, '[Indexer] Webhook queue error');
 });
 
-// ── Replay queue & worker ─────────────────────────────────────────────────────
-
-const replayQueue = new Queue('indexer-replays', {
-  connection: connectionParams,
-  defaultJobOptions: {
-    attempts: 2,
-    backoff: { type: 'exponential', delay: 2000 },
-    removeOnComplete: { count: 100 },
-    removeOnFail: { count: 50 },
-  },
-});
-
-const replayProgressRedis = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
-replayProgressRedis.on('error', (err) =>
-  fastify.log.warn({ err: err.message }, '[Indexer] Replay progress Redis error'),
-);
-
-const PROGRESS_KEY_PREFIX = 'replay:progress:';
-
-async function updateReplayProgress(
-  jobId: string,
-  data: { totalLedgers: number; processedLedgers: number; status: 'running' | 'completed' | 'failed'; error?: string },
-): Promise<void> {
-  try {
-    await replayProgressRedis.set(
-      `${PROGRESS_KEY_PREFIX}${jobId}`,
-      JSON.stringify(data),
-      'EX',
-      86400,
-    );
-  } catch {
-    // Non-fatal: progress is best-effort
-  }
-}
-
-const replayWorker = new Worker(
-  'indexer-replays',
-  async (job) => {
-    type ReplayJobData = { fromLedger: number; toLedger: number };
-    const { fromLedger, toLedger } = job.data as ReplayJobData;
-    const totalLedgers = toLedger - fromLedger + 1;
-
-    await updateReplayProgress(job.id!, {
-      totalLedgers,
-      processedLedgers: 0,
-      status: 'running',
-    });
-
-    let processedLedgers = 0;
-
-    try {
-      for (const contractId of CONTRACT_IDS) {
-        let cursor = fromLedger;
-
-        while (cursor <= toLedger) {
-          const response = await server.getEvents({
-            startLedger: cursor,
-            filters: [{ type: 'contract' as const, contractIds: [contractId], topics: [] }],
-            limit: REPLAY_CHUNK_SIZE,
-          });
-
-          if (!response.events || response.events.length === 0) break;
-
-          const stellarIds = response.events
-            .map((evt) => (typeof evt.id === 'string' ? evt.id : null))
-            .filter((id): id is string => id !== null);
-          const existingStellarIds = new Set<string>(
-            stellarIds.length > 0
-              ? (await prisma.indexedEvent.findMany({
-                  where: { stellarId: { in: stellarIds } },
-                  select: { stellarId: true },
-                })).map((e) => e.stellarId).filter((id): id is string => id !== null)
-              : [],
-          );
-
-          for (const evt of response.events) {
-            if (evt.ledger > toLedger) break;
-            cursor = Math.max(cursor, evt.ledger + 1);
-
-            const topics = Array.isArray(evt.topic) ? evt.topic.map(String) : [String(evt.topic)];
-            const rawValue = evt.value.toXDR('base64');
-            const decodedPayload = decodeScVal(evt.value, topics[0]);
-            const resolvedContractId = evt.contractId ? evt.contractId.toString() : contractId;
-            const contractName = getContractName(resolvedContractId);
-            const stellarId = typeof evt.id === 'string' ? evt.id : null;
-
-            if (stellarId) {
-              if (existingStellarIds.has(stellarId)) continue;
-            } else {
-              const existing = await prisma.indexedEvent.findFirst({
-                where: { ledger: evt.ledger, contractId: resolvedContractId, rawValue },
-              });
-              if (existing) continue;
-            }
-
-            await prisma.indexedEvent.create({
-              data: {
-                id: 'evt_' + crypto.randomUUID().replace(/-/g, ''),
-                stellarId,
-                contractId: resolvedContractId,
-                contractName,
-                topics,
-                type: topics[0],
-                rawValue,
-                decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
-                ledger: evt.ledger,
-                indexedAt: new Date(),
-              },
-            });
-
-            processedLedgers = Math.max(processedLedgers, evt.ledger - fromLedger + 1);
-            await updateReplayProgress(job.id!, {
-              totalLedgers,
-              processedLedgers,
-              status: 'running',
-            });
-          }
-
-          const lastEvt = response.events[response.events.length - 1];
-          if (lastEvt.ledger >= toLedger || response.events.length < REPLAY_CHUNK_SIZE) break;
-        }
-      }
-
-      await updateReplayProgress(job.id!, {
-        totalLedgers,
-        processedLedgers,
-        status: 'completed',
-      });
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      fastify.log.error({ err: errMsg, jobId: job.id }, '[Indexer] Replay job failed');
-      await updateReplayProgress(job.id!, {
-        totalLedgers,
-        processedLedgers,
-        status: 'failed',
-        error: errMsg,
-      });
-      throw err;
-    }
-  },
-  {
-    connection: connectionParams,
-    concurrency: 1,
-  },
-);
-
-replayWorker.on('error', (err) => {
-  fastify.log.error({ err: err.message }, '[Indexer] Replay worker error');
-});
-replayQueue.on('error', (err) => {
-  fastify.log.error({ err: err.message }, '[Indexer] Replay queue error');
-});
-
 // ── Multi-contract config ────────────────────────────────────────────────────
 
 // validateEnv resolves CONTRACT_IDS as a string[] (falls back to SETTLEMENT_CONTRACT_ID
@@ -297,9 +143,6 @@ const CONTRACT_NAMES: Record<string, string> = (() => {
   });
   return map;
 })();
-
-const MAX_REPLAY_LEDGER_RANGE = 1000;
-const REPLAY_CHUNK_SIZE = 100;
 
 function getContractName(contractId: string): string {
   return CONTRACT_NAMES[contractId] ?? 'unknown';
@@ -441,50 +284,77 @@ fastify.post(
   async (request, reply) => {
   const { fromLedger, toLedger } = ReplayBody.parse(request.body);
 
-  const range = toLedger - fromLedger;
-  if (range > MAX_REPLAY_LEDGER_RANGE) {
-    return reply.code(400).send({
-      error: {
-        code: 'VALIDATION_ERROR',
-        message: `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
-        details: { fromLedger, toLedger, maxRange: MAX_REPLAY_LEDGER_RANGE },
-      },
-    });
-  }
-
-  const job = await replayQueue.add('replay', { fromLedger, toLedger });
-
-  return reply.code(202).send({
-    jobId: job.id,
-    status: 'queued',
-    fromLedger,
-    toLedger,
-    range,
+  fastify.register(rateLimit, {
+    max: 60,
+    timeWindow: '1 minute'
   });
-});
 
-// Issue #229 — replay job progress status
-fastify.get<{ Params: { jobId: string } }>(
-  '/api/events/replay/:jobId/status',
-  async (request, reply) => {
-    const { jobId } = request.params;
-    try {
-      const raw = await replayProgressRedis.get(`${PROGRESS_KEY_PREFIX}${jobId}`);
-      if (!raw) {
-        return reply.code(404).send({
-          error: { code: 'NOT_FOUND', message: `Replay job ${jobId} not found` },
-        });
-      }
-      const progress = JSON.parse(raw);
-      return { jobId, ...progress };
-    } catch (err) {
-      fastify.log.warn({ err, jobId }, '[Indexer] Failed to read replay progress');
-      return reply.code(500).send({
-        error: { code: 'INTERNAL_ERROR', message: 'Failed to read replay progress' },
+  let newEvents = 0;
+  let skippedDuplicates = 0;
+
+  for (const contractId of CONTRACT_IDS) {
+    let cursor = fromLedger;
+
+    while (cursor <= toLedger) {
+      const response = await server.getEvents({
+        startLedger: cursor,
+        filters: [{ type: 'contract' as const, contractIds: [contractId], topics: [] }],
+        limit: 100,
       });
+
+      if (!response.events || response.events.length === 0) break;
+
+      for (const evt of response.events) {
+        if (evt.ledger > toLedger) break;
+        cursor = Math.max(cursor, evt.ledger + 1);
+
+        const topics = Array.isArray(evt.topic) ? evt.topic.map(String) : [String(evt.topic)];
+        const rawValue = evt.value.toXDR('base64');
+        const decodedPayload = decodeScVal(evt.value, topics[0]);
+        const resolvedContractId = evt.contractId ? evt.contractId.toString() : contractId;
+        const contractName = getContractName(resolvedContractId);
+        const stellarId = typeof evt.id === 'string' ? evt.id : null;
+
+        // Skip duplicates using Stellar's own event ID (most reliable key)
+        if (stellarId) {
+          const existing = await prisma.indexedEvent.findUnique({ where: { stellarId } });
+          if (existing) {
+            skippedDuplicates++;
+            continue;
+          }
+        } else {
+          // Fall back to ledger + contractId + rawValue fingerprint
+          const existing = await prisma.indexedEvent.findFirst({
+            where: { ledger: evt.ledger, contractId: resolvedContractId, rawValue },
+          });
+          if (existing) {
+            skippedDuplicates++;
+            continue;
+          }
+        }
+
+        await prisma.indexedEvent.create({
+          data: {
+            id: 'evt_' + crypto.randomUUID().replace(/-/g, ''),
+            stellarId,
+            contractId: resolvedContractId,
+            contractName,
+            topics,
+            type: topics[0],
+            rawValue,
+            decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
+            ledger: evt.ledger,
+            indexedAt: new Date(),
+          },
+        });
+        newEvents++;
+      }
+
+      const lastEvt = response.events[response.events.length - 1];
+      if (lastEvt.ledger >= toLedger || response.events.length < 100) break;
     }
-  },
-);
+  }
+});
 
 // Issue #70 — webhook subscription CRUD
 const WebhookBody = z.object({
@@ -673,9 +543,6 @@ const start = async () => {
 
 process.on('SIGTERM', async () => {
   await prisma.$disconnect();
-  await replayQueue.close();
-  await replayWorker.close();
-  await replayProgressRedis.quit().catch(() => {});
   await webhookQueue.close();
   await webhookWorker.close();
   await fastify.close();
