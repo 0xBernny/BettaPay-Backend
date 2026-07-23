@@ -113,42 +113,28 @@ const SERVICE_VERSION = readServiceVersion(import.meta.url);
 const REQUEST_TIMEOUT_MS = 30_000;
 const CONNECTION_TIMEOUT_MS = 31_000;
 
-const fastify = Fastify({
-  logger: createLoggerOptions({ level: env.LOG_LEVEL }),
-  requestTimeout: REQUEST_TIMEOUT_MS,
-  connectionTimeout: CONNECTION_TIMEOUT_MS,
-  // Limit request body size to 1MB (1,048,576 bytes) to protect the API gateway
-  // from oversized payload attacks and align with typical financial transaction payload sizes.
-  bodyLimit: 1_048_576,
-});
+// --- App Factory & Configuration Options ------------------------------------
+export interface AppOptions {
+  prisma?: PrismaClient;
+  indexerClient?: ReturnType<typeof createIndexerClient>;
+  settlementClient?: ReturnType<typeof createSettlementClient>;
+  fxClient?: ReturnType<typeof createFxClient>;
+  logger?: any;
+}
 
-registerRequestId(fastify);
-
-registerErrorHandler(fastify);
-// Distributed tracing: normalise x-request-id / x-trace-id and bind to the
-// request logger so trace context is logged and propagated downstream (#118).
-registerTracing(fastify);
-registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
-
-// Indexer HTTP client for optional on-chain event enrichment (Issue #116).
-// Enrichment is best-effort: indexer failures degrade to payment-only responses.
-const indexerClient = createIndexerClient({
-  baseUrl: env.INDEXER_URL,
-  serviceToken: env.INTER_SERVICE_SECRET,
-  logger: fastify.log,
-});
-
-const settlementClient = createSettlementClient({
-  baseUrl: env.SETTLEMENT_ENGINE_URL,
-  serviceToken: env.INTER_SERVICE_SECRET,
-  logger: fastify.log,
-});
-
-const fxClient = createFxClient({
-  baseUrl: env.FX_ENGINE_URL,
-  serviceToken: env.INTER_SERVICE_SECRET,
-  logger: fastify.log,
-});
+let defaultPrisma: PrismaClient | null = null;
+export function getDefaultPrisma(): PrismaClient {
+  if (!defaultPrisma) {
+    const pool = new pg.Pool({
+      connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
+      max: env.DATABASE_POOL_SIZE,
+      connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
+    });
+    const adapter = new PrismaPg(pool);
+    defaultPrisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
+  }
+  return defaultPrisma;
+}
 
 // --- Response logging hooks -------------------------------------------------
 const SENSITIVE_FIELDS = new Set(['token', 'secret', 'secretHash', 'password', 'privateKey', 'secretKey']);
@@ -206,74 +192,40 @@ function redactObject(obj: Record<string, any>) {
   return out;
 }
 
-fastify.addHook('onRequest', async (request, reply) => {
-  // Mark request start for response time calculation
-  (request as any).__startTime = Date.now();
-
-  // Per-request timeout guard. Fastify's requestTimeout only bounds how long the
-  // client takes to *send* a request; it does not abort a slow handler. This timer
-  // covers that case: if the response is not sent within REQUEST_TIMEOUT_MS, reply
-  // 408 so the caller is not left hanging. (The slow handler keeps running, but the
-  // client connection is freed.) The timer is cleared in the onResponse hook below.
-  const timeoutTimer = setTimeout(() => {
-    if (!reply.sent) {
-      reply.code(408).send(createErrorResponse(ErrorCodes.REQUEST_TIMEOUT, 'Request Timeout'));
-    }
-  }, REQUEST_TIMEOUT_MS);
-  (request as any).__timeoutTimer = timeoutTimer;
-});
-
-fastify.addHook('onResponse', async (request) => {
-  const timeoutTimer = (request as any).__timeoutTimer;
-  if (timeoutTimer) clearTimeout(timeoutTimer);
-});
-
-fastify.addHook('onSend', async (request, reply, payload) => {
-  try {
-    const headers = request.headers as Record<string, any>;
-    const reqId = (headers['x-request-id'] as string) || (request.id as string) || 'unknown';
-    const method = request.method;
-    const url = request.url;
-    const statusCode = reply.statusCode || 0;
-    const start = (request as any).__startTime || Date.now();
-    const responseTime = Date.now() - start;
-
-    const baseLog = { reqId, method, url, statusCode, responseTime };
-
-    if (statusCode >= 400) {
-      // attempt to parse payload (may be string, Buffer, object)
-      let body: any = payload;
-      try {
-        if (typeof payload === 'string') body = JSON.parse(payload as string);
-      } catch (e) {
-        // leave as raw string
-      }
-
-      const safeBody = typeof body === 'object' && body !== null ? redactObject(body as Record<string, any>) : body;
-      fastify.log.warn({ ...baseLog, response: safeBody }, 'Error response');
-    } else {
-      fastify.log.info(baseLog, 'Response summary');
-    }
-  } catch (err) {
-    fastify.log.error({ err }, 'onSend hook failed');
-  }
-
-  return payload;
-});
-
 function hashSecret(secret: string): string {
   return crypto.createHash('sha256').update(secret).digest('hex');
 }
 
-const pool = new pg.Pool({
-  connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
-  max: env.DATABASE_POOL_SIZE,
-  connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
-});
-const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
-setupPrismaQueryLogging(prisma, fastify.log);
-const logAuditEvent = createAuditLogger(prisma as unknown as Parameters<typeof createAuditLogger>[0], fastify.log);
+export function buildApp(opts: AppOptions = {}) {
+  const fastify = Fastify({
+    logger: opts.logger !== undefined ? opts.logger : createLoggerOptions({ level: env.LOG_LEVEL }),
+    requestTimeout: REQUEST_TIMEOUT_MS,
+    connectionTimeout: CONNECTION_TIMEOUT_MS,
+    bodyLimit: 1_048_576,
+  });
+
+  registerRequestId(fastify);
+  registerErrorHandler(fastify);
+  registerTracing(fastify);
+  registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
+
+  const prisma = opts.prisma ?? getDefaultPrisma();
+  const indexerClient = opts.indexerClient ?? createIndexerClient({
+    baseUrl: env.INDEXER_URL,
+    serviceToken: env.INTER_SERVICE_SECRET,
+    logger: fastify.log,
+  });
+  const settlementClient = opts.settlementClient ?? createSettlementClient({
+    baseUrl: env.SETTLEMENT_ENGINE_URL,
+    serviceToken: env.INTER_SERVICE_SECRET,
+    logger: fastify.log,
+  });
+  const fxClient = opts.fxClient ?? createFxClient({
+    baseUrl: env.FX_ENGINE_URL,
+    serviceToken: env.INTER_SERVICE_SECRET,
+    logger: fastify.log,
+  });
+  const logAuditEvent = createAuditLogger(prisma as unknown as Parameters<typeof createAuditLogger>[0], fastify.log);
 
 // Setup plugins
 fastify.register(helmet, { contentSecurityPolicy: false, hsts: { maxAge: 31536000 }, referrerPolicy: { policy: 'no-referrer' } });
@@ -944,22 +896,31 @@ fastify.get('/api/quote', async (request, reply) => {
   return proxyFxUpstream(request, reply, path);
 });
 
+  return fastify;
+}
+
 // Graceful shutdown
+let mainApp: ReturnType<typeof Fastify> | null = null;
 let shuttingDown = false;
 
 async function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  fastify.log.info(`Received ${signal}, shutting down gracefully...`);
-
-  try {
-    await fastify.close();
-    await prisma.$disconnect();
+  if (mainApp) {
+    mainApp.log.info(`Received ${signal}, shutting down gracefully...`);
+    try {
+      await mainApp.close();
+      if (defaultPrisma) {
+        await defaultPrisma.$disconnect();
+      }
+      process.exit(0);
+    } catch (err) {
+      mainApp.log.error(err, 'Error during shutdown');
+      process.exit(1);
+    }
+  } else {
     process.exit(0);
-  } catch (err) {
-    fastify.log.error(err, 'Error during shutdown');
-    process.exit(1);
   }
 }
 
@@ -968,12 +929,21 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 const start = async () => {
   try {
-    await connectWithRetry(prisma, fastify.log);
+    const prisma = getDefaultPrisma();
+    mainApp = buildApp({ prisma });
+    setupPrismaQueryLogging(prisma, mainApp.log);
+    await connectWithRetry(prisma, mainApp.log);
 
-    await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    await mainApp.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {
-    fastify.log.error(err);
+    if (mainApp) mainApp.log.error(err);
+    else console.error(err);
     process.exit(1);
   }
 };
-start();
+
+const isDirectRun = Boolean(process.argv[1] && (process.argv[1].endsWith('index.ts') || process.argv[1].endsWith('index.js')));
+if (isDirectRun) {
+  start();
+}
+
