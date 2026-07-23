@@ -76,6 +76,9 @@ model Settlement {
   // under concurrent requests even if Redis SET NX is unavailable (#240).
   idempotencyKey          String?          @unique
   idempotencyKeyExpiresAt DateTime?
+
+  @@index([initiatedAt(sort: Desc)])
+  @@index([merchantId, initiatedAt(sort: Desc)])
 }
 
 model IndexedEvent {

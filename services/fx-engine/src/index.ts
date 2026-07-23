@@ -23,6 +23,7 @@ import {
   validateEnv,
   registerErrorHandler,
   registerRequestId,
+  registerServiceAuth,
   createErrorResponse,
   ErrorCodes,
   createLoggerOptions,
@@ -158,6 +159,11 @@ const ASSET_ID_TO_KEY: Record<string, string> = {
 
 let refreshIntervalHandle: ReturnType<typeof setInterval> | null = null;
 let lastRefresh: { at: number; ok: boolean; durationMs: number; error?: string } | null = null;
+let lastSuccessfulFetch: number | null = null;
+let fallbackStartTime: number | null = null;
+
+// Log every 5 minutes when in fallback mode
+const FALLBACK_WARNING_INTERVAL_MS = 5 * 60 * 1000;
 
 async function fetchBaseRates(): Promise<Record<string, number> | null> {
   const controller = new AbortController();
@@ -187,6 +193,8 @@ async function fetchBaseRates(): Promise<Record<string, number> | null> {
       return null;
     }
     lastRefresh = { at: Date.now(), ok: true, durationMs: Date.now() - startedAt };
+    lastSuccessfulFetch = Date.now();
+    fallbackStartTime = null;
     return fetched;
   } catch (err) {
     const e = err as Error;
@@ -215,14 +223,42 @@ async function refreshTick(): Promise<void> {
         },
         'FX rates refreshed',
       );
+    } else {
+      // Fetch failed; transition to or continue in fallback mode (#236)
+      if (fallbackStartTime === null) {
+        fallbackStartTime = Date.now();
+        fastify.log.warn('Entering fallback FX rate mode');
+      }
     }
-    // On null (failure) we keep the existing cache; fetchBaseRates has already logged warn.
   } catch (err) {
     // Defensive: fetchBaseRates catches its own errors, so this is only for
     // programming bugs in refreshTick itself. Don't crash the interval.
     fastify.log.error({ err }, 'Unexpected error in refresh tick');
   }
 }
+
+async function warmupCacheFromRedis(): Promise<void> {
+  try {
+    const members = await redis.zrevrangebyscore(SNAPSHOT_KEY, '+inf', '-inf', 'LIMIT', 0, 1);
+    if (!members.length) {
+      fastify.log.info('No cached rate snapshot found in Redis; using fallback rates');
+      return;
+    }
+
+    const snapshot = JSON.parse(members[0]) as { ts: number; rates: Record<string, number> };
+    updateBaseRates(snapshot.rates);
+    computedRateCache.clear();
+    fastify.log.info(
+      { timestamp: new Date(snapshot.ts).toISOString(), rates: snapshot.rates },
+      'Rate cache warmed up from Redis snapshot',
+    );
+  } catch (err) {
+    const e = err as Error;
+    fastify.log.warn({ err: e.message }, 'Failed to warm up cache from Redis; using fallback rates');
+  }
+}
+
+let fallbackWarningIntervalHandle: ReturnType<typeof setInterval> | null = null;
 
 function startRefreshLoop(): void {
   if (refreshIntervalHandle !== null) return;
@@ -235,6 +271,23 @@ function startRefreshLoop(): void {
     { intervalMs: env.RATES_REFRESH_INTERVAL_MS, url: env.RATES_API_URL },
     'FX rate refresh loop started',
   );
+
+  // Log warning every 5 minutes if in fallback mode (#236)
+  if (fallbackWarningIntervalHandle === null) {
+    fallbackWarningIntervalHandle = setInterval(() => {
+      if (fallbackStartTime !== null) {
+        const durationMs = Date.now() - fallbackStartTime;
+        const durationMin = Math.round(durationMs / 60000);
+        fastify.log.warn(
+          { durationMs, durationMin },
+          `Operating in fallback FX rate mode for ${durationMin} minute(s); rates API unavailable`,
+        );
+      }
+    }, FALLBACK_WARNING_INTERVAL_MS);
+    if (typeof fallbackWarningIntervalHandle.unref === 'function') {
+      fallbackWarningIntervalHandle.unref();
+    }
+  }
 }
 
 // ── Quote storage (issue #57) ────────────────────────────────────────────
@@ -277,6 +330,7 @@ fastify.register(cors, {
 });
 fastify.register(rateLimit, { max: 200, timeWindow: 60 * 1000 });
 registerErrorHandler(fastify);
+registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
 
@@ -288,6 +342,17 @@ fastify.get('/api/health', async (_request, reply) => {
     service: 'fx-engine',
     version: SERVICE_VERSION,
   });
+
+  // Degrade to degraded if fallback mode has been active for >1 hour (#236)
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  if (fallbackStartTime !== null && Date.now() - fallbackStartTime > ONE_HOUR_MS) {
+    if (health.status !== 'unhealthy') {
+      health.status = 'degraded';
+      if (!health.details) health.details = {};
+      (health.details as Record<string, unknown>).fallbackModeDuration = 'exceeded 1 hour';
+    }
+  }
+
   const statusCode = health.status === 'unhealthy' ? 503 : 200;
   return reply.code(statusCode).send(health);
 });
@@ -302,6 +367,26 @@ fastify.get('/api/currencies', async (_request, _reply) => {
       code,
       name: CURRENCY_DISPLAY_NAMES[code],
     })),
+  };
+});
+
+// ── GET /api/admin/rates/status (#236) ─────────────────────────────────
+// Admin endpoint showing rate fetch mode (live vs fallback), staleness, and duration.
+
+fastify.get('/api/admin/rates/status', {
+  preValidation: [fastify.serviceAuth],
+}, async (_request, _reply) => {
+  const inFallback = fallbackStartTime !== null;
+  const fallbackDurationMs = inFallback ? Date.now() - fallbackStartTime : 0;
+  const fallbackDurationMin = Math.round(fallbackDurationMs / 60000);
+
+  return {
+    mode: inFallback ? 'fallback' : 'live',
+    lastSuccessfulFetch: lastSuccessfulFetch ? new Date(lastSuccessfulFetch).toISOString() : null,
+    fallbackActiveDuration: inFallback ? `${fallbackDurationMin} minutes` : null,
+    fallbackActiveDurationMs: fallbackDurationMs,
+    currentRates: cache.rates,
+    updatedAt: new Date(cache.cachedAt).toISOString(),
   };
 });
 
@@ -571,6 +656,8 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 const start = async () => {
   try {
+    // Warm up cache from latest Redis snapshot (#232)
+    await warmupCacheFromRedis();
     // Seed the snapshot store so history is queryable from the very first request
     await storeRateSnapshot(cache.rates).catch((err) => {
       fastify.log.warn({ err }, 'Failed to store initial rate snapshot');

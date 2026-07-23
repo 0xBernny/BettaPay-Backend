@@ -45,10 +45,11 @@ import {
   UpdateMerchantNameBody,
   WalletChallengeQuery,
   WalletVerifyBody,
+  SettlementListQuery,
   createErrorResponse,
   ErrorCodes,
   registerErrorHandler,
-  registerServiceAuth, // Assuming PAYMENT_ABANDONMENT_HOURS is added to EnvSchema in @bettapay/validation
+  registerServiceAuth,
   createAuditLogger,
 } from '@bettapay/validation';
 import type { Merchant } from '@prisma/client';
@@ -846,14 +847,18 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementSta
 });
 
 // Settlements
-fastify.get('/api/settlements', {
+fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: string } }>('/api/settlements', {
   preValidation: [fastify.authenticate],
   config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
 }, async (request, reply) => {
-  const { merchantId, from, to } = request.query as { merchantId?: string; from?: string; to?: string };
+  const query = SettlementListQuery.parse(request.query);
+  const { merchantId, status, from, to, limit, offset } = query as any;
   const where: any = {};
   if (merchantId) {
     where.merchantId = merchantId;
+  }
+  if (status) {
+    where.status = status;
   }
   if (from || to) {
     where.initiatedAt = {};
@@ -865,11 +870,26 @@ fastify.get('/api/settlements', {
     }
   }
 
-  const records = await prisma.settlement.findMany({
-    where,
-    orderBy: { initiatedAt: 'desc' },
-  });
-  return { settlements: records, total: records.length };
+  const [records, total] = await Promise.all([
+    prisma.settlement.findMany({
+      where,
+      orderBy: { initiatedAt: 'desc' },
+      take: limit,
+      skip: offset,
+    }),
+    prisma.settlement.count({ where }),
+  ]);
+
+  const hasMore = offset + limit < total;
+  return {
+    data: records,
+    pagination: {
+      total,
+      limit,
+      offset,
+      hasMore,
+    },
+  };
 });
 
 fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>('/api/settlements', {
@@ -927,18 +947,19 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>('/api/settlements',
     if (settings?.dailySettlementLimit) {
       const todayStart = new Date();
       todayStart.setHours(0, 0, 0, 0);
+      const startTimeMs = Date.now();
 
-      const todaySettlements = await prisma.settlement.findMany({
-        where: {
-          merchantId: d.merchantId,
-          initiatedAt: { gte: todayStart },
-        },
-        select: {
-          totalAmount: true
-        }
-      });
+      const aggregateResult = await prisma.$queryRaw<[{ sum: string | null }]>`
+        SELECT COALESCE(SUM(CAST("totalAmount" AS DECIMAL)), 0)::text as sum
+        FROM "Settlement"
+        WHERE "merchantId" = ${d.merchantId}
+        AND "initiatedAt" >= ${todayStart}
+      `;
 
-      const currentDailyTotal = todaySettlements.reduce((sum: number, s: { totalAmount: string }) => sum + parseFloat(s.totalAmount), 0);
+      const currentDailyTotal = aggregateResult?.[0]?.sum ? parseFloat(aggregateResult[0].sum) : 0;
+      const queryDurationMs = Date.now() - startTimeMs;
+      request.log.debug({ queryDurationMs, merchantId: d.merchantId }, 'Daily settlement aggregate query');
+
       const requestTotal = items.reduce((sum: number, item: any) => sum + parseFloat(item.amount), 0);
       const newDailyTotal = currentDailyTotal + requestTotal;
       const dailyLimit = parseFloat(settings.dailySettlementLimit);
