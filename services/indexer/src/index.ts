@@ -144,6 +144,8 @@ const CONTRACT_NAMES: Record<string, string> = (() => {
   return map;
 })();
 
+const MAX_REPLAY_LEDGER_RANGE = 1000;
+
 function getContractName(contractId: string): string {
   return CONTRACT_NAMES[contractId] ?? 'unknown';
 }
@@ -284,10 +286,16 @@ fastify.post(
   async (request, reply) => {
   const { fromLedger, toLedger } = ReplayBody.parse(request.body);
 
-  fastify.register(rateLimit, {
-    max: 60,
-    timeWindow: '1 minute'
-  });
+  const range = toLedger - fromLedger;
+  if (range > MAX_REPLAY_LEDGER_RANGE) {
+    return reply.code(400).send({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
+        details: { fromLedger, toLedger, maxRange: MAX_REPLAY_LEDGER_RANGE },
+      },
+    });
+  }
 
   let newEvents = 0;
   let skippedDuplicates = 0;
