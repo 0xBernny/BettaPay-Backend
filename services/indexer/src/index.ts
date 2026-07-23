@@ -304,6 +304,19 @@ fastify.post(
 
       if (!response.events || response.events.length === 0) break;
 
+      // Batch duplicate check: collect all non-null stellarIds and query once
+      const stellarIds = response.events
+        .map((evt) => (typeof evt.id === 'string' ? evt.id : null))
+        .filter((id): id is string => id !== null);
+      const existingStellarIds = new Set<string>(
+        stellarIds.length > 0
+          ? (await prisma.indexedEvent.findMany({
+              where: { stellarId: { in: stellarIds } },
+              select: { stellarId: true },
+            })).map((e) => e.stellarId).filter((id): id is string => id !== null)
+          : [],
+      );
+
       for (const evt of response.events) {
         if (evt.ledger > toLedger) break;
         cursor = Math.max(cursor, evt.ledger + 1);
@@ -315,15 +328,14 @@ fastify.post(
         const contractName = getContractName(resolvedContractId);
         const stellarId = typeof evt.id === 'string' ? evt.id : null;
 
-        // Skip duplicates using Stellar's own event ID (most reliable key)
+        // O(1) Set lookup for stellarId duplicates (batched query above)
         if (stellarId) {
-          const existing = await prisma.indexedEvent.findUnique({ where: { stellarId } });
-          if (existing) {
+          if (existingStellarIds.has(stellarId)) {
             skippedDuplicates++;
             continue;
           }
         } else {
-          // Fall back to ledger + contractId + rawValue fingerprint
+          // Fall back to individual ledger + contractId + rawValue fingerprint
           const existing = await prisma.indexedEvent.findFirst({
             where: { ledger: evt.ledger, contractId: resolvedContractId, rawValue },
           });
