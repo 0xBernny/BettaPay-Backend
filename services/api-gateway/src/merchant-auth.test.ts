@@ -71,7 +71,8 @@ function buildApp(optsOrMerchants: BuildAppOptions | any[] = {}) {
         secretHash,
       };
       db.push(merchant);
-      return reply.code(201).send({ success: true, merchant, secret });
+      const { secretHash: _hash, ...safeMerchant } = merchant;
+      return reply.code(201).send({ data: { merchant: safeMerchant, secret } });
     } catch (err: any) {
       return reply.code(400).send({ error: err.message });
     }
@@ -291,18 +292,19 @@ test('merchant creation hashes secrets and plaintext secrets are never persisted
         id: 'm-new-1',
         name: 'New Merchant',
         ownerId: VALID_STELLAR_PUBLIC_KEY,
-        secret: 'my-custom-secret',
+        secret: 'my-custom-secret-1234',
       }
     });
 
     t.equal(res1.statusCode, 201, 'creation succeeds');
     const body1 = JSON.parse(res1.body);
-    t.equal(body1.secret, 'my-custom-secret', 'returns custom secret');
+    t.equal(body1.data.secret, 'my-custom-secret-1234', 'returns custom secret');
+    t.notOk(body1.data.merchant.secretHash, 'response body contains no secretHash field');
 
     const stored1 = db.find(m => m.id === 'm-new-1');
     t.ok(stored1, 'merchant is persisted');
-    t.notEqual(stored1?.secretHash, 'my-custom-secret', 'persisted secret is hashed');
-    t.equal(stored1?.secretHash, hashSecret('my-custom-secret'), 'hash matches SHA-256');
+    t.notEqual(stored1?.secretHash, 'my-custom-secret-1234', 'persisted secret is hashed');
+    t.equal(stored1?.secretHash, hashSecret('my-custom-secret-1234'), 'hash matches SHA-256');
     t.notOk(Object.keys(stored1 || {}).includes('secret'), 'plaintext secret key is not in merchant object');
 
     // 2. Creation with generated secret
@@ -318,12 +320,13 @@ test('merchant creation hashes secrets and plaintext secrets are never persisted
 
     t.equal(res2.statusCode, 201, 'creation with generated secret succeeds');
     const body2 = JSON.parse(res2.body);
-    t.ok(body2.secret, 'generated secret is returned');
+    t.ok(body2.data.secret, 'generated secret is returned');
+    t.notOk(body2.data.merchant.secretHash, 'response body contains no secretHash field');
 
     const stored2 = db.find(m => m.id === 'm-new-2');
     t.ok(stored2, 'merchant is persisted');
-    t.notEqual(stored2?.secretHash, body2.secret, 'persisted secret is hashed');
-    t.equal(stored2?.secretHash, hashSecret(body2.secret), 'hash matches SHA-256');
+    t.notEqual(stored2?.secretHash, body2.data.secret, 'persisted secret is hashed');
+    t.equal(stored2?.secretHash, hashSecret(body2.data.secret), 'hash matches SHA-256');
     t.notOk(Object.keys(stored2 || {}).includes('secret'), 'plaintext secret key is not in merchant object');
   } catch (err: any) {
     t.fail(err);

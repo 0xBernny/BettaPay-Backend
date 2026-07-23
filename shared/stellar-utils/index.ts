@@ -11,6 +11,11 @@ type Stroops = string;
 export function validateStellarAddress(address: string): boolean {
   return StrKey.isValidEd25519PublicKey(address);
 }
+export const validateStellarPublicKey = validateStellarAddress;
+
+export function validateTransactionHash(hash: string): boolean {
+  return /^[0-9a-fA-F]{64}$/.test(hash);
+}
 
 /**
  * Generate a random Ed25519 Stellar keypair.
@@ -75,6 +80,34 @@ export function buildPaymentOperation(params: { source?: string; destination: st
     destination: params.destination,
     asset: params.asset,
     amount: params.amount
+  };
+}
+
+export function buildSetOptionsOp(params: any) {
+  if (params.masterWeight !== undefined) {
+    if (!Number.isInteger(params.masterWeight) || params.masterWeight < 0 || params.masterWeight > 255) throw new Error('masterWeight must be an integer between 0 and 255');
+  }
+  if (params.lowThreshold !== undefined) {
+    if (!Number.isInteger(params.lowThreshold) || params.lowThreshold < 0 || params.lowThreshold > 255) throw new Error('lowThreshold must be an integer between 0 and 255');
+  }
+  if (params.medThreshold !== undefined) {
+    if (!Number.isInteger(params.medThreshold) || params.medThreshold < 0 || params.medThreshold > 255) throw new Error('medThreshold must be an integer between 0 and 255');
+  }
+  if (params.highThreshold !== undefined) {
+    if (!Number.isInteger(params.highThreshold) || params.highThreshold < 0 || params.highThreshold > 255) throw new Error('highThreshold must be an integer between 0 and 255');
+  }
+  if (params.signer) {
+    if (!validateStellarAddress(params.signer.key)) throw new Error('signer.key must be a valid Stellar address');
+    if (!Number.isInteger(params.signer.weight) || params.signer.weight < 0 || params.signer.weight > 255) throw new Error('signer.weight must be an integer between 0 and 255');
+  }
+
+  return {
+    type: 'setOptions',
+    masterWeight: params.masterWeight ?? null,
+    lowThreshold: params.lowThreshold ?? null,
+    medThreshold: params.medThreshold ?? null,
+    highThreshold: params.highThreshold ?? null,
+    signer: params.signer ?? null
   };
 }
 
