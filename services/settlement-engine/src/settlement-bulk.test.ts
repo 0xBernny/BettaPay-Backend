@@ -1,0 +1,266 @@
+import test from 'tape';
+import { fastify, prisma, settlementQueue } from './index.js';
+import {
+  MOCK_MERCHANT_STANDARD,
+  MOCK_MERCHANT_TIGHT_LIMITS,
+  BATCH_VALID_STANDARD,
+  BATCH_WITH_MIN_LIMIT_VIOLATION,
+  BATCH_WITH_MAX_LIMIT_VIOLATION,
+  BATCH_WITH_DAILY_LIMIT_VIOLATION,
+  BATCH_WITH_INVALID_AMOUNTS,
+} from './test-fixtures.js';
+
+// Setup environment variable for tests
+process.env.NODE_ENV = 'test';
+
+// Helper to reset mocks
+function resetMocks() {
+  prisma.merchant.findUnique = async () => null;
+  prisma.$queryRaw = async () => [{ sum: null }];
+  prisma.$transaction = async (cb: any) => cb(prisma);
+  prisma.settlement.create = async (args: any) => args.data;
+  prisma.settlement.findMany = async () => [];
+  settlementQueue.add = async () => ({} as any);
+}
+
+test('POST /api/settlements/bulk: rejects batch size > 100', async (t) => {
+  resetMocks();
+  
+  const settlements = Array.from({ length: 101 }, () => ({
+    amount: '10.00',
+    asset: 'USDC',
+  }));
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    payload: {
+      merchantId: 'merch_1',
+      settlements,
+    },
+  });
+
+  t.equal(res.statusCode, 400, 'should return 400 Bad Request');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.code, 'VALIDATION_ERROR');
+  t.equal(body.error.message, 'Batch size exceeds maximum limit of 100 settlements');
+  t.end();
+});
+
+test('POST /api/settlements/bulk: returns 404 if merchant not found', async (t) => {
+  resetMocks();
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    payload: {
+      merchantId: 'merch_non_existent',
+      settlements: BATCH_VALID_STANDARD,
+    },
+  });
+
+  t.equal(res.statusCode, 404, 'returns 404 Not Found');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.code, 'NOT_FOUND');
+  t.end();
+});
+
+test('POST /api/settlements/bulk: processes valid batch successfully', async (t) => {
+  resetMocks();
+
+  const createdRecords: any[] = [];
+  const enqueuedJobs: any[] = [];
+
+  prisma.merchant.findUnique = async () => MOCK_MERCHANT_STANDARD as any;
+  prisma.settlement.create = async (args: any) => {
+    createdRecords.push(args.data);
+    return args.data;
+  };
+  settlementQueue.add = async (name: string, data: any) => {
+    enqueuedJobs.push(data);
+    return {} as any;
+  };
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    payload: {
+      merchantId: MOCK_MERCHANT_STANDARD.id,
+      settlements: BATCH_VALID_STANDARD,
+    },
+  });
+
+  t.equal(res.statusCode, 201, 'should return 201 Created');
+  const body = JSON.parse(res.body);
+
+  t.ok(body.batchId.startsWith('batch_'), 'batchId should be generated');
+  t.equal(body.total, 3, 'should report correct total count');
+  t.equal(body.created, 3, 'should report correct created count');
+  t.equal(body.errors.length, 0, 'should have no errors');
+
+  t.equal(createdRecords.length, 3, 'should write 3 database records');
+  t.equal(enqueuedJobs.length, 3, 'should enqueue 3 BullMQ jobs');
+  t.equal(createdRecords[0].batchId, body.batchId, 'records should share batchId');
+  t.end();
+});
+
+test('POST /api/settlements/bulk: handles partial failures (min amount violation)', async (t) => {
+  resetMocks();
+
+  const createdRecords: any[] = [];
+  prisma.merchant.findUnique = async () => MOCK_MERCHANT_STANDARD as any;
+  prisma.settlement.create = async (args: any) => {
+    createdRecords.push(args.data);
+    return args.data;
+  };
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    payload: {
+      merchantId: MOCK_MERCHANT_STANDARD.id,
+      settlements: BATCH_WITH_MIN_LIMIT_VIOLATION,
+    },
+  });
+
+  t.equal(res.statusCode, 201, 'returns 201 Created');
+  const body = JSON.parse(res.body);
+
+  t.equal(body.total, 3, 'total settlements is 3');
+  t.equal(body.created, 2, 'created count is 2 due to 1 limit violation');
+  t.equal(body.errors.length, 1, 'contains 1 error description');
+  t.equal(body.errors[0].index, 1, 'error occurred at index 1');
+  t.ok(body.errors[0].reason.includes('below minimum'), 'reports below minimum error');
+  t.equal(createdRecords.length, 2, 'only 2 records created in DB');
+  t.end();
+});
+
+test('POST /api/settlements/bulk: handles partial failures (max amount violation)', async (t) => {
+  resetMocks();
+
+  const createdRecords: any[] = [];
+  prisma.merchant.findUnique = async () => MOCK_MERCHANT_STANDARD as any;
+  prisma.settlement.create = async (args: any) => {
+    createdRecords.push(args.data);
+    return args.data;
+  };
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    payload: {
+      merchantId: MOCK_MERCHANT_STANDARD.id,
+      settlements: BATCH_WITH_MAX_LIMIT_VIOLATION,
+    },
+  });
+
+  t.equal(res.statusCode, 201, 'returns 201');
+  const body = JSON.parse(res.body);
+
+  t.equal(body.total, 3);
+  t.equal(body.created, 2);
+  t.equal(body.errors.length, 1);
+  t.equal(body.errors[0].index, 1);
+  t.ok(body.errors[0].reason.includes('exceeds maximum'), 'reports exceeds maximum error');
+  t.end();
+});
+
+test('POST /api/settlements/bulk: handles daily limits aggregation check', async (t) => {
+  resetMocks();
+
+  prisma.merchant.findUnique = async () => MOCK_MERCHANT_STANDARD as any;
+  // Current daily total is already 5000.00
+  prisma.$queryRaw = async () => [{ sum: '5000.00' }];
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    payload: {
+      merchantId: MOCK_MERCHANT_STANDARD.id,
+      settlements: BATCH_WITH_DAILY_LIMIT_VIOLATION,
+    },
+  });
+
+  t.equal(res.statusCode, 201);
+  const body = JSON.parse(res.body);
+
+  t.equal(body.total, 3);
+  // Item 0 (4000) fits (5000+4000 <= 10000)
+  // Item 1 (5000) fails (5000+4000+5000 > 10000)
+  // Item 2 (2000) fails cumulative daily check (5000+4000+2000 > 10000)
+  t.equal(body.created, 1);
+  t.equal(body.errors.length, 2);
+  t.equal(body.errors[0].index, 1);
+  t.equal(body.errors[1].index, 2);
+  t.ok(body.errors[0].reason.includes('daily settlement limit exceeded'), 'reports daily limit exceeded');
+  t.end();
+});
+
+test('POST /api/settlements/bulk: filters out invalid amount formats', async (t) => {
+  resetMocks();
+
+  prisma.merchant.findUnique = async () => MOCK_MERCHANT_STANDARD as any;
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    payload: {
+      merchantId: MOCK_MERCHANT_STANDARD.id,
+      settlements: BATCH_WITH_INVALID_AMOUNTS,
+    },
+  });
+
+  t.equal(res.statusCode, 201);
+  const body = JSON.parse(res.body);
+
+  t.equal(body.total, 4);
+  t.equal(body.created, 2); // only index 0 and 3 are valid
+  t.equal(body.errors.length, 2);
+  t.equal(body.errors[0].index, 1);
+  t.equal(body.errors[1].index, 2);
+  t.end();
+});
+
+test('GET /api/settlements/batch/:batchId/status: tracks progress of existing batch', async (t) => {
+  resetMocks();
+
+  prisma.settlement.findMany = async (args: any) => {
+    t.equal(args.where.batchId, 'batch_test123');
+    return [
+      { id: 's1', status: 'completed' },
+      { id: 's2', status: 'completed' },
+      { id: 's3', status: 'pending' },
+      { id: 's4', status: 'failed' },
+    ] as any[];
+  };
+
+  const res = await fastify.inject({
+    method: 'GET',
+    url: '/api/settlements/batch/batch_test123/status',
+  });
+
+  t.equal(res.statusCode, 200, 'returns 200 OK');
+  const body = JSON.parse(res.body);
+
+  t.equal(body.batchId, 'batch_test123');
+  t.equal(body.total, 4);
+  t.equal(body.completed, 2);
+  t.equal(body.pending, 1);
+  t.equal(body.failed, 1);
+  t.equal(body.status, 'processing');
+  t.end();
+});
+
+test('GET /api/settlements/batch/:batchId/status: returns 404 for unknown batch', async (t) => {
+  resetMocks();
+
+  prisma.settlement.findMany = async () => [];
+
+  const res = await fastify.inject({
+    method: 'GET',
+    url: '/api/settlements/batch/batch_unknown/status',
+  });
+
+  t.equal(res.statusCode, 404, 'returns 404 Not Found');
+  t.end();
+});
