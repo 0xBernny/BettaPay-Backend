@@ -764,6 +764,62 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
   }
 );
 
+fastify.get<{ Params: { batchId: string } }>(
+  '/api/settlements/batch/:batchId/status',
+  {
+    config: {
+      rateLimit: {
+        max: 60,
+        timeWindow: 60 * 1000,
+      },
+    },
+  },
+  async (request, reply) => {
+    const { batchId } = request.params;
+
+    if (!batchId || !batchId.startsWith('batch_')) {
+      return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid batchId format'));
+    }
+
+    const settlements = await prisma.settlement.findMany({
+      where: { batchId },
+    });
+
+    if (settlements.length === 0) {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, `Batch ${batchId} not found`));
+    }
+
+    const total = settlements.length;
+    let pending = 0;
+    let processing = 0;
+    let completed = 0;
+    let failed = 0;
+
+    for (const s of settlements) {
+      if (s.status === 'pending') pending++;
+      else if (s.status === 'processing') processing++;
+      else if (s.status === 'completed') completed++;
+      else if (s.status === 'failed') failed++;
+    }
+
+    let overallStatus = 'processing';
+    if (completed === total) overallStatus = 'completed';
+    else if (failed === total) overallStatus = 'failed';
+    else if (pending === total) overallStatus = 'pending';
+
+    return {
+      batchId,
+      total,
+      pending,
+      processing,
+      completed,
+      failed,
+      status: overallStatus,
+    };
+  }
+);
+
+
 
 // ============================================================================
 // GRACEFUL SHUTDOWN
