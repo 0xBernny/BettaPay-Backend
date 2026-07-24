@@ -142,7 +142,10 @@ export const EnvSchema = z.object({
   INDEXER_LAG_WARN_THRESHOLD: z.string().transform((s) => parseInt(s, 10)).default('10'),
 
   // Indexer — Event retention policy
-  EVENT_RETENTION_DAYS: z.string().transform((s) => parseInt(s, 10)).default('30'),
+  EVENT_RETENTION_DAYS: z.string().transform((s) => parseInt(s, 10)).default('30').refine(
+    (val) => process.env.NODE_ENV !== 'production' || val >= 1,
+    { message: 'EVENT_RETENTION_DAYS must be >= 1 in production' }
+  ),
 });
 
 export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS'> & {

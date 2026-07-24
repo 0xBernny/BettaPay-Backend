@@ -25,6 +25,7 @@ import { z } from 'zod';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
+import * as promClient from 'prom-client';
 import * as crypto from 'crypto';
 import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
@@ -162,7 +163,19 @@ const webhookWorker = createWebhookWorker('settlement-webhooks', connectionParam
   },
 });
 
-// ── Settlement processor ───────────────────────────────────────────────────────
+// ── Metrics ─────────────────────────────────────────────────────────────────
+const feeFallbackCounter = new promClient.Counter({
+  name: 'settlement_fee_fallback_total',
+  help: 'Total number of times fee resolution fell back to the default rate due to malformed settings',
+  labelNames: ['merchant_id'],
+});
+
+fastify.get('/metrics', async (request, reply) => {
+  reply.header('Content-Type', promClient.register.contentType);
+  return promClient.register.metrics();
+});
+
+// ── Database & Redis Setup ───────────────────────────────────────────────────────
 
 const worker = new Worker('settlements', async job => {
   const settlementId = job.data.id;
@@ -548,7 +561,17 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
 
     const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
     const parsedFeeRule = FeeRule.passthrough().safeParse(merchant?.settings);
-    const feeBps = parsedFeeRule.success ? parsedFeeRule.data.feeBps : env.FEES_DEFAULT_BPS;
+    let feeBps = env.FEES_DEFAULT_BPS;
+    if (parsedFeeRule.success) {
+      feeBps = parsedFeeRule.data.feeBps;
+    } else {
+      feeFallbackCounter.inc({ merchant_id: d.merchantId });
+      fastify.log.warn({
+        merchantId: d.merchantId,
+        rawSettings: merchant?.settings,
+        issues: parsedFeeRule.error?.issues
+      }, '[Settlement] FeeRule parsing failed, falling back to FEES_DEFAULT_BPS');
+    }
     const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
 
     const { grossAmount, feeAmount, netAmount } = computeSettlementAmounts(d.amount, feeBps);

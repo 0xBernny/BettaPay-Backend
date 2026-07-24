@@ -259,6 +259,14 @@ fastify.register(rateLimit, {
   }
 });
 
+// Global auth rate limit for brute-force protection
+fastify.register(async function authRateLimit(childServer) {
+  childServer.register(rateLimit, {
+    max: 100,
+    timeWindow: '1 minute',
+  });
+});
+
 fastify.register(rateLimit, {
   max: 100,
   timeWindow: '1 minute',
@@ -336,7 +344,16 @@ fastify.post<{ Body: WalletVerifyBody }>('/api/auth/wallet/verify', {
   config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
 }, async (request, reply) => {
   const d = WalletVerifyBody.parse(request.body);
+  const ip = request.ip;
+  const lockoutKey = `wallet_lockout:${d.address}`;
   
+  const failedAttempts = parseInt((await redis.get(lockoutKey)) || '0', 10);
+  const maxAttempts = parseInt(process.env.AUTH_MAX_FAILED_ATTEMPTS || '5', 10);
+  if (failedAttempts >= maxAttempts) {
+    request.log.warn({ address: d.address, ip }, '[Auth] Wallet verify locked out due to too many failed attempts');
+    return reply.code(429).send({ error: 'Too many failed attempts. Try again later.' });
+  }
+
   let storedRaw;
   try {
     storedRaw = await redis.get(`wallet_challenge:${d.address}`);
@@ -365,11 +382,21 @@ fastify.post<{ Body: WalletVerifyBody }>('/api/auth/wallet/verify', {
     const keypair = Keypair.fromPublicKey(d.address);
     const isValid = keypair.verify(Buffer.from(d.challenge, 'utf-8'), Buffer.from(d.signature, 'base64'));
     if (!isValid) {
+      const lockoutMinutes = parseInt(process.env.AUTH_LOCKOUT_MINUTES || '15', 10);
+      await redis.incr(lockoutKey);
+      await redis.expire(lockoutKey, lockoutMinutes * 60);
+      request.log.warn({ address: d.address, ip }, '[Auth] Invalid signature during wallet verify');
       return reply.code(401).send({ error: 'Invalid signature' });
     }
   } catch (err) {
+    const lockoutMinutes = parseInt(process.env.AUTH_LOCKOUT_MINUTES || '15', 10);
+    await redis.incr(lockoutKey);
+    await redis.expire(lockoutKey, lockoutMinutes * 60);
+    request.log.warn({ address: d.address, ip }, '[Auth] Signature verification failed');
     return reply.code(401).send({ error: 'Signature verification failed' });
   }
+  
+  await redis.del(lockoutKey).catch(() => {}); // reset on success
   
   const merchant = await prisma.merchant.upsert({
     where: { ownerId: d.address },
