@@ -295,7 +295,7 @@ export const CreateMerchantBody = z.object({
   name: z.string().min(1, 'name is required'),
   ownerId: StellarAddressSchema, // validated Stellar public key
   settings: MerchantSettings.optional(),
-  secret: z.string().optional(),
+  secret: z.string().min(20, 'secret must be at least 20 characters').optional(),
 });
 
 export const CreatePaymentBody = z.object({

@@ -72,8 +72,13 @@ model Settlement {
   batchId                 String?
   initiatedAt             DateTime         @default(now())
   completedAt             DateTime?
+  // Atomic idempotency guard: unique constraint prevents duplicate settlements
+  // under concurrent requests even if Redis SET NX is unavailable (#240).
   idempotencyKey          String?          @unique
   idempotencyKeyExpiresAt DateTime?
+
+  @@index([initiatedAt(sort: Desc)])
+  @@index([merchantId, initiatedAt(sort: Desc)])
 }
 
 model IndexedEvent {

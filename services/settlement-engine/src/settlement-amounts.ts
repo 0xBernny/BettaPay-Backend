@@ -30,6 +30,14 @@ export interface SettlementAmounts {
 /**
  * Computes fee and net amounts with full decimal precision using BigNumber.
  *
+ * Invariants (must hold for every valid non-negative gross amount and
+ * feeBps in [0, 10000]):
+ * - `feeAmount + netAmount === grossAmount` (exact decimal equality)
+ * - `feeAmount >= 0` and `netAmount <= grossAmount` (never a negative fee)
+ * - `feeAmount` has at most as many decimal places as `grossAmount`
+ * - When `feeBps === 0`, `feeAmount` is zero with the input's decimal places
+ * - ROUND_DOWN: `feeAmount <= grossAmount * feeBps / 10000` (never overcharge)
+ *
  * @param grossAmountStr  Validated numeric string from the request body.
  * @param feeBps          Fee in basis points (e.g. 100 = 1%).
  * @returns               { grossAmount, feeAmount, netAmount } as full-precision strings.

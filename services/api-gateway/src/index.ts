@@ -30,7 +30,7 @@ import crypto from 'crypto';
 import { z } from 'zod';
 import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
 import { createFxClient } from './clients/fx-client.js';
-import { createIndexerClient } from './clients/indexer-client.js';
+import { createIndexerClient, type IndexerClient } from './clients/indexer-client.js';
 import {
   createSettlementClient,
   SettlementEngineUnavailableError,
@@ -43,9 +43,9 @@ import {
   UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
   UpdateMerchantNameBody,
-  GoogleAuthBody,
   WalletChallengeQuery,
   WalletVerifyBody,
+  SettlementListQuery,
   createErrorResponse,
   ErrorCodes,
   registerErrorHandler,
@@ -62,7 +62,9 @@ import { fetchUpstream, UpstreamTimeoutError } from './upstream-fetch.js';
 import { Keypair } from '@stellar/stellar-sdk';
 import { OAuth2Client } from 'google-auth-library';
 import { registerGatewayHealthRoutes } from './health.js';
+import { startAbandonedPaymentsCron, stopAbandonedPaymentsCron } from './abandoned-payments-cron.js';
 import { readServiceVersion } from '@bettapay/validation';
+import { Redis } from 'ioredis';
 
 declare module 'fastify' {
   export interface FastifyInstance {
@@ -99,6 +101,8 @@ const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
 // --- Request lifecycle timeouts ---------------------------------------------
+
+
 // REQUEST_TIMEOUT_MS bounds how long a single request may run. If a handler
 // (e.g. a slow DB query or a hung upstream service) exceeds it, the per-request
 // hook below replies 408 Request Timeout so the client connection is released
@@ -310,8 +314,7 @@ registerGatewayHealthRoutes({
 });
 
 // --- Wallet Auth Challenge Store ----------------------------------------------
-// TODO: migrate to Redis for multi-instance deployments
-const challengeMap = new Map<string, { challenge: string; expiresAt: number }>();
+const redis = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
 
 fastify.get<{ Querystring: WalletChallengeQuery }>('/api/auth/wallet/challenge', {
   config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
@@ -320,7 +323,12 @@ fastify.get<{ Querystring: WalletChallengeQuery }>('/api/auth/wallet/challenge',
   const nonce = crypto.randomBytes(32).toString('hex');
   const challenge = `BettaPay:${address}:${nonce}`;
   const expiresAt = Date.now() + 2 * 60 * 1000; // 2 minutes
-  challengeMap.set(address, { challenge, expiresAt });
+  try {
+    await redis.set(`wallet_challenge:${address}`, JSON.stringify({ challenge, expiresAt }), 'PX', 120000);
+  } catch (err) {
+    request.log.error({ err }, 'Failed to set wallet challenge in Redis');
+    return reply.code(503).send({ error: 'Authentication service unavailable' });
+  }
   return reply.send({ challenge, expiresAt });
 });
 
@@ -328,20 +336,30 @@ fastify.post<{ Body: WalletVerifyBody }>('/api/auth/wallet/verify', {
   config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
 }, async (request, reply) => {
   const d = WalletVerifyBody.parse(request.body);
-  const stored = challengeMap.get(d.address);
   
-  if (!stored) {
+  let storedRaw;
+  try {
+    storedRaw = await redis.get(`wallet_challenge:${d.address}`);
+  } catch (err) {
+    request.log.error({ err }, 'Failed to get wallet challenge from Redis');
+    return reply.code(503).send({ error: 'Authentication service unavailable' });
+  }
+
+  if (!storedRaw) {
     return reply.code(400).send({ error: 'Challenge expired or not found' });
   }
+
+  const stored = JSON.parse(storedRaw);
+
   if (Date.now() > stored.expiresAt) {
-    challengeMap.delete(d.address);
+    await redis.del(`wallet_challenge:${d.address}`).catch(() => {});
     return reply.code(400).send({ error: 'Challenge expired' });
   }
   if (stored.challenge !== d.challenge) {
     return reply.code(400).send({ error: 'Invalid challenge' });
   }
   
-  challengeMap.delete(d.address); // Single use
+  await redis.del(`wallet_challenge:${d.address}`).catch(() => {}); // Single use
   
   try {
     const keypair = Keypair.fromPublicKey(d.address);
@@ -368,38 +386,133 @@ fastify.post<{ Body: WalletVerifyBody }>('/api/auth/wallet/verify', {
   return reply.send({ token });
 });
 
-const googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID);
 
-fastify.post<{ Body: GoogleAuthBody }>('/api/auth/google', {
-  config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
-}, async (request, reply) => {
+const walletChallenges = new Map<string, { challenge: string; expiresAt: number }>();
+
+interface WalletChallengeRouteBody {
+  address?: unknown;
+}
+
+const WalletChallengeBody = z.object({
+  address: z.string().min(1, 'address is required'),
+});
+
+fastify.post<{ Body: WalletChallengeRouteBody }>('/api/auth/challenge', async (request, reply) => {
+  const d = WalletChallengeBody.parse(request.body);
+  const challenge = crypto.randomBytes(32).toString('hex');
+  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 mins
+  walletChallenges.set(d.address, { challenge, expiresAt });
+  return reply.send({ challenge, expiresAt: new Date(expiresAt).toISOString() });
+});
+
+interface WalletVerifyRouteBody {
+  address?: unknown;
+  signature?: unknown;
+}
+
+const LegacyWalletVerifyBody = z.object({
+  address: z.string().min(1, 'address is required'),
+  signature: z.string().min(1, 'signature is required'),
+});
+
+fastify.post<{ Body: WalletVerifyRouteBody }>('/api/auth/verify', async (request, reply) => {
+  const d = LegacyWalletVerifyBody.parse(request.body);
+  const challengeInfo = walletChallenges.get(d.address);
+
+  if (!challengeInfo) {
+    return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge not found or expired'));
+  }
+
+  if (Date.now() > challengeInfo.expiresAt) {
+    walletChallenges.delete(d.address);
+    return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired'));
+  }
+
+  try {
+    const keypair = Keypair.fromPublicKey(d.address);
+    const isValid = keypair.verify(Buffer.from(challengeInfo.challenge), Buffer.from(d.signature, 'hex'));
+    if (!isValid) {
+      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid signature'));
+    }
+  } catch (err) {
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid signature'));
+  }
+
+  walletChallenges.delete(d.address);
+
+  let merchant;
+  try {
+    merchant = await prisma.merchant.upsert({
+      where: { id: d.address },
+      update: {},
+      create: {
+        id: d.address,
+        name: `Merchant ${d.address.substring(0, 6)}`,
+        ownerId: `owner-${d.address.substring(0, 6)}`,
+        settings: {},
+      }
+    });
+  } catch (err: any) {
+    if (err.code === 'P2002') {
+      merchant = await prisma.merchant.findUnique({ where: { id: d.address } });
+    } else {
+      throw err;
+    }
+  }
+
+  if (!merchant) {
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Failed to upsert merchant'));
+  }
+
+  const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
+  return reply.send({ token });
+});
+
+interface GoogleAuthRouteBody {
+  token?: unknown;
+}
+
+const GoogleAuthBody = z.object({
+  token: z.string().min(1, 'token is required'),
+});
+
+fastify.post<{ Body: GoogleAuthRouteBody }>('/api/auth/google', async (request, reply) => {
   const d = GoogleAuthBody.parse(request.body);
   
   try {
-    const ticket = await googleClient.verifyIdToken({
-      idToken: d.idToken,
-      audience: env.GOOGLE_CLIENT_ID,
+    const client = new OAuth2Client();
+    const ticket = await client.verifyIdToken({
+      idToken: d.token,
+      audience: process.env.GOOGLE_CLIENT_ID,
     });
     const payload = ticket.getPayload();
-    if (!payload || !payload.email) {
-      return reply.code(401).send({ error: 'Invalid Google payload' });
+    if (!payload) {
+      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid token payload'));
     }
-    
-    const merchant = await prisma.merchant.upsert({
-      where: { ownerId: payload.email },
-      update: {},
-      create: {
-        id: crypto.randomUUID(),
-        name: payload.name || 'My Business',
-        ownerId: payload.email,
-        settings: {}
-      }
+    const email = payload.email;
+    if (!email) {
+      return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Email missing in Google payload'));
+    }
+
+    let merchant = await prisma.merchant.findFirst({
+      where: { ownerId: email, deletedAt: null }
     });
-    
-    const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
-    return reply.send({ token });
-  } catch (err) {
-    return reply.code(401).send({ error: 'Google authentication failed' });
+    if (!merchant) {
+      const merchantId = `google_${crypto.randomBytes(8).toString('hex')}`;
+      merchant = await prisma.merchant.create({
+        data: {
+          id: merchantId,
+          name: email.split('@')[0] + ' Merchant',
+          ownerId: email,
+          settings: {},
+        }
+      });
+    }
+
+    const jwtToken = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
+    return reply.send({ token: jwtToken });
+  } catch (err: any) {
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid Google token'));
   }
 });
 
@@ -425,7 +538,11 @@ fastify.post<{ Body: z.infer<typeof CreateMerchantBody> }>('/api/merchants', {
       await logAuditEvent('merchant.created', 'merchant', created.id, { before: null, after: created }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
       return created;
     });
-    return reply.code(201).send({ success: true, merchant, secret });
+    if (!d.secret) {
+      fastify.log.warn({ merchantId: merchant.id }, 'Auto-generated merchant secret returned in response. This will only be shown once.');
+    }
+    const { secretHash: _hash, ...safeMerchant } = merchant;
+    return reply.code(201).send({ data: { merchant: safeMerchant, secret } });
 });
 
 fastify.get<{ Params: { id: string } }>('/api/merchants/:id', {
@@ -684,14 +801,18 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementSta
 });
 
 // Settlements
-fastify.get('/api/settlements', {
+fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: string } }>('/api/settlements', {
   preValidation: [fastify.authenticate],
   config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
 }, async (request, reply) => {
-  const { merchantId, from, to } = request.query as { merchantId?: string; from?: string; to?: string };
+  const query = SettlementListQuery.parse(request.query);
+  const { merchantId, status, from, to, limit, offset } = query as any;
   const where: any = {};
   if (merchantId) {
     where.merchantId = merchantId;
+  }
+  if (status) {
+    where.status = status;
   }
   if (from || to) {
     where.initiatedAt = {};
@@ -703,11 +824,26 @@ fastify.get('/api/settlements', {
     }
   }
 
-  const records = await prisma.settlement.findMany({
-    where,
-    orderBy: { initiatedAt: 'desc' },
-  });
-  return { settlements: records, total: records.length };
+  const [records, total] = await Promise.all([
+    prisma.settlement.findMany({
+      where,
+      orderBy: { initiatedAt: 'desc' },
+      take: limit,
+      skip: offset,
+    }),
+    prisma.settlement.count({ where }),
+  ]);
+
+  const hasMore = offset + limit < total;
+  return {
+    data: records,
+    pagination: {
+      total,
+      limit,
+      offset,
+      hasMore,
+    },
+  };
 });
 
 fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>('/api/settlements', {
@@ -765,18 +901,19 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>('/api/settlements',
     if (settings?.dailySettlementLimit) {
       const todayStart = new Date();
       todayStart.setHours(0, 0, 0, 0);
+      const startTimeMs = Date.now();
 
-      const todaySettlements = await prisma.settlement.findMany({
-        where: {
-          merchantId: d.merchantId,
-          initiatedAt: { gte: todayStart },
-        },
-        select: {
-          totalAmount: true
-        }
-      });
+      const aggregateResult = await prisma.$queryRaw<[{ sum: string | null }]>`
+        SELECT COALESCE(SUM(CAST("totalAmount" AS DECIMAL)), 0)::text as sum
+        FROM "Settlement"
+        WHERE "merchantId" = ${d.merchantId}
+        AND "initiatedAt" >= ${todayStart}
+      `;
 
-      const currentDailyTotal = todaySettlements.reduce((sum: number, s: { totalAmount: string }) => sum + parseFloat(s.totalAmount), 0);
+      const currentDailyTotal = aggregateResult?.[0]?.sum ? parseFloat(aggregateResult[0].sum) : 0;
+      const queryDurationMs = Date.now() - startTimeMs;
+      request.log.debug({ queryDurationMs, merchantId: d.merchantId }, 'Daily settlement aggregate query');
+
       const requestTotal = items.reduce((sum: number, item: any) => sum + parseFloat(item.amount), 0);
       const newDailyTotal = currentDailyTotal + requestTotal;
       const dailyLimit = parseFloat(settings.dailySettlementLimit);
@@ -909,19 +1046,12 @@ async function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  if (mainApp) {
-    mainApp.log.info(`Received ${signal}, shutting down gracefully...`);
-    try {
-      await mainApp.close();
-      if (defaultPrisma) {
-        await defaultPrisma.$disconnect();
-      }
-      process.exit(0);
-    } catch (err) {
-      mainApp.log.error(err, 'Error during shutdown');
-      process.exit(1);
-    }
-  } else {
+  fastify.log.info(`Received ${signal}, shutting down gracefully...`);
+
+  try {
+    await fastify.close();
+    await prisma.$disconnect();
+    stopAbandonedPaymentsCron();
     process.exit(0);
   }
 }
@@ -931,12 +1061,11 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 const start = async () => {
   try {
-    const prisma = getDefaultPrisma();
-    mainApp = buildApp({ prisma });
-    setupPrismaQueryLogging(prisma, mainApp.log);
-    await connectWithRetry(prisma, mainApp.log);
-
-    await mainApp.listen({ port: PORT, host: '0.0.0.0' });
+    await connectWithRetry(prisma, fastify.log);
+    if (process.env.NODE_ENV !== 'test') {
+      startAbandonedPaymentsCron(prisma, fastify.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24);
+    }
+    await fastify.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {
     if (mainApp) mainApp.log.error(err);
     else console.error(err);
