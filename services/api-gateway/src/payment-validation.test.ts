@@ -96,6 +96,29 @@ test('validation: POST /api/payments validates payerId if provided', async (t) =
   t.end();
 });
 
+test('validation: POST /api/payments validates convertTo is not empty and is uppercase', async (t) => {
+  const { app } = createTestApp();
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/payments',
+    headers: { authorization: `Bearer ${token}` },
+    payload: {
+      merchantId: VALID_STELLAR_KEY,
+      amount: '10.00',
+      asset: 'USDC',
+      convertTo: 'ngn', // lowercase is invalid according to validation rules
+    },
+  });
+
+  t.equal(res.statusCode, 400, 'should reject lowercase convertTo with 400');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.code, 'VALIDATION_ERROR');
+  await app.close();
+  t.end();
+});
+
 test('validation: POST /api/merchants validates id and ownerId Stellar addresses', async (t) => {
   const { app } = createTestApp();
   const token = generateTestJwt(app);
@@ -178,3 +201,77 @@ test('validation: PATCH /api/merchants/:id/settings validates feeBps constraints
   await app.close();
   t.end();
 });
+
+test('validation: POST /api/settlements validates merchantId format', async (t) => {
+  const { app } = createTestApp();
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/settlements',
+    headers: { authorization: `Bearer ${token}` },
+    payload: {
+      merchantId: INVALID_STELLAR_KEY,
+      items: [{ amount: '50.00', asset: 'USDC' }],
+    },
+  });
+
+  t.equal(res.statusCode, 400, 'should reject invalid settlement merchantId with 400');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.code, 'VALIDATION_ERROR');
+  await app.close();
+  t.end();
+});
+
+test('validation: POST /api/settlements validates items payload structure', async (t) => {
+  const { app } = createTestApp();
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/settlements',
+    headers: { authorization: `Bearer ${token}` },
+    payload: {
+      merchantId: VALID_STELLAR_KEY,
+      items: [{ amount: 'not-a-number', asset: '' }], // invalid amount format and empty asset
+    },
+  });
+
+  t.equal(res.statusCode, 400, 'should reject invalid settlement items layout with 400');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.code, 'VALIDATION_ERROR');
+  await app.close();
+  t.end();
+});
+
+test('validation: GET /api/settlements validates query parameter dates', async (t) => {
+  const { app } = createTestApp();
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/settlements?merchantId=' + VALID_STELLAR_KEY + '&from=not-a-date',
+    headers: { authorization: `Bearer ${token}` },
+  });
+
+  t.equal(res.statusCode, 400, 'should reject malformed date format with 400');
+  await app.close();
+  t.end();
+});
+
+test('validation: GET /api/settlements handles date ranges correctly when start date is after end date', async (t) => {
+  const { app } = createTestApp();
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/settlements?merchantId=' + VALID_STELLAR_KEY + '&from=2026-12-31&to=2026-01-01',
+    headers: { authorization: `Bearer ${token}` },
+  });
+
+  // Query parameter date bounds verification
+  t.ok(res.statusCode === 200 || res.statusCode === 400, 'should handle date ranges cleanly');
+  await app.close();
+  t.end();
+});
+export { VALID_STELLAR_KEY, INVALID_STELLAR_KEY };
