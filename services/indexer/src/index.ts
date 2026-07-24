@@ -502,7 +502,7 @@ const WebhookBody = z.object({
   url: WebhookUrlSchema,
 });
 
-fastify.post('/api/webhooks', async (request, reply) => {
+fastify.post('/api/webhooks', { preValidation: [fastify.serviceAuth] }, async (request, reply) => {
   const { url } = WebhookBody.parse(request.body);
   const sub = await prisma.$transaction(async (tx) => {
     const created = await tx.webhookSubscription.create({
@@ -515,11 +515,11 @@ fastify.post('/api/webhooks', async (request, reply) => {
   return reply.code(201).send(sub);
 });
 
-fastify.get('/api/webhooks', async () => {
+fastify.get('/api/webhooks', { preValidation: [fastify.serviceAuth] }, async () => {
   return prisma.webhookSubscription.findMany({ orderBy: { createdAt: 'desc' } });
 });
 
-fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, reply) => {
+fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', { preValidation: [fastify.serviceAuth] }, async (request, reply) => {
   const { id } = request.params;
   const existing = await prisma.webhookSubscription.findUnique({ where: { id } });
   if (!existing) {

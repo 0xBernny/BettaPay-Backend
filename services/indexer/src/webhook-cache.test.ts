@@ -81,6 +81,7 @@ test('webhook creation and deletion invalidate the cache', async (t) => {
     const res = await fastify.inject({
       method: 'POST',
       url: '/api/webhooks',
+      headers: { 'x-service-token': process.env.INTER_SERVICE_SECRET || 'test-secret-that-is-at-least-16-chars' },
       payload: { url: 'https://example.com/webhook' }
     });
     
@@ -92,6 +93,7 @@ test('webhook creation and deletion invalidate the cache', async (t) => {
     const resDel = await fastify.inject({
       method: 'DELETE',
       url: '/api/webhooks/fake_id',
+      headers: { 'x-service-token': process.env.INTER_SERVICE_SECRET || 'test-secret-that-is-at-least-16-chars' },
     });
     t.equal(resDel.statusCode, 204, 'DELETE /api/webhooks/:id succeeds');
     t.equal(cacheState.subscriptions, null, 'Cache is null after DELETE /api/webhooks/:id');
