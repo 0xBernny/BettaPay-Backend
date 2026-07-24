@@ -8,6 +8,7 @@ test('POST /api/webhooks - rejects a non-URL string', async (t) => {
     const res = await fastify.inject({
       method: 'POST',
       url: '/api/webhooks',
+      headers: { 'x-service-token': process.env.INTER_SERVICE_SECRET || 'test-secret-that-is-at-least-16-chars' },
       payload: { url: 'not-a-url' },
     });
     t.equal(res.statusCode, 400, 'should return 400 for a malformed URL');
@@ -28,11 +29,67 @@ test('POST /api/webhooks - rejects a URL exceeding 2048 characters', async (t) =
     const res = await fastify.inject({
       method: 'POST',
       url: '/api/webhooks',
+      headers: { 'x-service-token': process.env.INTER_SERVICE_SECRET || 'test-secret-that-is-at-least-16-chars' },
       payload: { url: long },
     });
     t.equal(res.statusCode, 400, 'should return 400 for an over-length URL');
     const body = JSON.parse(res.body);
     t.equal(body.error?.code, 'VALIDATION_ERROR', 'error code should be VALIDATION_ERROR');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    t.end();
+  }
+});
+
+test('POST /api/webhooks - rejects requests without service token', async (t) => {
+  await fastify.ready();
+
+  try {
+    const res = await fastify.inject({
+      method: 'POST',
+      url: '/api/webhooks',
+      payload: { url: 'https://example.com/webhook' },
+    });
+    t.equal(res.statusCode, 401, 'should return 401 without x-service-token');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'UNAUTHORIZED', 'error code should be UNAUTHORIZED');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    t.end();
+  }
+});
+
+test('GET /api/webhooks - rejects requests without service token', async (t) => {
+  await fastify.ready();
+
+  try {
+    const res = await fastify.inject({
+      method: 'GET',
+      url: '/api/webhooks',
+    });
+    t.equal(res.statusCode, 401, 'should return 401 without x-service-token');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'UNAUTHORIZED', 'error code should be UNAUTHORIZED');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    t.end();
+  }
+});
+
+test('DELETE /api/webhooks/:id - rejects requests without service token', async (t) => {
+  await fastify.ready();
+
+  try {
+    const res = await fastify.inject({
+      method: 'DELETE',
+      url: '/api/webhooks/fake_id',
+    });
+    t.equal(res.statusCode, 401, 'should return 401 without x-service-token');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'UNAUTHORIZED', 'error code should be UNAUTHORIZED');
   } catch (err: any) {
     t.fail(err);
   } finally {
