@@ -1,18 +1,13 @@
 import test from 'tape';
-import Fastify from 'fastify';
-import fastifyJwt from '@fastify/jwt';
 import crypto from 'crypto';
 import sinon from 'sinon';
 import { Keypair } from '@stellar/stellar-sdk';
 import { OAuth2Client } from 'google-auth-library';
 import { CreateMerchantBody, AuthTokenBody, createErrorResponse, ErrorCodes } from '@bettapay/validation';
 
-// Valid Ed25519 Stellar public key (checksummed) used wherever AuthTokenBody /
-// CreateMerchantBody require StellarAddressSchema.
 const VALID_STELLAR_PUBLIC_KEY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const OTHER_STELLAR_PUBLIC_KEY = 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H';
 
-// Native hashSecret helper mirroring src/index.ts
 function hashSecret(secret: string): string {
   return crypto.createHash('sha256').update(secret).digest('hex');
 }
@@ -210,20 +205,21 @@ test('valid credentials return JWT', async (t) => {
   const secret = 'merchant-super-secret-key';
   const merchantId = VALID_STELLAR_PUBLIC_KEY;
   const hashed = hashSecret(secret);
-  const { app } = buildApp([{ id: merchantId, ownerId: 'user-1', secretHash: hashed }]);
+  const { app } = createTestApp({}, {
+    merchants: [{ id: merchantId, ownerId: 'user-1', secretHash: hashed }],
+  });
 
   try {
     const res = await app.inject({
       method: 'POST',
       url: '/api/auth/token',
-      payload: { merchantId, secret }
+      payload: { merchantId, secret },
     });
 
     t.equal(res.statusCode, 200, 'should return 200 OK');
     const body = JSON.parse(res.body);
     t.ok(body.token, 'should return a token');
-    
-    // Verify JWT contents
+
     const payload = app.jwt.decode(body.token) as any;
     t.equal(payload.merchantId, merchantId, 'JWT contains correct merchant ID');
     t.equal(payload.ownerId, 'user-1', 'JWT contains correct owner ID');
@@ -239,13 +235,15 @@ test('invalid secret returns 401', async (t) => {
   const secret = 'merchant-super-secret-key';
   const merchantId = VALID_STELLAR_PUBLIC_KEY;
   const hashed = hashSecret(secret);
-  const { app } = buildApp([{ id: merchantId, ownerId: 'user-1', secretHash: hashed }]);
+  const { app } = createTestApp({}, {
+    merchants: [{ id: merchantId, ownerId: 'user-1', secretHash: hashed }],
+  });
 
   try {
     const res = await app.inject({
       method: 'POST',
       url: '/api/auth/token',
-      payload: { merchantId, secret: 'wrong-secret' }
+      payload: { merchantId, secret: 'wrong-secret' },
     });
 
     t.equal(res.statusCode, 401, 'should return 401 Unauthorized');
@@ -260,13 +258,13 @@ test('invalid secret returns 401', async (t) => {
 });
 
 test('unknown merchant returns 401', async (t) => {
-  const { app } = buildApp([]);
+  const { app } = createTestApp({}, { merchants: [] });
 
   try {
     const res = await app.inject({
       method: 'POST',
       url: '/api/auth/token',
-      payload: { merchantId: OTHER_STELLAR_PUBLIC_KEY, secret: 'some-secret' }
+      payload: { merchantId: OTHER_STELLAR_PUBLIC_KEY, secret: 'some-secret' },
     });
 
     t.equal(res.statusCode, 401, 'should return 401 Unauthorized for unknown merchant');
@@ -281,13 +279,15 @@ test('unknown merchant returns 401', async (t) => {
 });
 
 test('merchant creation hashes secrets and plaintext secrets are never persisted', async (t) => {
-  const { app, db } = buildApp([]);
+  const { app, mockPrisma } = createTestApp({}, { merchants: [] });
+  const token = generateTestJwt(app);
 
   try {
     // 1. Creation with custom secret
     const res1 = await app.inject({
       method: 'POST',
       url: '/api/merchants',
+      headers: { authorization: `Bearer ${token}` },
       payload: {
         id: 'm-new-1',
         name: 'New Merchant',
@@ -311,11 +311,12 @@ test('merchant creation hashes secrets and plaintext secrets are never persisted
     const res2 = await app.inject({
       method: 'POST',
       url: '/api/merchants',
+      headers: { authorization: `Bearer ${token}` },
       payload: {
         id: 'm-new-2',
         name: 'Generated Merchant',
         ownerId: OTHER_STELLAR_PUBLIC_KEY,
-      }
+      },
     });
 
     t.equal(res2.statusCode, 201, 'creation with generated secret succeeds');
@@ -340,21 +341,22 @@ test('seeded admin merchant authenticates successfully', async (t) => {
   const adminAddress = VALID_STELLAR_PUBLIC_KEY;
   const adminSecret = 'admin-secret-dev-value';
   const adminSecretHash = hashSecret(adminSecret);
-  
-  // Build database seeded with admin merchant
-  const { app } = buildApp([{
-    id: adminAddress,
-    name: 'BettaPay Merchant LLC',
-    ownerId: 'admin-user-001',
-    settings: { preferredAsset: 'USDC', autoSettle: true },
-    secretHash: adminSecretHash
-  }]);
+
+  const { app } = createTestApp({}, {
+    merchants: [{
+      id: adminAddress,
+      name: 'BettaPay Merchant LLC',
+      ownerId: 'admin-user-001',
+      settings: { preferredAsset: 'USDC', autoSettle: true },
+      secretHash: adminSecretHash,
+    }],
+  });
 
   try {
     const res = await app.inject({
       method: 'POST',
       url: '/api/auth/token',
-      payload: { merchantId: adminAddress, secret: adminSecret }
+      payload: { merchantId: adminAddress, secret: adminSecret },
     });
 
     t.equal(res.statusCode, 200, 'admin authenticates successfully');
@@ -372,14 +374,15 @@ test('regression test: arbitrary secrets can no longer obtain a JWT', async (t) 
   const merchantId = VALID_STELLAR_PUBLIC_KEY;
   const secret = 'merchant-super-secret-key';
   const hashed = hashSecret(secret);
-  const { app } = buildApp([{ id: merchantId, ownerId: 'user-1', secretHash: hashed }]);
+  const { app } = createTestApp({}, {
+    merchants: [{ id: merchantId, ownerId: 'user-1', secretHash: hashed }],
+  });
 
   try {
-    // Attempting to auth with an arbitrary random secret
     const res = await app.inject({
       method: 'POST',
       url: '/api/auth/token',
-      payload: { merchantId, secret: 'arbitrary-unauthorized-secret-key-123' }
+      payload: { merchantId, secret: 'arbitrary-unauthorized-secret-key-123' },
     });
 
     t.equal(res.statusCode, 401, 'arbitrary secret is rejected');

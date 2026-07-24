@@ -1,83 +1,98 @@
 import test from 'tape';
-import Fastify from 'fastify';
-import { UpdatePaymentStatusBody, createErrorResponse, ErrorCodes } from '@bettapay/validation';
+import { createTestApp, generateTestJwt } from './test-utils.js';
 
-// Mirrors the PATCH /api/payments/:id/status logic in src/index.ts, but backed by
-// an in-memory store so the test does not need a database (same self-contained
-// style as authenticate.test.ts).
+test('authorization: PATCH /api/payments/:id/status returns 401 without valid JWT', async (t) => {
+  const { app } = createTestApp({}, {
+    payments: [{ id: 'pay_1', status: 'initiated', merchantId: 'm1', amount: '10.00', asset: 'USDC' }],
+  });
 
-const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
-  initiated: ['completed', 'failed', 'cancelled'],
-  completed: [],
-  failed: [],
-  cancelled: [],
-};
+  const res = await app.inject({
+    method: 'PATCH',
+    url: '/api/payments/pay_1/status',
+    payload: { status: 'completed' },
+  });
 
-function buildApp(initialStatus: string) {
-  const app = Fastify({ logger: false });
-  const payment: { id: string; status: string } | null =
-    initialStatus === 'missing' ? null : { id: 'pay_1', status: initialStatus };
+  t.equal(res.statusCode, 401, 'returns 401 Unauthorized when missing token');
+  await app.close();
+  t.end();
+});
 
-  app.patch<{ Params: { id: string }; Body: { status?: unknown } }>(
-    '/api/payments/:id/status',
-    async (request, reply) => {
-      let d: UpdatePaymentStatusBody;
-      try {
-        d = UpdatePaymentStatusBody.parse(request.body);
-      } catch {
-        return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Invalid request payload'));
-      }
+test('persistence & transitions: initiated transitions to a terminal state and updates DB', async (t) => {
+  const initialPayment = { id: 'pay_1', status: 'initiated', merchantId: 'm1', amount: '10.00', asset: 'USDC' };
+  const { app, mockPrisma } = createTestApp({}, { payments: [initialPayment] });
+  const token = generateTestJwt(app);
 
-      if (!payment) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Payment not found'));
+  const res = await app.inject({
+    method: 'PATCH',
+    url: '/api/payments/pay_1/status',
+    headers: { authorization: `Bearer ${token}` },
+    payload: { status: 'completed' },
+  });
 
-      const allowed = PAYMENT_STATUS_TRANSITIONS[payment.status] ?? [];
-      if (!allowed.includes(d.status)) {
-        return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid status transition', { from: payment.status, to: d.status }));
-      }
+  t.equal(res.statusCode, 200, 'returns 200 OK');
+  const body = JSON.parse(res.body);
+  t.equal(body.status, 'completed', 'response status is updated to completed');
 
-      payment.status = d.status;
-      return reply.send(payment);
-    }
-  );
+  // Persistence verification in mock DB
+  const stored = await mockPrisma.payment.findUnique({ where: { id: 'pay_1' } });
+  t.ok(stored, 'payment exists in mock database');
+  t.equal(stored.status, 'completed', 'database payment status is updated to completed');
 
-  return app;
-}
-
-async function patch(app: ReturnType<typeof buildApp>, status: unknown) {
-  return app.inject({ method: 'PATCH', url: '/api/payments/pay_1/status', payload: { status } });
-}
-
-test('initiated transitions to a terminal state', async (t) => {
-  const app = buildApp('initiated');
-  const res = await patch(app, 'completed');
-  t.equal(res.statusCode, 200, 'returns 200');
-  t.equal(JSON.parse(res.body).status, 'completed', 'status is updated to completed');
   await app.close();
   t.end();
 });
 
 test('terminal states cannot transition', async (t) => {
-  const app = buildApp('completed');
-  const res = await patch(app, 'failed');
+  const { app } = createTestApp({}, {
+    payments: [{ id: 'pay_1', status: 'completed', merchantId: 'm1', amount: '10.00', asset: 'USDC' }],
+  });
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'PATCH',
+    url: '/api/payments/pay_1/status',
+    headers: { authorization: `Bearer ${token}` },
+    payload: { status: 'failed' },
+  });
+
   t.equal(res.statusCode, 422, 'returns 422 Unprocessable Entity');
-  t.equal(JSON.parse(res.body).error.details.from, 'completed', 'reports the current state');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.details.from, 'completed', 'reports the current state in error details');
+
   await app.close();
   t.end();
 });
 
 test('an unaccepted status value is rejected as a bad payload', async (t) => {
-  const app = buildApp('initiated');
-  // `initiated` is not an accepted target, and unknown values are rejected too.
-  const res = await patch(app, 'initiated');
+  const { app } = createTestApp({}, {
+    payments: [{ id: 'pay_1', status: 'initiated', merchantId: 'm1', amount: '10.00', asset: 'USDC' }],
+  });
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'PATCH',
+    url: '/api/payments/pay_1/status',
+    headers: { authorization: `Bearer ${token}` },
+    payload: { status: 'initiated' },
+  });
+
   t.equal(res.statusCode, 400, 'returns 400 for a status outside the accepted enum');
   await app.close();
   t.end();
 });
 
 test('updating a missing payment returns 404', async (t) => {
-  const app = buildApp('missing');
-  const res = await patch(app, 'completed');
-  t.equal(res.statusCode, 404, 'returns 404');
+  const { app } = createTestApp({}, { payments: [] });
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'PATCH',
+    url: '/api/payments/missing_pay/status',
+    headers: { authorization: `Bearer ${token}` },
+    payload: { status: 'completed' },
+  });
+
+  t.equal(res.statusCode, 404, 'returns 404 Not Found');
   await app.close();
   t.end();
 });

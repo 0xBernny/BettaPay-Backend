@@ -1,7 +1,7 @@
 import test from 'tape';
-import Fastify from 'fastify';
-import { z } from 'zod';
-import { registerErrorHandler, createErrorResponse, ErrorCodes } from '@bettapay/validation';
+import { createErrorResponse, ErrorCodes } from '@bettapay/validation';
+import { buildApp } from './index.js';
+import { createMockPrisma } from './test-utils.js';
 
 test('createErrorResponse builds the standard envelope', (t) => {
   const res = createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found');
@@ -17,17 +17,17 @@ test('createErrorResponse includes details when provided', (t) => {
   t.end();
 });
 
-test('a Zod failure returns a 400 VALIDATION_ERROR with the issue list in details', async (t) => {
-  const app = Fastify({ logger: false });
-  registerErrorHandler(app);
-  const Body = z.object({ amount: z.string().regex(/^\d+$/, 'amount must be numeric') });
+test('a Zod failure on gateway route returns a 400 VALIDATION_ERROR with the issue list in details', async (t) => {
+  const app = buildApp({ prisma: createMockPrisma() as any, logger: false });
 
-  app.post('/x', async (request, reply) => {
-    Body.parse(request.body);
-    return reply.send({ ok: true });
+  // Test Zod error handler on real POST /api/payments route (missing token doesn't bypass validation, or we can use any route without auth, e.g. /api/auth/wallet/verify)
+  // Let's use /api/auth/wallet/verify which requires address, challenge, signature
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/auth/wallet/verify',
+    payload: { address: 'invalid-address' } // Missing challenge and signature
   });
 
-  const res = await app.inject({ method: 'POST', url: '/x', payload: { amount: 'not-a-number' } });
   t.equal(res.statusCode, 400, 'status is preserved at 400');
   const body = JSON.parse(res.body);
   t.equal(body.error.code, 'VALIDATION_ERROR', 'code is VALIDATION_ERROR');
