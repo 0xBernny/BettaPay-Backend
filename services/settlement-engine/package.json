@@ -9,7 +9,7 @@
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-precision.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/genReqId-usage.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/prisma-adapter.test.ts"
+    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-precision.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-amounts.property.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/genReqId-usage.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/prisma-adapter.test.ts"
   },
   "dependencies": {
     "@bettapay/shared-types": "workspace:^",
@@ -31,6 +31,7 @@
     "@types/node": "^20.10.0",
     "@types/pg": "^8.20.0",
     "@types/tape": "^5.6.4",
+    "fast-check": "^4.9.0",
     "tape": "^5.9.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.3"

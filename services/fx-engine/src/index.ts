@@ -347,8 +347,13 @@ fastify.get('/api/health', async (_request, reply) => {
   if (fallbackStartTime !== null && Date.now() - fallbackStartTime > ONE_HOUR_MS) {
     if (health.status !== 'unhealthy') {
       health.status = 'degraded';
-      if (!health.details) health.details = {};
-      (health.details as Record<string, unknown>).fallbackModeDuration = 'exceeded 1 hour';
+      const ratesApi = health.upstream?.find((d) => d.name === 'rates-api');
+      if (ratesApi) {
+        ratesApi.details = {
+          ...(ratesApi.details ?? {}),
+          fallbackModeDuration: 'exceeded 1 hour',
+        };
+      }
     }
   }
 
@@ -376,7 +381,7 @@ fastify.get('/api/admin/rates/status', {
   preValidation: [fastify.serviceAuth],
 }, async (_request, _reply) => {
   const inFallback = fallbackStartTime !== null;
-  const fallbackDurationMs = inFallback ? Date.now() - fallbackStartTime : 0;
+  const fallbackDurationMs = fallbackStartTime !== null ? Date.now() - fallbackStartTime : 0;
   const fallbackDurationMin = Math.round(fallbackDurationMs / 60000);
 
   return {

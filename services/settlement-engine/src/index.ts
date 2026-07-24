@@ -561,7 +561,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     if (idempotencyKey) {
       let claimed: string | null = null;
       try {
-        claimed = await redis.set(`idempotency:${idempotencyKey}`, settlementId, 'NX', 'EX', 86400);
+        claimed = await redis.set(`idempotency:${idempotencyKey}`, settlementId, 'EX', 86400, 'NX');
       } catch {
         // Redis unavailable — fall through to DB @unique constraint
       }
