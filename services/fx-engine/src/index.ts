@@ -16,7 +16,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
-import { Redis } from 'ioredis';
+import * as promClient from 'prom-client';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import {
@@ -31,6 +31,9 @@ import {
   CurrencyCode,
   buildFxEngineHealthResponse,
   readServiceVersion,
+  createRedisClient,
+  waitForRedis,
+  startRedisMemoryMonitor,
 } from '@bettapay/validation';
 
 const env = validateEnv(process.env);
@@ -206,32 +209,84 @@ async function fetchBaseRates(): Promise<Record<string, number> | null> {
   }
 }
 
+// #388 — cache stampede protection constants
+const RATE_FETCH_LOCK_KEY    = 'rate_fetch_lock:global';
+const RATE_FETCH_LOCK_TTL_MS = 5_000;
+const STAMPEDE_POLL_INTERVAL = 50;   // ms between polls
+const STAMPEDE_POLL_TIMEOUT  = 5_000; // ms before giving up and fetching directly
+
+// Acquire a SET NX lock in Redis. Returns the lock token if acquired, null otherwise.
+async function acquireRateFetchLock(): Promise<string | null> {
+  const token = randomUUID();
+  const result = await redis
+    .set(RATE_FETCH_LOCK_KEY, token, 'PX', RATE_FETCH_LOCK_TTL_MS, 'NX')
+    .catch(() => null);
+  return result === 'OK' ? token : null;
+}
+
+async function releaseRateFetchLock(token: string): Promise<void> {
+  // Only delete the key if we still own it (Lua for atomicity)
+  const script = `
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+      return redis.call("del", KEYS[1])
+    else
+      return 0
+    end
+  `;
+  await redis.eval(script, 1, RATE_FETCH_LOCK_KEY, token).catch(() => {});
+}
+
 async function refreshTick(): Promise<void> {
   try {
-    const fetched = await fetchBaseRates();
-    if (fetched) {
-      // Merge fetched rates into the existing cache so any currency not in the
-      // response (e.g. NGN) keeps its current value.
-      const merged: Record<string, number> = { ...cache.rates, ...fetched };
-      updateBaseRates(merged);
-      fastify.log.info(
-        {
-          durationMs: lastRefresh?.durationMs,
-          assets: Object.keys(fetched),
-          cacheAgeMs: 0,
-        },
-        'FX rates refreshed',
-      );
-    } else {
-      // Fetch failed; transition to or continue in fallback mode (#236)
-      if (fallbackStartTime === null) {
-        fallbackStartTime = Date.now();
-        fastify.log.warn('Entering fallback FX rate mode');
+    // #388 — attempt to acquire the distributed fetch lock
+    const lockToken = await acquireRateFetchLock().catch(() => null);
+
+    if (lockToken !== null) {
+      // We hold the lock — perform the fetch
+      try {
+        const fetched = await fetchBaseRates();
+        if (fetched) {
+          const merged: Record<string, number> = { ...cache.rates, ...fetched };
+          updateBaseRates(merged);
+          fastify.log.info(
+            { durationMs: lastRefresh?.durationMs, assets: Object.keys(fetched) },
+            'FX rates refreshed',
+          );
+        } else {
+          if (fallbackStartTime === null) {
+            fallbackStartTime = Date.now();
+            fastify.log.warn('Entering fallback FX rate mode');
+          }
+        }
+      } finally {
+        await releaseRateFetchLock(lockToken);
+      }
+      return;
+    }
+
+    // Lock not acquired — another instance is fetching. Busy-poll the snapshot
+    // store until the lock holder populates it or the timeout expires.
+    const deadline = Date.now() + STAMPEDE_POLL_TIMEOUT;
+    const snapshotBefore = cache.cachedAt;
+
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, STAMPEDE_POLL_INTERVAL));
+      if (cache.cachedAt > snapshotBefore) {
+        fastify.log.info('Stampede protection: another instance refreshed the rate cache');
+        return;
       }
     }
+
+    // Lock holder may have failed — attempt fetch ourselves as fallback
+    fastify.log.warn('Stampede poll timed out; falling back to direct fetch');
+    const fetched = await fetchBaseRates();
+    if (fetched) {
+      updateBaseRates({ ...cache.rates, ...fetched });
+    } else if (fallbackStartTime === null) {
+      fallbackStartTime = Date.now();
+      fastify.log.warn('Entering fallback FX rate mode');
+    }
   } catch (err) {
-    // Defensive: fetchBaseRates catches its own errors, so this is only for
-    // programming bugs in refreshTick itself. Don't crash the interval.
     fastify.log.error({ err }, 'Unexpected error in refresh tick');
   }
 }
@@ -320,7 +375,8 @@ const fastify = Fastify({
 });
 
 registerRequestId(fastify);
-redis = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
+// #386 — exponential backoff retry strategy
+redis = createRedisClient(env.REDIS_URL, fastify.log);
 redis.on('error', (err) => fastify.log.warn({ err: err.message }, 'Redis error in fx-engine'));
 fastify.addHook('onClose', async () => { await redis.quit().catch(() => {}); });
 
@@ -688,8 +744,28 @@ async function shutdown(signal: string) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
+// ── Prometheus metrics endpoint (#387) ────────────────────────────────────
+promClient.collectDefaultMetrics();
+
+const redisMemoryGauge = new promClient.Gauge({
+  name: 'redis_memory_usage_bytes',
+  help: 'Current Redis memory usage in bytes (used_memory from INFO memory)',
+});
+const redisEvictedCounter = new promClient.Counter({
+  name: 'redis_evicted_keys_total',
+  help: 'Total number of keys evicted from Redis (evicted_keys from INFO stats)',
+});
+
+fastify.get('/metrics', async (_request, reply) => {
+  reply.header('Content-Type', promClient.register.contentType);
+  return promClient.register.metrics();
+});
+
 const start = async () => {
   try {
+    // #391 — wait for Redis before doing anything else
+    await waitForRedis(redis, fastify.log);
+
     // Warm up cache from latest Redis snapshot (#232)
     await warmupCacheFromRedis();
     // Seed the snapshot store so history is queryable from the very first request
@@ -700,6 +776,28 @@ const start = async () => {
     // updated; if it fails, we keep the FALLBACK_RATES seed.
     await refreshTick();
     startRefreshLoop();
+
+    // #387 — Redis memory monitoring: update prom gauges every 30 s
+    startRedisMemoryMonitor(redis, fastify.log, {
+      intervalMs: 30_000,
+      warnThresholdRatio: 0.8,
+    });
+    // Wire up gauge updates alongside the shared logger-based monitor
+    setInterval(async () => {
+      try {
+        const [memInfo, statsInfo] = await Promise.all([
+          redis.info('memory'),
+          redis.info('stats'),
+        ]);
+        const usedMemMatch = memInfo.match(/^used_memory:(\d+)/m);
+        const evictedMatch = statsInfo.match(/^evicted_keys:(\d+)/m);
+        if (usedMemMatch) redisMemoryGauge.set(parseInt(usedMemMatch[1], 10));
+        if (evictedMatch) redisEvictedCounter.reset(); // counter only grows; set abs value via inc
+      } catch {
+        // non-fatal
+      }
+    }, 30_000);
+
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {
     fastify.log.error(err);

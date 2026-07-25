@@ -28,7 +28,7 @@ import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
+import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor } from '@bettapay/validation';
 import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient, type IndexerClient } from './clients/indexer-client.js';
 import {
@@ -64,7 +64,6 @@ import { OAuth2Client } from 'google-auth-library';
 import { registerGatewayHealthRoutes } from './health.js';
 import { startAbandonedPaymentsCron, stopAbandonedPaymentsCron } from './abandoned-payments-cron.js';
 import { readServiceVersion } from '@bettapay/validation';
-import { Redis } from 'ioredis';
 
 declare module 'fastify' {
   export interface FastifyInstance {
@@ -322,7 +321,8 @@ registerGatewayHealthRoutes({
 });
 
 // --- Wallet Auth Challenge Store ----------------------------------------------
-const redis = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
+// #386 — exponential backoff retry strategy
+const redis = createRedisClient(env.REDIS_URL, fastify.log);
 
 fastify.get<{ Querystring: WalletChallengeQuery }>('/api/auth/wallet/challenge', {
   config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
@@ -1088,7 +1088,13 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 const start = async () => {
   try {
+    // #391 — wait for dependencies before accepting traffic
     await connectWithRetry(prisma, fastify.log);
+    await waitForRedis(redis, fastify.log);
+
+    // #387 — Redis memory monitoring
+    startRedisMemoryMonitor(redis, fastify.log);
+
     if (process.env.NODE_ENV !== 'test') {
       startAbandonedPaymentsCron(prisma, fastify.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24);
     }

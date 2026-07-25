@@ -27,7 +27,6 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import * as promClient from 'prom-client';
 import * as crypto from 'crypto';
-import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
 import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
@@ -52,6 +51,9 @@ import {
   registerTracing,
   buildSettlementEngineHealthResponse,
   readServiceVersion,
+  createRedisClient,
+  waitForRedis,
+  startRedisMemoryMonitor,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
@@ -88,13 +90,14 @@ const fastify = Fastify({
 registerRequestId(fastify);
 setupPrismaQueryLogging(prisma, fastify.log);
 
-const redis = new Redis(env.REDIS_URL);
+// #386 — exponential backoff retry strategy
+const redis = createRedisClient(env.REDIS_URL, fastify.log);
 
 fastify.addHook('onClose', async () => {
   await redis.quit();
 });
 
-fastify.register(cors, { 
+fastify.register(cors, {
   origin: env.ALLOWED_ORIGINS
 });
 
@@ -116,16 +119,16 @@ registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
 
+// #386 — BullMQ connection also uses exponential backoff
 const redisConnection = new URL(env.REDIS_URL);
 const connectionParams = {
   host: redisConnection.hostname,
   port: parseInt(redisConnection.port || '6379', 10),
   maxRetriesPerRequest: env.REDIS_MAX_RETRIES,
   enableReadyCheck: false,
-  retryStrategy: (times: number) => {
-    if (times > 10) return null;
-    const delay = Math.min(times * 1000, 30000);
-    fastify.log.warn({ attempt: times, delay }, 'Redis connection retry');
+  retryStrategy: (attempt: number) => {
+    const delay = Math.min(Math.pow(2, attempt) * 100, 5_000);
+    fastify.log.warn({ attempt, delayMs: delay }, 'BullMQ Redis connection retry');
     return delay;
   },
 };
@@ -710,7 +713,13 @@ process.on('SIGINT', () => {
 
 const start = async () => {
   try {
+    // #391 — wait for both dependencies before accepting traffic
     await connectWithRetry(prisma, fastify.log);
+    await waitForRedis(redis, fastify.log);
+
+    // #387 — Redis memory monitoring
+    startRedisMemoryMonitor(redis, fastify.log);
+
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
     fastify.log.info({ port: PORT }, 'Settlement Engine started successfully');
   } catch (err) {

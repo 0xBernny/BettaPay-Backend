@@ -16,7 +16,6 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import crypto from 'crypto';
-import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { PrismaClient, WebhookSubscription } from '@prisma/client';
@@ -43,6 +42,9 @@ import {
   buildIndexerHealthResponse,
   readServiceVersion,
   createAuditLogger,
+  createRedisClient,
+  waitForRedis,
+  startRedisMemoryMonitor,
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
 
@@ -109,7 +111,8 @@ const webhookWorker = createWebhookWorker('indexer-webhooks', connectionParams, 
   },
 });
 
-const redisHealth = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
+// #386 — exponential backoff retry strategy
+const redisHealth = createRedisClient(env.REDIS_URL, fastify.log);
 redisHealth.on('error', (err) => fastify.log.warn({ err: err.message }, '[Indexer] Redis health client error'));
 fastify.addHook('onClose', async () => {
   await redisHealth.quit().catch(() => {});
@@ -134,7 +137,8 @@ const replayQueue = new Queue('indexer-replays', {
   },
 });
 
-const replayProgressRedis = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
+// #386 — exponential backoff retry strategy
+const replayProgressRedis = createRedisClient(env.REDIS_URL, fastify.log);
 replayProgressRedis.on('error', (err) =>
   fastify.log.warn({ err: err.message }, '[Indexer] Replay progress Redis error'),
 );
@@ -673,7 +677,13 @@ export function stopCleanupScheduler(): void {
 
 const start = async () => {
   try {
+    // #391 — wait for both dependencies before accepting traffic
     await connectWithRetry(prisma, fastify.log);
+    await waitForRedis(redisHealth, fastify.log);
+
+    // #387 — Redis memory monitoring
+    startRedisMemoryMonitor(redisHealth, fastify.log);
+
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
     fastify.log.info('[Indexer] Starting Stellar RPC polling loop...');
     pollEvents();
