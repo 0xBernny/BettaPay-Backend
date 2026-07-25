@@ -144,3 +144,31 @@ test('amounts do not contain floating-point artifacts (e, ., scientific notation
   });
   t.end();
 });
+
+// ─── Fee audit snapshot (#330) ──────────────────────────────────────────────
+
+test('feeSnapshot: populated with correct fee parameters', (t) => {
+  const { feeSnapshot } = computeSettlementAmounts('1000', 150);
+  t.ok(feeSnapshot, 'feeSnapshot is present');
+  t.equal(feeSnapshot.feeBpsApplied, 150, 'feeBpsApplied matches input');
+  t.equal(feeSnapshot.maxFeeBpsApplied, 150, 'maxFeeBpsApplied matches input');
+  t.equal(feeSnapshot.discountApplied, 0, 'discountApplied defaults to 0');
+  t.equal(feeSnapshot.monthlyVolumeAtTime, 1000, 'monthlyVolumeAtTime is gross amount');
+  t.equal(feeSnapshot.feeVersion, '1.0', 'feeVersion is set');
+  t.end();
+});
+
+test('feeSnapshot: zero bps records correct snapshot', (t) => {
+  const { feeSnapshot } = computeSettlementAmounts('500.00', 0);
+  t.equal(feeSnapshot.feeBpsApplied, 0, 'zero fee bps');
+  t.equal(feeSnapshot.discountApplied, 0, 'no discount');
+  t.end();
+});
+
+test('feeSnapshot: survives JSON round-trip', (t) => {
+  const { feeSnapshot } = computeSettlementAmounts('100.123456', 250);
+  const serialised = JSON.stringify(feeSnapshot);
+  const deserialised = JSON.parse(serialised);
+  t.deepEqual(deserialised, feeSnapshot, 'feeSnapshot round-trips correctly');
+  t.end();
+});

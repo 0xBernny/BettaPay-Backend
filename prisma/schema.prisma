@@ -76,6 +76,9 @@ model Settlement {
   // under concurrent requests even if Redis SET NX is unavailable (#240).
   idempotencyKey          String?          @unique
   idempotencyKeyExpiresAt DateTime?
+  // Fee audit snapshot — records the exact fee parameters used at settlement
+  // time for forensic analysis of historical fees (#330).
+  feeSnapshot             Json?
 
   @@index([initiatedAt(sort: Desc)])
   @@index([merchantId, initiatedAt(sort: Desc)])

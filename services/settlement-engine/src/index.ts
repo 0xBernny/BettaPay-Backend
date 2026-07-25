@@ -34,6 +34,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import BigNumber from 'bignumber.js';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { computeSettlementAmounts } from './settlement-amounts.js';
+import { acquireSemaphore, releaseSemaphore, getActiveCount } from './redis-semaphore.js';
 import {
   validateEnvOrExit,
   CreateSettlementBody,
@@ -174,6 +175,12 @@ const feeFallbackCounter = new promClient.Counter({
   labelNames: ['merchant_id'],
 });
 
+const settlementDelayCounter = new promClient.Counter({
+  name: 'settlement_semaphore_delay_total',
+  help: 'Total number of settlements delayed due to per-merchant concurrency limit',
+  labelNames: ['merchant_id'],
+});
+
 fastify.get('/metrics', async (request, reply) => {
   reply.header('Content-Type', promClient.register.contentType);
   return promClient.register.metrics();
@@ -183,6 +190,7 @@ fastify.get('/metrics', async (request, reply) => {
 
 const worker = new Worker('settlements', async job => {
   const settlementId = job.data.id;
+  const merchantId = job.data.merchantId;
 
   if (job.attemptsMade > 0) {
     fastify.log.warn({
@@ -193,29 +201,46 @@ const worker = new Worker('settlements', async job => {
     }, 'Retrying settlement job');
   }
 
+  // ── Per-merchant concurrency semaphore ──────────────────────────────────────
+  const maxRetries = 3;
+  const requeueDelayMs = 5000;
+  let acquired = false;
+
   fastify.log.info({
     jobId: job.id,
-    merchantId: job.data.merchantId,
+    merchantId,
     amount: job.data.grossAmount,
     asset: job.data.asset,
     jobName: job.name,
   }, 'Processing settlement job');
 
-  const settlement = await prisma.settlement.findUnique({ where: { id: settlementId } });
-  if (!settlement) {
-    throw new Error(`Settlement ${settlementId} not found`);
-  }
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    acquired = await acquireSemaphore(redis, merchantId);
+    if (acquired) break;
 
-  // If already in a terminal state, ensure the webhook is (re-)delivered.
-  if (settlement.status === 'completed' || settlement.status === 'failed') {
-    fastify.log.info({ settlementId, status: settlement.status }, 'Settlement already processed, enqueuing webhook');
-    if (settlement.webhookUrl) {
-      await webhookQueue.add('deliver', {
-        url: settlement.webhookUrl,
-        event: { event: `settlement.${settlement.status}`, data: settlement as unknown as Record<string, unknown> },
+    if (attempt < maxRetries) {
+      fastify.log.info({
+        merchantId,
+        settlementId,
+        attempt: attempt + 1,
+        maxRetries,
+      }, 'Settlement delayed: merchant at concurrency limit, re-queuing');
+
+      settlementDelayCounter.inc({ merchant_id: merchantId });
+
+      await settlementQueue.add('process-settlement', job.data, {
+        delay: requeueDelayMs,
+        attempts: job.opts.attempts,
+        backoff: job.opts.backoff,
       });
+      return;
     }
-    return;
+
+    fastify.log.error({
+      merchantId,
+      settlementId,
+    }, 'Settlement failed: merchant concurrency limit exceeded after max retries');
+    throw new Error(`Merchant ${merchantId} at concurrency limit after ${maxRetries} retries`);
   }
 
   try {
@@ -252,6 +277,10 @@ const worker = new Worker('settlements', async job => {
     }
 
     throw error;
+  } finally {
+    if (acquired) {
+      await releaseSemaphore(redis, merchantId).catch(() => {});
+    }
   }
 }, {
   connection: connectionParams,
@@ -579,7 +608,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     }
     const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
 
-    const { grossAmount, feeAmount, netAmount } = computeSettlementAmounts(d.amount, feeBps);
+    const { grossAmount, feeAmount, netAmount, feeSnapshot } = computeSettlementAmounts(d.amount, feeBps);
 
     const rawIdempotencyKey = request.headers['idempotency-key'];
     const idempotencyKey = Array.isArray(rawIdempotencyKey) ? rawIdempotencyKey[0] : rawIdempotencyKey;
@@ -620,6 +649,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
         asset: d.asset,
         status: 'pending',
         webhookUrl,
+        feeSnapshot,
         idempotencyKey: idempotencyKey ?? undefined,
         idempotencyKeyExpiresAt: idempotencyKey ? new Date(Date.now() + 86400_000) : undefined,
       },

@@ -39,6 +39,7 @@ export const ErrorCodes = {
   UNSUPPORTED_CURRENCY_PAIR: 'UNSUPPORTED_CURRENCY_PAIR',
   INVALID_AMOUNT: 'INVALID_AMOUNT',
   INVALID_QUERY: 'INVALID_QUERY',
+  INVALID_ORIGIN: 'INVALID_ORIGIN',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -79,6 +80,10 @@ export const EnvSchema = z.object({
   // Admin API key for privileged endpoints (optional)
   ADMIN_API_KEY: z.string().min(32, 'ADMIN_API_KEY must be at least 32 characters').optional(),
   GOOGLE_CLIENT_ID: z.string().min(1, 'GOOGLE_CLIENT_ID is required'),
+
+  // Google OAuth — optional comma-separated list of allowed email domains.
+  // When set, only emails from these domains can authenticate.
+  ALLOWED_EMAIL_DOMAINS: z.string().optional(),
 
   // Inter-service auth — shared secret presented in the `x-service-token` header
   // on internal (service-to-service) calls. Required so services fail fast
@@ -152,6 +157,7 @@ export const EnvSchema = z.object({
 export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS'> & {
   ALLOWED_ORIGINS: string[];
   CONTRACT_IDS: string[];
+  ALLOWED_EMAIL_DOMAINS: string[];
 };
 
 // For string length issues, appends the received length (e.g. "(got 8)") rather
@@ -184,7 +190,14 @@ export function validateEnv(env: Record<string, unknown>): Env {
       throw new Error('\n[BettaPay] Invalid or missing environment variables:\n  CONTRACT_IDS: at least one contract ID must be provided\n');
     }
 
-    return { ...parsed, ALLOWED_ORIGINS: origins, CONTRACT_IDS: contractIds };
+    return {
+      ...parsed,
+      ALLOWED_ORIGINS: origins,
+      CONTRACT_IDS: contractIds,
+      ALLOWED_EMAIL_DOMAINS: parsed.ALLOWED_EMAIL_DOMAINS
+        ? parsed.ALLOWED_EMAIL_DOMAINS.split(',').map(d => d.trim().toLowerCase()).filter(Boolean)
+        : [],
+    };
   } catch (error) {
     if (error instanceof z.ZodError) {
       const message = error.errors.map((e) => formatEnvIssue(e, env)).join('\n');
