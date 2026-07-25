@@ -25,6 +25,16 @@ export interface SettlementAmounts {
   feeAmount: Amount;
   /** grossAmount − feeAmount, same decimal places as input */
   netAmount: Amount;
+  /** Fee audit snapshot for forensic analysis (#330) */
+  feeSnapshot: FeeAuditSnapshot;
+}
+
+export interface FeeAuditSnapshot {
+  feeBpsApplied: number;
+  maxFeeBpsApplied: number;
+  discountApplied: number;
+  monthlyVolumeAtTime: number;
+  feeVersion: string;
 }
 
 /**
@@ -60,9 +70,18 @@ export function computeSettlementAmounts(
   const feeStr = fee.toFixed(inputDecimals, BigNumber.ROUND_DOWN);
   const netStr = gross.minus(feeStr).toFixed(inputDecimals);
 
+  const feeSnapshot: FeeAuditSnapshot = {
+    feeBpsApplied: feeBps,
+    maxFeeBpsApplied: feeBps,
+    discountApplied: 0,
+    monthlyVolumeAtTime: parseFloat(grossAmountStr),
+    feeVersion: '1.0',
+  };
+
   return {
     grossAmount: grossAmountStr,   // exact original — zero rounding
     feeAmount: feeStr,
     netAmount: netStr,
+    feeSnapshot,
   };
 }
