@@ -51,6 +51,7 @@ import {
   registerErrorHandler,
   registerServiceAuth,
   createAuditLogger,
+  timingSafeStrEqual,
 } from '@bettapay/validation';
 import type { Merchant } from '@prisma/client';
 import type { ApiResponse, PaginatedResponse } from '@bettapay/shared-types';
@@ -270,6 +271,32 @@ fastify.register(async function authRateLimit(childServer) {
 fastify.register(rateLimit, {
   max: 100,
   timeWindow: '1 minute',
+});
+
+// --- Same-origin enforcement --------------------------------------------------
+// Reject cross-origin mutations that lack an explicit CORS preflight.
+// Server-to-server calls (no Origin header, authenticated via x-service-token)
+// are exempt. GET/HEAD are also exempt since they cannot cause state changes.
+const ALLOWED_ORIGINS_SET = new Set(env.ALLOWED_ORIGINS.map(o => o.toLowerCase()));
+
+fastify.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
+  const method = request.method;
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return;
+
+  const origin = request.headers.origin;
+  if (!origin) return;
+
+  const normalised = origin.trim().replace(/\/+$/, '').toLowerCase();
+  const isAllowed = [...ALLOWED_ORIGINS_SET].some(
+    allowed => timingSafeStrEqual(normalised, allowed),
+  );
+
+  if (!isAllowed) {
+    request.log.warn({ origin, method, url: request.url }, 'Rejected cross-origin mutation');
+    return reply
+      .code(403)
+      .send(createErrorResponse(ErrorCodes.INVALID_ORIGIN, 'Request origin is not allowed'));
+  }
 });
 
 // Request body logging for mutation endpoints
@@ -514,12 +541,22 @@ fastify.post<{ Body: GoogleAuthRouteBody }>('/api/auth/google', async (request, 
     });
     const payload = ticket.getPayload();
     if (!payload) {
-      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid token payload'));
+      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Google token verification failed: invalid token payload'));
     }
     const email = payload.email;
     if (!email) {
-      return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Email missing in Google payload'));
+      return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Email missing in Google token payload'));
     }
+
+    if (env.ALLOWED_EMAIL_DOMAINS.length > 0) {
+      const domain = email.split('@')[1]?.toLowerCase();
+      if (!domain || !env.ALLOWED_EMAIL_DOMAINS.includes(domain)) {
+        request.log.info({ email, domain }, '[Auth] Google OAuth rejected: email domain not allowed');
+        return reply.code(403).send(createErrorResponse(ErrorCodes.INVALID_ORIGIN, 'Email domain not allowed', { domain }));
+      }
+    }
+
+    request.log.info({ email }, '[Auth] Google OAuth accepted');
 
     let merchant = await prisma.merchant.findFirst({
       where: { ownerId: email, deletedAt: null }
@@ -539,7 +576,8 @@ fastify.post<{ Body: GoogleAuthRouteBody }>('/api/auth/google', async (request, 
     const jwtToken = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
     return reply.send({ token: jwtToken });
   } catch (err: any) {
-    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid Google token'));
+    request.log.error({ err }, '[Auth] Google OAuth failed');
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Google token verification failed'));
   }
 });
 
