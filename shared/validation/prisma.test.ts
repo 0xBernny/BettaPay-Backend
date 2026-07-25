@@ -32,6 +32,66 @@ test('getPrismaLogLevels excludes query in production', () => {
   process.env.LOG_LEVEL = originalLogLevel;
 });
 
+test('getPrismaLogLevels returns error and warn only in production', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalOverride = process.env.PRISMA_LOG_LEVELS;
+
+  process.env.NODE_ENV = 'production';
+  delete process.env.PRISMA_LOG_LEVELS;
+  assert.deepStrictEqual(getPrismaLogLevels(), ['error', 'warn']);
+
+  process.env.NODE_ENV = originalNodeEnv;
+  process.env.PRISMA_LOG_LEVELS = originalOverride;
+});
+
+test('getPrismaLogLevels returns query, info, warn, error in development', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalOverride = process.env.PRISMA_LOG_LEVELS;
+
+  process.env.NODE_ENV = 'development';
+  delete process.env.PRISMA_LOG_LEVELS;
+  assert.deepStrictEqual(getPrismaLogLevels(), ['query', 'info', 'warn', 'error']);
+
+  process.env.NODE_ENV = originalNodeEnv;
+  process.env.PRISMA_LOG_LEVELS = originalOverride;
+});
+
+test('getPrismaLogLevels returns error only in test', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalOverride = process.env.PRISMA_LOG_LEVELS;
+
+  process.env.NODE_ENV = 'test';
+  delete process.env.PRISMA_LOG_LEVELS;
+  assert.deepStrictEqual(getPrismaLogLevels(), ['error']);
+
+  process.env.NODE_ENV = originalNodeEnv;
+  process.env.PRISMA_LOG_LEVELS = originalOverride;
+});
+
+test('getPrismaLogLevels honors PRISMA_LOG_LEVELS override regardless of NODE_ENV', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalOverride = process.env.PRISMA_LOG_LEVELS;
+
+  process.env.NODE_ENV = 'production';
+  process.env.PRISMA_LOG_LEVELS = 'query, warn';
+  assert.deepStrictEqual(getPrismaLogLevels(), ['query', 'warn']);
+
+  process.env.NODE_ENV = originalNodeEnv;
+  process.env.PRISMA_LOG_LEVELS = originalOverride;
+});
+
+test('getPrismaLogLevels falls back to the NODE_ENV default when the override has no valid levels', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalOverride = process.env.PRISMA_LOG_LEVELS;
+
+  process.env.NODE_ENV = 'test';
+  process.env.PRISMA_LOG_LEVELS = 'not-a-level, also-invalid';
+  assert.deepStrictEqual(getPrismaLogLevels(), ['error']);
+
+  process.env.NODE_ENV = originalNodeEnv;
+  process.env.PRISMA_LOG_LEVELS = originalOverride;
+});
+
 test('connectWithRetry succeeds after transient failures', async () => {
   let attempts = 0;
   const prisma = {

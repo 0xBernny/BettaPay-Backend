@@ -154,6 +154,18 @@ export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_
   CONTRACT_IDS: string[];
 };
 
+// For string length issues, appends the received length (e.g. "(got 8)") rather
+// than the raw value itself, so secrets are never echoed into logs.
+function formatEnvIssue(issue: z.ZodIssue, env: Record<string, unknown>): string {
+  const path = issue.path.join('.');
+  const rawValue = env[path];
+  const detail =
+    (issue.code === 'too_small' || issue.code === 'too_big') && typeof rawValue === 'string'
+      ? ` (got ${rawValue.length})`
+      : '';
+  return `  ${path}: ${issue.message}${detail}`;
+}
+
 export function validateEnv(env: Record<string, unknown>): Env {
   const { origins, error: originsError } = resolveAllowedOrigins(env);
   if (originsError) {
@@ -175,9 +187,21 @@ export function validateEnv(env: Record<string, unknown>): Env {
     return { ...parsed, ALLOWED_ORIGINS: origins, CONTRACT_IDS: contractIds };
   } catch (error) {
     if (error instanceof z.ZodError) {
-      const message = error.errors.map((e) => `  ${e.path.join('.')}: ${e.message}`).join('\n');
+      const message = error.errors.map((e) => formatEnvIssue(e, env)).join('\n');
       throw new Error(`\n[BettaPay] Invalid or missing environment variables:\n${message}\n`);
     }
     throw error;
+  }
+}
+
+// Wraps validateEnv() for use at service startup: logs a single clean,
+// human-readable message (no stack trace) and exits with code 1 on failure,
+// so misconfiguration is caught fast instead of surfacing later at runtime.
+export function validateEnvOrExit(env: Record<string, unknown>): Env {
+  try {
+    return validateEnv(env);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    return process.exit(1);
   }
 }
