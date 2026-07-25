@@ -28,7 +28,7 @@ import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
+import { validateEnvOrExit, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
 import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient, type IndexerClient } from './clients/indexer-client.js';
 import {
@@ -95,7 +95,7 @@ function readIdempotencyKey(request: FastifyRequest): string | null {
 
 const isProduction = process.env.NODE_ENV === 'production';
 
-const env = validateEnv(process.env);
+const env = validateEnvOrExit(process.env);
 const PORT = Number(process.env.PORT ?? '3000');
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);

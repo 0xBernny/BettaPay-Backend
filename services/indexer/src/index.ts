@@ -25,7 +25,7 @@ import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { z } from 'zod';
 import {
-  validateEnv,
+  validateEnvOrExit,
   registerErrorHandler,
   registerRequestId,
   registerServiceAuth,
@@ -46,7 +46,7 @@ import {
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
 
-export const env = validateEnv(process.env);
+export const env = validateEnvOrExit(process.env);
 const PORT = Number(process.env.PORT ?? '3000');
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
