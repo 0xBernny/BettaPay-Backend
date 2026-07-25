@@ -326,6 +326,14 @@ export const CreateSettlementBody = z.object({
   message: 'Provide either amount/asset OR items array, not both',
 });
 
+export const BulkSettlementBody = z.object({
+  merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
+  settlements: z.array(z.object({
+    amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
+    asset: CurrencyCode,
+  })),
+});
+
 export const AuthTokenBody = z.object({
   merchantId: StellarAddressSchema,
   secret: z.string().min(1, 'secret is required'),
@@ -389,6 +397,7 @@ export type DateRangeQuery = z.infer<typeof DateRangeQuery>;
 export type CreateMerchantBody = z.infer<typeof CreateMerchantBody>;
 export type CreatePaymentBody = z.infer<typeof CreatePaymentBody>;
 export type CreateSettlementBody = z.infer<typeof CreateSettlementBody>;
+export type BulkSettlementBody = z.infer<typeof BulkSettlementBody>;
 export type AuthTokenBody = z.infer<typeof AuthTokenBody>;
 export type UpdatePaymentStatusBody = z.infer<typeof UpdatePaymentStatusBody>;
 export type UpdateMerchantSettingsBody = z.infer<typeof UpdateMerchantSettingsBody>;

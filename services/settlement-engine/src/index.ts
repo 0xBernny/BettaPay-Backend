@@ -38,6 +38,7 @@ import { computeSettlementAmounts } from './settlement-amounts.js';
 import {
   validateEnv,
   CreateSettlementBody,
+  BulkSettlementBody,
   registerErrorHandler,
   registerRequestId,
   createErrorResponse,
@@ -632,6 +633,217 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     return reply.code(201).send(settlement);
 });
 
+fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
+  '/api/settlements/bulk',
+  {
+    config: {
+      rateLimit: {
+        max: 30,
+        timeWindow: 60 * 1000,
+      },
+    },
+  },
+  async (request, reply) => {
+    const d = BulkSettlementBody.parse(request.body);
+
+    if (d.settlements.length > 100) {
+      return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch size exceeds maximum limit of 100 settlements'));
+    }
+
+    const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
+    if (!merchant) {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+    }
+
+    const settings = merchant.settings as {
+      webhookUrl?: string;
+      minSettlementAmount?: string;
+      maxSettlementAmount?: string;
+      dailySettlementLimit?: string;
+    } | null | undefined;
+
+    const parsedFeeRule = FeeRule.passthrough().safeParse(merchant?.settings);
+    const feeBps = parsedFeeRule.success ? parsedFeeRule.data.feeBps : env.FEES_DEFAULT_BPS;
+    const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
+
+    // Fetch current daily total
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+
+    const aggregateResult = await prisma.$queryRaw<[{ sum: string | null }]>`
+      SELECT COALESCE(SUM(CAST("totalAmount" AS DECIMAL)), 0)::text as sum
+      FROM "Settlement"
+      WHERE "merchantId" = ${d.merchantId}
+      AND "initiatedAt" >= ${todayStart}
+    `;
+
+    const currentDailyTotal = aggregateResult?.[0]?.sum ? parseFloat(aggregateResult[0].sum) : 0;
+
+    let runningBatchTotal = 0;
+    const validItems: Array<{ amount: string; asset: string; id: string; grossAmount: string; feeAmount: string; netAmount: string }> = [];
+    const errors: Array<{ index: number; reason: string }> = [];
+
+    for (let i = 0; i < d.settlements.length; i++) {
+      const item = d.settlements[i];
+      const amount = parseFloat(item.amount);
+
+      if (isNaN(amount) || amount <= 0) {
+        errors.push({ index: i, reason: 'amount must be greater than zero' });
+        continue;
+      }
+
+      // Check min/max amount limits
+      if (settings?.minSettlementAmount) {
+        const minAmount = parseFloat(settings.minSettlementAmount);
+        if (amount < minAmount) {
+          errors.push({
+            index: i,
+            reason: `Settlement amount ${item.amount} is below minimum ${settings.minSettlementAmount}`
+          });
+          continue;
+        }
+      }
+
+      if (settings?.maxSettlementAmount) {
+        const maxAmount = parseFloat(settings.maxSettlementAmount);
+        if (amount > maxAmount) {
+          errors.push({
+            index: i,
+            reason: `Settlement amount ${item.amount} exceeds maximum ${settings.maxSettlementAmount}`
+          });
+          continue;
+        }
+      }
+
+      // Check daily settlement limits
+      if (settings?.dailySettlementLimit) {
+        const dailyLimit = parseFloat(settings.dailySettlementLimit);
+        if (currentDailyTotal + runningBatchTotal + amount > dailyLimit) {
+          errors.push({
+            index: i,
+            reason: `Daily settlement limit exceeded. Current: ${currentDailyTotal + runningBatchTotal}, Requested: ${amount}, Limit: ${settings.dailySettlementLimit}`
+          });
+          continue;
+        }
+      }
+
+      const { grossAmount, feeAmount, netAmount } = computeSettlementAmounts(item.amount, feeBps);
+      const settlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
+
+      validItems.push({
+        id: settlementId,
+        amount: item.amount,
+        asset: item.asset,
+        grossAmount,
+        feeAmount,
+        netAmount
+      });
+      runningBatchTotal += amount;
+    }
+
+    const batchId = 'batch_' + crypto.randomUUID().replace(/-/g, '');
+
+    if (validItems.length > 0) {
+      await prisma.$transaction(async (tx) => {
+        for (const item of validItems) {
+          await tx.settlement.create({
+            data: {
+              id: item.id,
+              merchantId: d.merchantId,
+              totalAmount: item.grossAmount,
+              grossAmount: item.grossAmount,
+              feeAmount: item.feeAmount,
+              netAmount: item.netAmount,
+              feeBps,
+              asset: item.asset,
+              status: 'pending',
+              webhookUrl,
+              batchId,
+            },
+          });
+        }
+      });
+
+      // Enqueue job for each successfully created settlement record
+      for (const item of validItems) {
+        const jobData: SettlementJobData = {
+          id: item.id,
+          merchantId: d.merchantId,
+          grossAmount: item.grossAmount,
+          asset: item.asset,
+        };
+        await settlementQueue.add('process-settlement', jobData).catch((err) => {
+          request.log.error({ err, settlementId: item.id }, 'Failed to enqueue bulk settlement job');
+        });
+      }
+    }
+
+    return reply.code(201).send({
+      batchId,
+      total: d.settlements.length,
+      created: validItems.length,
+      errors
+    });
+  }
+);
+
+fastify.get<{ Params: { batchId: string } }>(
+  '/api/settlements/batch/:batchId/status',
+  {
+    config: {
+      rateLimit: {
+        max: 60,
+        timeWindow: 60 * 1000,
+      },
+    },
+  },
+  async (request, reply) => {
+    const { batchId } = request.params;
+
+    if (!batchId || !batchId.startsWith('batch_')) {
+      return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid batchId format'));
+    }
+
+    const settlements = await prisma.settlement.findMany({
+      where: { batchId },
+    });
+
+    if (settlements.length === 0) {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, `Batch ${batchId} not found`));
+    }
+
+    const total = settlements.length;
+    let pending = 0;
+    let processing = 0;
+    let completed = 0;
+    let failed = 0;
+
+    for (const s of settlements) {
+      if (s.status === 'pending') pending++;
+      else if (s.status === 'processing') processing++;
+      else if (s.status === 'completed') completed++;
+      else if (s.status === 'failed') failed++;
+    }
+
+    let overallStatus = 'processing';
+    if (completed === total) overallStatus = 'completed';
+    else if (failed === total) overallStatus = 'failed';
+    else if (pending === total) overallStatus = 'pending';
+
+    return {
+      batchId,
+      total,
+      pending,
+      processing,
+      completed,
+      failed,
+      status: overallStatus,
+    };
+  }
+);
+
+
+
 // ============================================================================
 // GRACEFUL SHUTDOWN
 // ============================================================================
@@ -719,4 +931,14 @@ const start = async () => {
   }
 };
 
-start();
+export { fastify, prisma, settlementQueue };
+
+const isDirectRun = 
+  !process.argv[1] || 
+  process.argv[1].endsWith('index.ts') || 
+  process.argv[1].endsWith('index.js') ||
+  process.argv[1].endsWith('dist/index.js');
+
+if (isDirectRun && process.env.NODE_ENV !== 'test') {
+  start();
+}
