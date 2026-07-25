@@ -8,6 +8,7 @@ export const ErrorCodes = {
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   INVALID_REQUEST: 'INVALID_REQUEST',
   REQUEST_TIMEOUT: 'REQUEST_TIMEOUT',
+  INVALID_ORIGIN: 'INVALID_ORIGIN',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
