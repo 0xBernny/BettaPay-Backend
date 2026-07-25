@@ -389,6 +389,7 @@ fastify.get('/api/health', async (_request, reply) => {
     queryDatabase: () => prisma.$queryRaw`SELECT 1`,
     pingRedis: () => redisHealth.ping(),
     getQueueJobCounts: () => webhookQueue.getJobCounts(),
+    getQueueIsPaused: () => webhookQueue.isPaused(),
     getLatestLedger: () => server.getLatestLedger(),
     latestLedgerCursor,
     latestLedgerSequence,

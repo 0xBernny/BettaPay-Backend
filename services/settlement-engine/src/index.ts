@@ -291,6 +291,7 @@ fastify.get('/api/health', async (_request, reply) => {
     queryDatabase: () => prisma.$queryRaw`SELECT 1`,
     pingRedis: () => redis.ping(),
     getQueueJobCounts: () => settlementQueue.getJobCounts(),
+    getQueueIsPaused: () => settlementQueue.isPaused(),
     startTime,
     service: 'settlement-engine',
     version: SERVICE_VERSION,

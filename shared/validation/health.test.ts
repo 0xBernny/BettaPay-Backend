@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   aggregateAllHealth,
   buildHealthResponse,
+  buildSettlementEngineHealthResponse,
+  checkBullMQ,
   computeOverallStatus,
 } from './health.js';
 import type { DependencyHealth, HealthResponse } from './schemas.js';
@@ -103,6 +105,65 @@ test('aggregateAllHealth uses Promise.allSettled and degrades when a downstream 
   assert.equal(aggregated.services['indexer'].status, 'degraded');
   assert.equal(aggregated.services['settlement-engine'].status, 'unhealthy');
   assert.ok(aggregated.services['settlement-engine'].error);
+});
+
+test('checkBullMQ reports queue metrics and connected status under the waiting threshold', async () => {
+  const dep = await checkBullMQ(
+    async () => ({ waiting: 5, active: 1, failed: 0, delayed: 0 }),
+    'bullmq-settlement',
+    undefined,
+    async () => false,
+  );
+
+  assert.equal(dep.status, 'connected');
+  assert.deepEqual(dep.details, {
+    queueName: 'bullmq-settlement',
+    isPaused: false,
+    waiting: 5,
+    active: 1,
+    failed: 0,
+    delayed: 0,
+  });
+});
+
+test('checkBullMQ marks a paused queue as disconnected regardless of job counts', async () => {
+  const dep = await checkBullMQ(
+    async () => ({ waiting: 0, active: 0, failed: 0, delayed: 0 }),
+    'bullmq-webhooks',
+    undefined,
+    async () => true,
+  );
+
+  assert.equal(dep.status, 'disconnected');
+  assert.equal(dep.details?.isPaused, true);
+});
+
+test('buildSettlementEngineHealthResponse degrades when waiting jobs exceed the threshold', async () => {
+  const health = await buildSettlementEngineHealthResponse({
+    queryDatabase: async () => [{ '?column?': 1 }],
+    pingRedis: async () => 'PONG',
+    getQueueJobCounts: async () => ({ waiting: 1001, active: 2, failed: 0, delayed: 0 }),
+    getQueueIsPaused: async () => false,
+    startTime: Date.now(),
+    service: 'settlement-engine',
+    version: '0.1.0',
+  });
+
+  assert.equal(health.status, 'degraded');
+});
+
+test('buildSettlementEngineHealthResponse marks unhealthy when the queue is paused', async () => {
+  const health = await buildSettlementEngineHealthResponse({
+    queryDatabase: async () => [{ '?column?': 1 }],
+    pingRedis: async () => 'PONG',
+    getQueueJobCounts: async () => ({ waiting: 0, active: 0, failed: 0, delayed: 0 }),
+    getQueueIsPaused: async () => true,
+    startTime: Date.now(),
+    service: 'settlement-engine',
+    version: '0.1.0',
+  });
+
+  assert.equal(health.status, 'unhealthy');
 });
 
 test('aggregateAllHealth returns healthy when gateway and downstream services are healthy', async () => {
