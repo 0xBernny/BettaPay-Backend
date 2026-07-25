@@ -908,4 +908,14 @@ const start = async () => {
   }
 };
 
-start();
+export { fastify, prisma, settlementQueue };
+
+const isDirectRun = 
+  !process.argv[1] || 
+  process.argv[1].endsWith('index.ts') || 
+  process.argv[1].endsWith('index.js') ||
+  process.argv[1].endsWith('dist/index.js');
+
+if (isDirectRun && process.env.NODE_ENV !== 'test') {
+  start();
+}
