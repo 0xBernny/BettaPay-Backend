@@ -20,7 +20,7 @@ import { Redis } from 'ioredis';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import {
-  validateEnv,
+  validateEnvOrExit,
   registerErrorHandler,
   registerRequestId,
   registerServiceAuth,
@@ -33,7 +33,7 @@ import {
   readServiceVersion,
 } from '@bettapay/validation';
 
-const env = validateEnv(process.env);
+const env = validateEnvOrExit(process.env);
 const PORT = Number(process.env.PORT ?? '3002');
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);

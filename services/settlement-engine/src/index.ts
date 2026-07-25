@@ -36,7 +36,7 @@ import BigNumber from 'bignumber.js';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { computeSettlementAmounts } from './settlement-amounts.js';
 import {
-  validateEnv,
+  validateEnvOrExit,
   CreateSettlementBody,
   BulkSettlementBody,
   registerErrorHandler,
@@ -58,7 +58,7 @@ import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
 
 
-const env = validateEnv(process.env);
+const env = validateEnvOrExit(process.env);
 const PORT = Number(process.env.PORT ?? '3001');
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
@@ -292,6 +292,7 @@ fastify.get('/api/health', async (_request, reply) => {
     queryDatabase: () => prisma.$queryRaw`SELECT 1`,
     pingRedis: () => redis.ping(),
     getQueueJobCounts: () => settlementQueue.getJobCounts(),
+    getQueueIsPaused: () => settlementQueue.isPaused(),
     startTime,
     service: 'settlement-engine',
     version: SERVICE_VERSION,
