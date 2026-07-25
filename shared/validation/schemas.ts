@@ -107,6 +107,13 @@ export const settlementSchema = z.object({
   initiatedAt: isoDateString,
   completedAt: isoDateString.optional(),
   status: z.enum(['pending','processing','completed','failed']),
+  feeSnapshot: z.object({
+    feeBpsApplied: z.number(),
+    maxFeeBpsApplied: z.number(),
+    discountApplied: z.number(),
+    monthlyVolumeAtTime: z.number(),
+    feeVersion: z.string(),
+  }).optional(),
 });
 
 export const fxQuoteSchema = z.object({
