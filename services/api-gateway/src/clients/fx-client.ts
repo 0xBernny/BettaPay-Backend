@@ -1,4 +1,5 @@
 import { propagateTracingHeaders } from '@bettapay/validation';
+import { defaultInterServiceMetrics, type InterServiceMetrics } from './inter-service-metrics.js';
 
 type IncomingHeaders = Record<string, string | string[] | undefined>;
 
@@ -32,6 +33,7 @@ export interface FxClientOptions {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
   logger?: MinimalLogger;
+  metrics?: InterServiceMetrics;
 }
 
 export interface FxClient {
@@ -47,9 +49,12 @@ export function createFxClient(options: FxClientOptions): FxClient {
     timeoutMs = DEFAULT_FX_TIMEOUT_MS,
     fetchImpl = fetch,
     logger,
+    metrics = defaultInterServiceMetrics,
   } = options;
 
   const root = baseUrl.replace(/\/+$/, '');
+  const TARGET = 'fx-service';
+  const ENDPOINT = '/api/quote';
 
   async function getQuote(
     quoteRequest: FxQuoteRequest,
@@ -78,11 +83,15 @@ export function createFxClient(options: FxClientOptions): FxClient {
 
     try {
       const res = await fetchImpl(url, { signal: controller.signal, headers });
-      const durationMs = Date.now() - startedAt;
+      const durationSeconds = (Date.now() - startedAt) / 1000;
+      const statusCode = String(res.status);
+
+      metrics.duration.observe({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode }, durationSeconds);
 
       if (!res.ok) {
+        metrics.failures.inc({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode });
         logger?.warn(
-          { status: res.status, durationMs, from: quoteRequest.from, to: quoteRequest.to },
+          { status: res.status, durationMs: durationSeconds * 1000, from: quoteRequest.from, to: quoteRequest.to },
           'fx-client: non-OK quote response - continuing without quote',
         );
         return null;
@@ -90,11 +99,18 @@ export function createFxClient(options: FxClientOptions): FxClient {
 
       const body = (await res.json()) as FxQuoteResponse;
       logger?.info?.(
-        { durationMs, from: quoteRequest.from, to: quoteRequest.to },
+        { durationMs: durationSeconds * 1000, from: quoteRequest.from, to: quoteRequest.to },
         'fx-client: quote fetched',
       );
       return body;
     } catch (err) {
+      const durationSeconds = (Date.now() - startedAt) / 1000;
+      const isTimeout = err instanceof Error && err.name === 'AbortError';
+      const statusCode = isTimeout ? 'timeout' : 'network_error';
+
+      metrics.failures.inc({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode });
+      metrics.duration.observe({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode }, durationSeconds);
+
       logger?.warn(
         { err, from: quoteRequest.from, to: quoteRequest.to },
         'fx-client: quote request failed - continuing without quote',

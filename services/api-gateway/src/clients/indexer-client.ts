@@ -18,6 +18,7 @@
 
 import type { IndexedEvent, EventType } from '@bettapay/validation';
 import { propagateTracingHeaders } from '@bettapay/validation';
+import { defaultInterServiceMetrics, type InterServiceMetrics } from './inter-service-metrics.js';
 
 type IncomingHeaders = Record<string, string | string[] | undefined>;
 
@@ -47,6 +48,8 @@ export interface IndexerClientOptions {
   fetchImpl?: typeof fetch;
   /** Optional logger for degradation diagnostics. */
   logger?: MinimalLogger;
+  /** Optional metrics instance (defaults to shared singleton). */
+  metrics?: InterServiceMetrics;
 }
 
 export const DEFAULT_INDEXER_TIMEOUT_MS = 5_000;
@@ -74,6 +77,7 @@ export function createIndexerClient(options: IndexerClientOptions): IndexerClien
     timeoutMs = DEFAULT_INDEXER_TIMEOUT_MS,
     fetchImpl = fetch,
     logger,
+    metrics = defaultInterServiceMetrics,
   } = options;
 
   const root = baseUrl.replace(/\/+$/, '');
@@ -81,6 +85,9 @@ export function createIndexerClient(options: IndexerClientOptions): IndexerClien
   const authHeaders: Record<string, string> = serviceToken
     ? { 'x-service-token': serviceToken }
     : {};
+
+  const TARGET = 'indexer';
+  const ENDPOINT = '/api/events';
 
   async function getPaymentEvents(
     merchantId: string,
@@ -98,11 +105,17 @@ export function createIndexerClient(options: IndexerClientOptions): IndexerClien
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const startedAt = Date.now();
 
     try {
       const res = await fetchImpl(url, { signal: controller.signal, headers });
+      const durationSeconds = (Date.now() - startedAt) / 1000;
+      const statusCode = String(res.status);
+
+      metrics.duration.observe({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode }, durationSeconds);
 
       if (!res.ok) {
+        metrics.failures.inc({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode });
         logger?.warn(
           { status: res.status, merchantId },
           'indexer-client: non-OK response — returning no events',
@@ -117,6 +130,13 @@ export function createIndexerClient(options: IndexerClientOptions): IndexerClien
     } catch (err) {
       // Timeout (AbortError), network failure, or malformed JSON all degrade to
       // "no events available" rather than failing the payment lookup.
+      const durationSeconds = (Date.now() - startedAt) / 1000;
+      const isTimeout = err instanceof Error && err.name === 'AbortError';
+      const statusCode = isTimeout ? 'timeout' : 'network_error';
+
+      metrics.failures.inc({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode });
+      metrics.duration.observe({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode }, durationSeconds);
+
       logger?.warn(
         { err, merchantId },
         'indexer-client: request failed — degrading without events',
