@@ -17,6 +17,7 @@ export * from './webhookSchema.js';
 export * from './health.js';
 export * from './audit.js';
 export * from './redis.js';
+export * from './metrics-server.js';
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {

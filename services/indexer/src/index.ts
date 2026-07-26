@@ -46,8 +46,10 @@ import {
   createRedisClient,
   waitForRedis,
   startRedisMemoryMonitor,
+  startMetricsServer,
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
+import * as promClient from 'prom-client';
 
 export const env = validateEnvOrExit(process.env);
 const PORT = Number(process.env.PORT ?? '3000');
@@ -81,6 +83,17 @@ registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 fastify.register(rateLimit, {
   max: 500,
   timeWindow: '1 minute'
+});
+
+// Served on its own port (see startMetricsServer below), not on the
+// application port — keeps the scrape endpoint unauthenticated without
+// exposing it alongside application traffic.
+promClient.collectDefaultMetrics();
+const metricsServer = startMetricsServer({
+  appPort: PORT,
+  contentType: promClient.register.contentType,
+  getMetrics: () => promClient.register.metrics(),
+  log: fastify.log,
 });
 
 let latestLedgerCursor: number | undefined = undefined;
@@ -706,6 +719,7 @@ process.on('SIGTERM', async () => {
   await webhookQueue.close();
   await closeWorkerWithTimeout(webhookWorker, 'indexer-webhooks', fastify.log, getActiveWebhookJob);
   await fastify.close();
+  await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
   process.exit(0);
 });
 

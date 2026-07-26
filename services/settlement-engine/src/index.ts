@@ -57,6 +57,7 @@ import {
   createRedisClient,
   waitForRedis,
   startRedisMemoryMonitor,
+  startMetricsServer,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
@@ -183,9 +184,14 @@ const settlementDelayCounter = new promClient.Counter({
   labelNames: ['merchant_id'],
 });
 
-fastify.get('/metrics', async (request, reply) => {
-  reply.header('Content-Type', promClient.register.contentType);
-  return promClient.register.metrics();
+// Served on its own port (see startMetricsServer below), not on the
+// application port — keeps the scrape endpoint unauthenticated without
+// exposing it alongside application traffic.
+const metricsServer = startMetricsServer({
+  appPort: PORT,
+  contentType: promClient.register.contentType,
+  getMetrics: () => promClient.register.metrics(),
+  log: fastify.log,
 });
 
 // ── Database & Redis Setup ───────────────────────────────────────────────────────
@@ -909,6 +915,9 @@ async function gracefulShutdown(signal: string): Promise<void> {
     fastify.log.info('Closing Fastify server...');
     await fastify.close();
     fastify.log.info('Fastify server closed');
+
+    // 1b. Close the metrics server
+    await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
 
     // 2. Close BullMQ worker (drain and close gracefully, force-stop after 10s)
     fastify.log.info('Closing BullMQ worker...');
