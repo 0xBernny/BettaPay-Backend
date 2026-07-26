@@ -18,6 +18,7 @@ export * from './health.js';
 export * from './audit.js';
 export * from './redis.js';
 export * from './metrics-server.js';
+export * from './feature-flags.js';
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {
@@ -66,6 +67,11 @@ export function createErrorResponse(code: string, message: string, details?: unk
 export const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.string().transform((s) => parseInt(s, 10)).default('3000'),
+
+  // Feature flags — comma-separated list of enabled flag names, e.g.
+  // "new_settlement_flow,enhanced_fx_quotes". An absent or empty value means
+  // all flags are disabled. Flag names are matched case-insensitively.
+  FEATURE_FLAGS: z.string().optional(),
 
   // Logging — pino level for the shared logger config (#119).
   LOG_LEVEL: z
@@ -155,10 +161,11 @@ export const EnvSchema = z.object({
   ),
 });
 
-export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS'> & {
+export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS' | 'FEATURE_FLAGS'> & {
   ALLOWED_ORIGINS: string[];
   CONTRACT_IDS: string[];
   ALLOWED_EMAIL_DOMAINS: string[];
+  FEATURE_FLAGS: string[];
 };
 
 // For string length issues, appends the received length (e.g. "(got 8)") rather
@@ -197,6 +204,9 @@ export function validateEnv(env: Record<string, unknown>): Env {
       CONTRACT_IDS: contractIds,
       ALLOWED_EMAIL_DOMAINS: parsed.ALLOWED_EMAIL_DOMAINS
         ? parsed.ALLOWED_EMAIL_DOMAINS.split(',').map(d => d.trim().toLowerCase()).filter(Boolean)
+        : [],
+      FEATURE_FLAGS: parsed.FEATURE_FLAGS
+        ? parsed.FEATURE_FLAGS.split(',').map(f => f.trim().toLowerCase()).filter(Boolean)
         : [],
     };
   } catch (error) {
