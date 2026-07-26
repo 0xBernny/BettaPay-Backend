@@ -73,6 +73,14 @@ export const EnvSchema = z.object({
   // all flags are disabled. Flag names are matched case-insensitively.
   FEATURE_FLAGS: z.string().optional(),
 
+  // Two-tier upstream timeouts.
+  // READ_TIMEOUT_MS caps idempotent GET calls (fx quotes, indexer events) so
+  // the gateway fails fast during upstream read outages. Default: 2 s.
+  // WRITE_TIMEOUT_MS caps mutation calls (POST settlements) where the
+  // downstream service may need longer to commit. Default: 30 s.
+  READ_TIMEOUT_MS: z.string().transform((s) => parseInt(s, 10)).default('2000'),
+  WRITE_TIMEOUT_MS: z.string().transform((s) => parseInt(s, 10)).default('30000'),
+
   // Logging — pino level for the shared logger config (#119).
   LOG_LEVEL: z
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])

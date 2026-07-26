@@ -52,7 +52,7 @@ export interface IndexerClientOptions {
   metrics?: InterServiceMetrics;
 }
 
-export const DEFAULT_INDEXER_TIMEOUT_MS = 5_000;
+export const DEFAULT_INDEXER_TIMEOUT_MS = 2_000;
 
 /** Event type identifying a completed payment on-chain. */
 export const PAYMENT_COMPLETED_TYPE: EventType = 'PaymentCompleted';
@@ -137,9 +137,13 @@ export function createIndexerClient(options: IndexerClientOptions): IndexerClien
       metrics.failures.inc({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode });
       metrics.duration.observe({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode }, durationSeconds);
 
+      // Circuit-breaker log: distinguish fast read-timeout from other failures
+      // so the outage is always visible in logs even though we degrade gracefully.
       logger?.warn(
-        { err, merchantId },
-        'indexer-client: request failed — degrading without events',
+        { err, merchantId, timedOut: isTimeout },
+        isTimeout
+          ? 'indexer-client: read timeout — degrading without events'
+          : 'indexer-client: request failed — degrading without events',
       );
       return null;
     } finally {

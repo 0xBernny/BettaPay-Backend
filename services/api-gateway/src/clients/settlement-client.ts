@@ -29,7 +29,7 @@ export interface SettlementClient {
   ): Promise<SettlementClientResult>;
 }
 
-export const DEFAULT_SETTLEMENT_TIMEOUT_MS = 5_000;
+export const DEFAULT_SETTLEMENT_TIMEOUT_MS = 30_000;
 
 export class SettlementEngineUnavailableError extends Error {
   constructor(message: string) {
