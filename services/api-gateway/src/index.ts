@@ -28,7 +28,8 @@ import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { validateEnvOrExit, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor } from '@bettapay/validation';
+import { validateEnvOrExit, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor, startMetricsServer } from '@bettapay/validation';
+import * as promClient from 'prom-client';
 import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient, type IndexerClient } from './clients/indexer-client.js';
 import {
@@ -140,6 +141,11 @@ export function getDefaultPrisma(): PrismaClient {
   }
   return defaultPrisma;
 }
+
+// Set by buildApp() when it creates the app's Redis client — shutdown()/start()
+// (defined after buildApp, at module scope) need it but don't have their own
+// handle on the instance buildApp created internally.
+let sharedRedis: ReturnType<typeof createRedisClient> | null = null;
 
 // --- Response logging hooks -------------------------------------------------
 const SENSITIVE_FIELDS = new Set(['token', 'secret', 'secretHash', 'password', 'privateKey', 'secretKey']);
@@ -350,6 +356,7 @@ registerGatewayHealthRoutes({
 // --- Wallet Auth Challenge Store ----------------------------------------------
 // #386 — exponential backoff retry strategy
 const redis = createRedisClient(env.REDIS_URL, fastify.log);
+sharedRedis = redis;
 
 fastify.get<{ Querystring: WalletChallengeQuery }>('/api/auth/wallet/challenge', {
   config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
@@ -1105,19 +1112,27 @@ fastify.get('/api/quote', async (request, reply) => {
 
 // Graceful shutdown
 let mainApp: ReturnType<typeof Fastify> | null = null;
+let metricsServer: ReturnType<typeof startMetricsServer> | null = null;
 let shuttingDown = false;
 
 async function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  fastify.log.info(`Received ${signal}, shutting down gracefully...`);
+  const app = mainApp!;
+  app.log.info(`Received ${signal}, shutting down gracefully...`);
 
   try {
-    await fastify.close();
-    await prisma.$disconnect();
+    await app.close();
+    if (metricsServer) {
+      await new Promise<void>((resolve) => metricsServer!.close(() => resolve()));
+    }
+    await getDefaultPrisma().$disconnect();
     stopAbandonedPaymentsCron();
     process.exit(0);
+  } catch (err) {
+    app.log.error(err, 'Error during shutdown');
+    process.exit(1);
   }
 }
 
@@ -1126,17 +1141,21 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 const start = async () => {
   try {
+    const app = mainApp!;
+    const prisma = getDefaultPrisma();
+    const redis = sharedRedis!;
+
     // #391 — wait for dependencies before accepting traffic
-    await connectWithRetry(prisma, fastify.log);
-    await waitForRedis(redis, fastify.log);
+    await connectWithRetry(prisma, app.log);
+    await waitForRedis(redis, app.log);
 
     // #387 — Redis memory monitoring
-    startRedisMemoryMonitor(redis, fastify.log);
+    startRedisMemoryMonitor(redis, app.log);
 
     if (process.env.NODE_ENV !== 'test') {
-      startAbandonedPaymentsCron(prisma, fastify.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24);
+      startAbandonedPaymentsCron(prisma, app.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24);
     }
-    await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    await app.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {
     if (mainApp) mainApp.log.error(err);
     else console.error(err);
@@ -1146,6 +1165,20 @@ const start = async () => {
 
 const isDirectRun = Boolean(process.argv[1] && (process.argv[1].endsWith('index.ts') || process.argv[1].endsWith('index.js')));
 if (isDirectRun) {
+  mainApp = buildApp();
+
+  // Served on its own port (see startMetricsServer), not the application
+  // port — keeps the scrape endpoint unauthenticated without exposing it
+  // alongside application traffic. Started only for the real server process,
+  // not when buildApp() is called directly by tests.
+  promClient.collectDefaultMetrics();
+  metricsServer = startMetricsServer({
+    appPort: PORT,
+    contentType: promClient.register.contentType,
+    getMetrics: () => promClient.register.metrics(),
+    log: mainApp.log,
+  });
+
   start();
 }
 

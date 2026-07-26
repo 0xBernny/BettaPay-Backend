@@ -36,7 +36,7 @@ Common workflow:
 
 The repository uses **GitHub Actions** to automatically validate every pull request and push to the default branch.
 
-- **Jobs executed**: lint, type‑check, test, dependency audit, and PR title validation (Conventional Commits).
+- **Jobs executed**: lint, type‑check, test, migration rollback test, dependency audit, and PR title validation (Conventional Commits).
 - **Caching**: pnpm store is cached to speed up installations.
 - **Node.js version**: 20 (configured in the workflow).
 
@@ -56,6 +56,7 @@ When merging to `main` (or the default branch), enable branch protection with th
 - `lint`
 - `type-check`
 - `test`
+- `migration-rollback-test`
 - `audit`
 - `pr-title`
 Additionally, require at least one approving review and restrict force‑pushes on the protected branch.

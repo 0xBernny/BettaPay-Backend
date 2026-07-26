@@ -18,6 +18,7 @@ import cors from '@fastify/cors';
 import crypto from 'crypto';
 import { Queue, Worker } from 'bullmq';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
+import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { PrismaClient, WebhookSubscription } from '@prisma/client';
 import { rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
 import pg from 'pg';
@@ -45,8 +46,10 @@ import {
   createRedisClient,
   waitForRedis,
   startRedisMemoryMonitor,
+  startMetricsServer,
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
+import * as promClient from 'prom-client';
 
 export const env = validateEnvOrExit(process.env);
 const PORT = Number(process.env.PORT ?? '3000');
@@ -82,6 +85,17 @@ fastify.register(rateLimit, {
   timeWindow: '1 minute'
 });
 
+// Served on its own port (see startMetricsServer below), not on the
+// application port — keeps the scrape endpoint unauthenticated without
+// exposing it alongside application traffic.
+promClient.collectDefaultMetrics();
+const metricsServer = startMetricsServer({
+  appPort: PORT,
+  contentType: promClient.register.contentType,
+  getMetrics: () => promClient.register.metrics(),
+  log: fastify.log,
+});
+
 let latestLedgerCursor: number | undefined = undefined;
 let latestLedgerSequence: number | undefined = undefined;
 const BASE_BACKOFF = 1000;
@@ -110,6 +124,7 @@ const webhookWorker = createWebhookWorker('indexer-webhooks', connectionParams, 
     error: (obj, msg) => fastify.log.error(obj, msg),
   },
 });
+const getActiveWebhookJob = trackActiveJob(webhookWorker);
 
 // #386 — exponential backoff retry strategy
 const redisHealth = createRedisClient(env.REDIS_URL, fastify.log);
@@ -271,6 +286,7 @@ const replayWorker = new Worker(
     concurrency: 1,
   },
 );
+const getActiveReplayJob = trackActiveJob(replayWorker);
 
 replayWorker.on('error', (err) => {
   fastify.log.error({ err: err.message }, '[Indexer] Replay worker error');
@@ -698,11 +714,12 @@ const start = async () => {
 process.on('SIGTERM', async () => {
   await prisma.$disconnect();
   await replayQueue.close();
-  await replayWorker.close();
+  await closeWorkerWithTimeout(replayWorker, 'indexer-replays', fastify.log, getActiveReplayJob);
   await replayProgressRedis.quit().catch(() => {});
   await webhookQueue.close();
-  await webhookWorker.close();
+  await closeWorkerWithTimeout(webhookWorker, 'indexer-webhooks', fastify.log, getActiveWebhookJob);
   await fastify.close();
+  await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
   process.exit(0);
 });
 

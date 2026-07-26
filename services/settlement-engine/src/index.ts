@@ -35,6 +35,7 @@ import BigNumber from 'bignumber.js';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { computeSettlementAmounts } from './settlement-amounts.js';
 import { acquireSemaphore, releaseSemaphore, getActiveCount } from './redis-semaphore.js';
+import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import {
   validateEnvOrExit,
   CreateSettlementBody,
@@ -56,6 +57,7 @@ import {
   createRedisClient,
   waitForRedis,
   startRedisMemoryMonitor,
+  startMetricsServer,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
@@ -167,6 +169,7 @@ const webhookWorker = createWebhookWorker('settlement-webhooks', connectionParam
     error: (obj, msg) => fastify.log.error(obj, msg),
   },
 });
+const getActiveWebhookJob = trackActiveJob(webhookWorker);
 
 // ── Metrics ─────────────────────────────────────────────────────────────────
 const feeFallbackCounter = new promClient.Counter({
@@ -181,9 +184,14 @@ const settlementDelayCounter = new promClient.Counter({
   labelNames: ['merchant_id'],
 });
 
-fastify.get('/metrics', async (request, reply) => {
-  reply.header('Content-Type', promClient.register.contentType);
-  return promClient.register.metrics();
+// Served on its own port (see startMetricsServer below), not on the
+// application port — keeps the scrape endpoint unauthenticated without
+// exposing it alongside application traffic.
+const metricsServer = startMetricsServer({
+  appPort: PORT,
+  contentType: promClient.register.contentType,
+  getMetrics: () => promClient.register.metrics(),
+  log: fastify.log,
 });
 
 // ── Database & Redis Setup ───────────────────────────────────────────────────────
@@ -286,6 +294,8 @@ const worker = new Worker('settlements', async job => {
   connection: connectionParams,
   concurrency: 5,
 });
+
+const getActiveSettlementJob = trackActiveJob(worker);
 
 worker.on('failed', async (job, err) => {
   if (job) {
@@ -906,16 +916,19 @@ async function gracefulShutdown(signal: string): Promise<void> {
     await fastify.close();
     fastify.log.info('Fastify server closed');
 
-    // 2. Close BullMQ worker (drain and close gracefully)
+    // 1b. Close the metrics server
+    await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
+
+    // 2. Close BullMQ worker (drain and close gracefully, force-stop after 10s)
     fastify.log.info('Closing BullMQ worker...');
-    await worker.close();
+    await closeWorkerWithTimeout(worker, 'settlements', fastify.log, getActiveSettlementJob);
     fastify.log.info('BullMQ worker closed');
 
     // 3. Close BullMQ queues
     fastify.log.info('Closing BullMQ queues...');
     await settlementQueue.close();
     await settlementDLQ.close();
-    await webhookWorker.close();
+    await closeWorkerWithTimeout(webhookWorker, 'settlement-webhooks', fastify.log, getActiveWebhookJob);
     await webhookQueue.close();
     fastify.log.info('BullMQ queues closed');
 
