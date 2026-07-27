@@ -448,7 +448,7 @@ fastify.get('/api/events', { preValidation: [fastify.serviceAuth] }, async (requ
   ]);
 
   const hasMore = offset + limit < total;
-  return { events: dbEvents, total, limit, offset, hasMore, latestLedgerCursor };
+  return { data: dbEvents, pagination: { total, limit, offset, hasMore }, latestLedgerCursor };
 });
 
 // Issue #68 — replay historical events for a ledger range (all contracts)

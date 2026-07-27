@@ -701,7 +701,7 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantSetti
     return merchantUpdate;
   });
 
-  return reply.code(200).send({ success: true, merchant: updated });
+  return reply.code(200).send({ data: { merchant: updated } });
 });
 
 // Payments
@@ -735,7 +735,7 @@ fastify.post<{ Body: z.infer<typeof CreatePaymentBody> }>('/api/payments', {
         { idempotencyKey, paymentId: existing.id },
         'Idempotency hit — returning cached payment'
       );
-      return reply.code(200).send(existing);
+      return reply.code(200).send({ data: existing });
     }
   }
 
@@ -790,10 +790,10 @@ fastify.post<{ Body: z.infer<typeof CreatePaymentBody> }>('/api/payments', {
     );
 
     if (d.convertTo) {
-      return reply.code(201).send({ ...payment, fxQuote });
+      return reply.code(201).send({ data: { ...payment, fxQuote } });
     }
 
-    return reply.code(201).send(payment);
+    return reply.code(201).send({ data: payment });
 });
 
 fastify.get<{ Params: { id: string }; Querystring: { includeEvents?: string } }>('/api/payments/:id', async (request, reply) => {
@@ -807,10 +807,10 @@ fastify.get<{ Params: { id: string }; Querystring: { includeEvents?: string } }>
   if (request.query.includeEvents === 'true') {
     // Forward tracing headers so the indexer call is part of the same trace (#118).
     const events = await indexerClient.getPaymentEvents(payment.merchantId, request.headers);
-    return { ...payment, events };
+    return { data: { ...payment, events } };
   }
 
-  return payment;
+  return { data: payment };
 });
 
 // Enforce valid status transitions. The DB enum and Prisma allow any status, so
@@ -842,7 +842,7 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdatePaymentStatus
     await logAuditEvent('payment.status.changed', 'payment', paymentUpdate.id, { before: payment, after: paymentUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
     return paymentUpdate;
   });
-  return reply.send(updated);
+  return reply.send({ data: updated });
 });
 
 fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementStatusBody> }>('/api/settlements/:id/status', {
@@ -888,7 +888,7 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementSta
     await logAuditEvent('settlement.status.changed', 'settlement', settlementUpdate.id, { before: settlement, after: settlementUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
     return settlementUpdate;
   });
-  return reply.send(updated);
+  return reply.send({ data: updated });
 });
 
 // Settlements
@@ -1074,25 +1074,27 @@ fastify.get('/api/admin/audit-log', {
     prisma.auditLog.count({ where }),
   ]);
 
-  return reply.send({ logs: rows, total, limit, offset, hasMore: offset + limit < total });
+  return reply.send({ data: rows, pagination: { total, limit, offset, hasMore: offset + limit < total } });
 });
 
 fastify.get('/api/deployments', async (request, reply) => {
   return {
-    network: env.STELLAR_NETWORK_PASSPHRASE,
-    contracts: [
-      {
-        name: 'Settlement contract',
-        contractId: env.SETTLEMENT_CONTRACT_ID,
-        explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.SETTLEMENT_CONTRACT_ID}`,
-      },
-      {
-        name: 'Governance contract',
-        contractId: env.GOVERNANCE_CONTRACT_ID,
-        explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.GOVERNANCE_CONTRACT_ID}`,
-      },
-    ],
-    updatedAt: new Date().toISOString(),
+    data: {
+      network: env.STELLAR_NETWORK_PASSPHRASE,
+      contracts: [
+        {
+          name: 'Settlement contract',
+          contractId: env.SETTLEMENT_CONTRACT_ID,
+          explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.SETTLEMENT_CONTRACT_ID}`,
+        },
+        {
+          name: 'Governance contract',
+          contractId: env.GOVERNANCE_CONTRACT_ID,
+          explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.GOVERNANCE_CONTRACT_ID}`,
+        },
+      ],
+      updatedAt: new Date().toISOString(),
+    },
   };
 });
 
