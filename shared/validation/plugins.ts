@@ -27,12 +27,43 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
       return reply.code(fastifyErr.statusCode!).send(response);
     }
 
-    // Generic fallback for unhandled errors
-    logger.error({ err: error, reqId: request.id }, 'Unhandled internal error');
+    // Generic fallback for unhandled errors — assign a referenceId so the
+    // client can quote it when reporting the problem, and the server log entry
+    // ties back to exactly that request.
+    const referenceId = crypto.randomUUID();
+    logger.error(
+      { err: error, reqId: request.id, referenceId, stack: error.stack },
+      'Unhandled internal error',
+    );
 
-    // In production, do not leak stack traces or internal details
-    const response = createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error');
-    return reply.code(500).send(response);
+    return reply.code(500).send({
+      error: 'Internal Server Error',
+      statusCode: 500,
+      referenceId,
+    });
+  });
+
+  // Belt-and-suspenders: Fastify's onError lifecycle hook fires after the
+  // error handler has run. We use it to catch any error that reaches this
+  // stage without already having been converted to a response (e.g. errors
+  // thrown inside reply serialization or other hooks). If the reply has
+  // already been sent this is a no-op.
+  fastify.addHook('onError', async (request, reply, error) => {
+    if (reply.sent) return;
+
+    const logger = customLogger || request.log || fastify.log;
+    const referenceId = crypto.randomUUID();
+
+    logger.error(
+      { err: error, reqId: request.id, referenceId, stack: error.stack },
+      'Panic recovery: unhandled error reached onError hook',
+    );
+
+    return reply.code(500).send({
+      error: 'Internal Server Error',
+      statusCode: 500,
+      referenceId,
+    });
   });
 }
 

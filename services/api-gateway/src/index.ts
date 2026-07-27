@@ -28,10 +28,11 @@ import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { validateEnvOrExit, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor, startMetricsServer } from '@bettapay/validation';
+import { validateEnvOrExit, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor, startMetricsServer, logFeatureFlags } from '@bettapay/validation';
 import * as promClient from 'prom-client';
 import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient, type IndexerClient } from './clients/indexer-client.js';
+import { UpstreamReadTimeoutError } from './upstream-fetch.js';
 import {
   createSettlementClient,
   SettlementEngineUnavailableError,
@@ -225,16 +226,19 @@ export function buildApp(opts: AppOptions = {}) {
     baseUrl: env.INDEXER_URL,
     serviceToken: env.INTER_SERVICE_SECRET,
     logger: fastify.log,
+    timeoutMs: env.READ_TIMEOUT_MS,
   });
   const settlementClient = opts.settlementClient ?? createSettlementClient({
     baseUrl: env.SETTLEMENT_ENGINE_URL,
     serviceToken: env.INTER_SERVICE_SECRET,
     logger: fastify.log,
+    timeoutMs: env.WRITE_TIMEOUT_MS,
   });
   const fxClient = opts.fxClient ?? createFxClient({
     baseUrl: env.FX_ENGINE_URL,
     serviceToken: env.INTER_SERVICE_SECRET,
     logger: fastify.log,
+    timeoutMs: env.READ_TIMEOUT_MS,
   });
   const logAuditEvent = createAuditLogger(prisma as unknown as Parameters<typeof createAuditLogger>[0], fastify.log);
 
@@ -740,12 +744,27 @@ fastify.post<{ Body: z.infer<typeof CreatePaymentBody> }>('/api/payments', {
     ? new Date(Date.now() + IDEMPOTENCY_TTL_MS)
     : null;
 
-    const fxQuote = d.convertTo
-      ? await fxClient.getQuote(
+    let fxQuote: Awaited<ReturnType<typeof fxClient.getQuote>> = null;
+    if (d.convertTo) {
+      try {
+        fxQuote = await fxClient.getQuote(
           { from: d.asset, to: d.convertTo, amount: d.amount },
           request.headers,
-        )
-      : null;
+        );
+      } catch (err) {
+        if (err instanceof UpstreamReadTimeoutError) {
+          request.log.warn(
+            { service: err.service, endpoint: err.endpoint },
+            'fx-service read timeout — no cached quote available, returning 503',
+          );
+          return reply
+            .code(503)
+            .header('Retry-After', '5')
+            .send(createErrorResponse(ErrorCodes.GATEWAY_TIMEOUT, 'FX service temporarily unavailable, please retry'));
+        }
+        throw err;
+      }
+    }
 
     const payment = await prisma.$transaction(async (tx) => {
       const created = await tx.payment.create({
@@ -1179,6 +1198,7 @@ if (isDirectRun) {
     log: mainApp.log,
   });
 
+  logFeatureFlags(mainApp.log);
   start();
 }
 

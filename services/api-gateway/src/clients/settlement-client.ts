@@ -1,4 +1,5 @@
 import { propagateTracingHeaders } from '@bettapay/validation';
+import { defaultInterServiceMetrics, type InterServiceMetrics } from './inter-service-metrics.js';
 
 type IncomingHeaders = Record<string, string | string[] | undefined>;
 
@@ -12,6 +13,7 @@ export interface SettlementClientOptions {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
   logger?: MinimalLogger;
+  metrics?: InterServiceMetrics;
 }
 
 export interface SettlementClientResult {
@@ -27,7 +29,7 @@ export interface SettlementClient {
   ): Promise<SettlementClientResult>;
 }
 
-export const DEFAULT_SETTLEMENT_TIMEOUT_MS = 5_000;
+export const DEFAULT_SETTLEMENT_TIMEOUT_MS = 30_000;
 
 export class SettlementEngineUnavailableError extends Error {
   constructor(message: string) {
@@ -43,12 +45,16 @@ export function createSettlementClient(options: SettlementClientOptions): Settle
     timeoutMs = DEFAULT_SETTLEMENT_TIMEOUT_MS,
     fetchImpl = fetch,
     logger,
+    metrics = defaultInterServiceMetrics,
   } = options;
 
   const root = baseUrl.replace(/\/+$/, '');
   const authHeaders: Record<string, string> = serviceToken
     ? { 'x-service-token': serviceToken }
     : {};
+
+  const TARGET = 'settlement-engine';
+  const ENDPOINT = '/api/settlements';
 
   async function createSettlement(
     payload: unknown,
@@ -62,6 +68,7 @@ export function createSettlementClient(options: SettlementClientOptions): Settle
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const startedAt = Date.now();
 
     try {
       const response = await fetchImpl(url, {
@@ -71,6 +78,15 @@ export function createSettlementClient(options: SettlementClientOptions): Settle
         signal: controller.signal,
       });
 
+      const durationSeconds = (Date.now() - startedAt) / 1000;
+      const statusCode = String(response.status);
+
+      metrics.duration.observe({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode }, durationSeconds);
+
+      if (!response.ok) {
+        metrics.failures.inc({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode });
+      }
+
       const contentType = response.headers.get('content-type') ?? 'application/json';
       const body = contentType.includes('application/json')
         ? await response.json()
@@ -78,6 +94,13 @@ export function createSettlementClient(options: SettlementClientOptions): Settle
 
       return { status: response.status, body, contentType };
     } catch (err) {
+      const durationSeconds = (Date.now() - startedAt) / 1000;
+      const isTimeout = err instanceof Error && err.name === 'AbortError';
+      const statusCode = isTimeout ? 'timeout' : 'network_error';
+
+      metrics.failures.inc({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode });
+      metrics.duration.observe({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode }, durationSeconds);
+
       logger?.warn({ err }, 'settlement-client: settlement-engine request failed');
       throw new SettlementEngineUnavailableError(
         err instanceof Error ? err.message : 'settlement-engine unavailable'
