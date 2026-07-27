@@ -439,13 +439,12 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
         throw new Error(`API Gateway returned status ${response.status}`);
       }
 
-      const data = await response.json() as { settlements: any[] };
-      gatewayRecords = data.settlements;
+      const data = await response.json() as { data: any[] };
+      gatewayRecords = data.data;
     } catch (error) {
       fastify.log.error({ error }, 'Failed to fetch settlements from API Gateway');
       return reply.code(502).send({
-        error: 'Failed to fetch settlement records from api-gateway',
-        details: error instanceof Error ? error.message : String(error)
+        error: { code: 'UPSTREAM_ERROR', message: 'Failed to fetch settlement records from api-gateway', details: error instanceof Error ? error.message : String(error) }
       });
     }
 
@@ -641,7 +640,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
             where: { id: existingId },
           });
           if (existingSettlement) {
-            return reply.code(200).send(existingSettlement);
+            return reply.code(200).send({ data: existingSettlement });
           }
         }
       }
@@ -674,7 +673,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
 
     await settlementQueue.add('process-settlement', jobData);
 
-    return reply.code(201).send(settlement);
+    return reply.code(201).send({ data: settlement });
 });
 
 fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
@@ -823,10 +822,12 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     }
 
     return reply.code(201).send({
-      batchId,
-      total: d.settlements.length,
-      created: validItems.length,
-      errors
+      data: {
+        batchId,
+        total: d.settlements.length,
+        created: validItems.length,
+        errors,
+      },
     });
   }
 );
@@ -875,13 +876,15 @@ fastify.get<{ Params: { batchId: string } }>(
     else if (pending === total) overallStatus = 'pending';
 
     return {
-      batchId,
-      total,
-      pending,
-      processing,
-      completed,
-      failed,
-      status: overallStatus,
+      data: {
+        batchId,
+        total,
+        pending,
+        processing,
+        completed,
+        failed,
+        status: overallStatus,
+      },
     };
   }
 );
