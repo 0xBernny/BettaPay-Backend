@@ -49,6 +49,14 @@ export interface FeeAuditSnapshot {
   discountApplied: number;
   monthlyVolumeAtTime: number;
   feeVersion: string;
+  capApplied?: boolean;
+  uncappedFee?: string;
+}
+
+export interface FeeConfig {
+  feeBps: number;
+  maxFeeBps?: number;
+  maxFeeThreshold?: string;
 }
 
 /**
@@ -79,6 +87,7 @@ export function resolveVolumeDiscount(
 
 /**
  * Computes fee and net amounts with full decimal precision using BigNumber.
+ * Supports optional maximum fee caps for high-value settlements.
  *
  * Invariants (must hold for every valid non-negative gross amount and
  * feeBps in [0, 10000]):
@@ -98,7 +107,7 @@ export function resolveVolumeDiscount(
  * @returns               { grossAmount, feeAmount, netAmount, feeSnapshot }
  *
  * @example
- *   computeSettlementAmounts('100.123456', 100)
+ *   computeSettlementAmounts('100.123456', { feeBps: 100 })
  *   // → { grossAmount: '100.123456', feeAmount: '1.001234', netAmount: '99.122222' }
  *
  * @example  Volume discount: $15 000 volume, tier at $10 000 / 10 bps, base 100 bps
@@ -112,6 +121,12 @@ export function computeSettlementAmounts(
   monthlyVolume = 0,
   discountTiers: DiscountTier[] = [],
 ): SettlementAmounts {
+  // Backward compatibility: accept plain number as feeBps
+  const config: FeeConfig = typeof feeConfig === 'number' 
+    ? { feeBps: feeConfig } 
+    : feeConfig;
+
+  const { feeBps, maxFeeBps, maxFeeThreshold } = config;
   const gross = new BigNumber(grossAmountStr);
 
   // Resolve volume-based discount and clamp to [0, feeBps]
@@ -123,7 +138,7 @@ export function computeSettlementAmounts(
 
   // Preserve the same decimal places as the original input string.
   const inputDecimals = (grossAmountStr.split('.')[1] ?? '').length;
-  const feeStr = fee.toFixed(inputDecimals, BigNumber.ROUND_DOWN);
+  const feeStr = finalFee.toFixed(inputDecimals, BigNumber.ROUND_DOWN);
   const netStr = gross.minus(feeStr).toFixed(inputDecimals);
 
   const feeSnapshot: FeeAuditSnapshot = {

@@ -287,6 +287,8 @@ export type IdempotencyKey = z.infer<typeof IdempotencyKeySchema>;
 
 export const MerchantSettings = z.object({
   feeBps: z.number().int().min(0).max(10000).optional(),
+  maxFeeBps: z.number().int().min(0).max(10000).optional(),
+  maxFeeThreshold: z.string().regex(/^\d+(\.\d+)?$/, 'maxFeeThreshold must be a numeric string').optional(),
   webhookUrl: WebhookUrlSchema.optional(),
   preferredAsset: z.string().optional(),
   autoSettle: z.boolean().optional(),
@@ -389,6 +391,8 @@ export function isValidTransition(
 // the merchant's existing settings rather than replacing them.
 export const UpdateMerchantSettingsBody = z.object({
   feeBps: z.number().int().min(0).max(10000).optional(),
+  maxFeeBps: z.number().int().min(0).max(10000).optional(),
+  maxFeeThreshold: z.string().regex(/^\d+(\.\d+)?$/, 'maxFeeThreshold must be a numeric string').optional(),
   tier: z.string().optional(),
   minSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'minSettlementAmount must be a numeric string').optional(),
   maxSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'maxSettlementAmount must be a numeric string').optional(),
