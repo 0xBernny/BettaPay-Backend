@@ -48,6 +48,7 @@ import {
   WalletChallengeQuery,
   WalletVerifyBody,
   SettlementListQuery,
+  BulkCancelPaymentsBody,
   createErrorResponse,
   ErrorCodes,
   registerErrorHandler,
@@ -883,6 +884,67 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdatePaymentStatus
     return paymentUpdate;
   });
   return reply.send({ data: updated });
+});
+
+// Bulk-cancel initiated payments belonging to the authenticated merchant.
+fastify.post<{ Body: z.infer<typeof BulkCancelPaymentsBody> }>('/api/payments/bulk-cancel', {
+  preValidation: [fastify.authenticate],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const d = BulkCancelPaymentsBody.parse(request.body);
+  const merchantId = (request.user as any).merchantId as string;
+
+  // Deduplicate IDs
+  const uniqueIds = [...new Set(d.paymentIds)];
+
+  const payments = await prisma.payment.findMany({
+    where: { id: { in: uniqueIds } },
+  });
+
+  const paymentMap = new Map(payments.map(p => [p.id, p]));
+
+  const cancelledIds: string[] = [];
+  const skippedIds: string[] = [];
+  const errors: { id: string; reason: string }[] = [];
+
+  for (const id of uniqueIds) {
+    const payment = paymentMap.get(id);
+    if (!payment) {
+      skippedIds.push(id);
+      continue;
+    }
+    if (payment.merchantId !== merchantId) {
+      skippedIds.push(id);
+      continue;
+    }
+    if (payment.status !== 'initiated') {
+      skippedIds.push(id);
+      continue;
+    }
+    cancelledIds.push(id);
+  }
+
+  if (cancelledIds.length > 0) {
+    await prisma.$transaction(async (tx) => {
+      for (const id of cancelledIds) {
+        const before = paymentMap.get(id)!;
+        const updated = await tx.payment.update({
+          where: { id },
+          data: { status: 'cancelled' },
+        });
+        await logAuditEvent('payment.status.changed', 'payment', id, { before, after: updated }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+      }
+    });
+  }
+
+  return reply.code(200).send({
+    cancelled: cancelledIds.length,
+    skipped: skippedIds.length,
+    errors: errors.length,
+    cancelledIds,
+    skippedIds,
+  });
 });
 
 fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementStatusBody> }>('/api/settlements/:id/status', {

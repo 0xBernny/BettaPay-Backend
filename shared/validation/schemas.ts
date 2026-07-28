@@ -374,6 +374,11 @@ export const UpdateMerchantNameBody = z.object({
 });
 export type UpdateMerchantNameBody = z.infer<typeof UpdateMerchantNameBody>;
 
+export const BulkCancelPaymentsBody = z.object({
+  paymentIds: z.array(z.string().min(1)).min(1, 'At least one payment ID is required').max(100, 'Maximum 100 payment IDs allowed'),
+});
+export type BulkCancelPaymentsBody = z.infer<typeof BulkCancelPaymentsBody>;
+
 export const PaginationQuery = z.object({
   limit: z.coerce.number().max(200).default(50),
   offset: z.coerce.number().min(0).default(0),
