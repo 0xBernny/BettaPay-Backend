@@ -126,3 +126,24 @@ model AuditLog {
   @@index([createdAt])
   @@index([entityId])
 }
+
+model SupportedAsset {
+  code       String  @id
+  contractId String
+  decimals   Int
+  name       String
+  isActive   Boolean @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model SettlementBatch {
+  id         String   @id @default(cuid())
+  asset      String
+  totalCount Int
+  totalGross String
+  totalFees  String
+  totalNet   String
+  createdAt  DateTime @default(now())
+  processedAt DateTime?
+}

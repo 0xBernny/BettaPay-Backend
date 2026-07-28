@@ -172,6 +172,10 @@ export const EnvSchema = z.object({
     (val) => process.env.NODE_ENV !== 'production' || val >= 1,
     { message: 'EVENT_RETENTION_DAYS must be >= 1 in production' }
   ),
+
+  // Settlement Batching — interval (seconds) for batch job and minimum count per batch
+  BATCH_INTERVAL_SECONDS: z.string().transform((s) => parseInt(s, 10)).default('300'),
+  BATCH_MIN_COUNT: z.string().transform((s) => parseInt(s, 10)).default('2'),
 });
 
 export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS' | 'FEATURE_FLAGS'> & {

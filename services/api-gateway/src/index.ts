@@ -41,6 +41,8 @@ import {
   CreateMerchantBody,
   CreatePaymentBody,
   CreateSettlementBody,
+  CreateSupportedAssetBody,
+  UpdateSupportedAssetBody,
   UpdatePaymentStatusBody,
   UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
@@ -1053,6 +1055,21 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>('/api/settlements',
     // Normalize to items array (backward compatibility: single amount/asset becomes single-item batch)
     const items = d.items || (d.amount && d.asset ? [{ amount: d.amount, asset: d.asset }] : []);
 
+    // #319 — Validate each asset against SupportedAsset table
+    for (const item of items) {
+      const supportedAsset = await prisma.supportedAsset.findUnique({
+        where: { code: item.asset },
+      });
+
+      if (!supportedAsset || !supportedAsset.isActive) {
+        return reply.code(422).send(createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          `Asset ${item.asset} is not supported`,
+          { asset: item.asset }
+        ));
+      }
+    }
+
     // Validate each settlement item against merchant limits
     for (const item of items) {
       const amount = parseFloat(item.amount);
@@ -1216,6 +1233,148 @@ async function proxyFxUpstream(
 
 fastify.get('/api/rates', async (request, reply) => proxyFxUpstream(request, reply, '/api/rates'));
 fastify.get('/api/currencies', async (request, reply) => proxyFxUpstream(request, reply, '/api/currencies'));
+
+// ============================================================================
+// SUPPORTED ASSETS (#319)
+// ============================================================================
+
+// GET /api/assets — list all supported assets
+fastify.get('/api/assets', async (request, reply) => {
+  try {
+    const assets = await prisma.supportedAsset.findMany({
+      where: { isActive: true },
+      select: {
+        code: true,
+        contractId: true,
+        decimals: true,
+        name: true,
+        isActive: true,
+      },
+    });
+
+    return { data: assets };
+  } catch (error) {
+    request.log.error({ error }, 'Failed to fetch supported assets');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
+// POST /api/admin/assets — admin endpoint to add new asset
+fastify.post('/api/admin/assets', {
+  preValidation: [fastify.serviceAuth],
+  schema: {
+    body: z.object({
+      code: z.string().min(1),
+      contractId: z.string().min(1),
+      decimals: z.number().int().min(0),
+      name: z.string().min(1),
+      isActive: z.boolean().default(true),
+    }),
+  },
+}, async (request, reply) => {
+  const body = request.body as z.infer<typeof CreateSupportedAssetBody>;
+
+  try {
+    const asset = await prisma.supportedAsset.create({
+      data: body,
+    });
+
+    await logAuditEvent({
+      action: 'CREATE_SUPPORTED_ASSET',
+      entityType: 'SupportedAsset',
+      entityId: asset.code,
+      actorId: 'admin',
+      actorType: 'SERVICE',
+      changes: { asset },
+      ipAddress: request.ip,
+    });
+
+    return reply.code(201).send({ data: asset });
+  } catch (error: any) {
+    if (error.code === 'P2002') {
+      return reply.code(409).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Asset code already exists'));
+    }
+    request.log.error({ error }, 'Failed to create supported asset');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
+// PATCH /api/admin/assets/:code — admin endpoint to update asset
+fastify.patch('/api/admin/assets/:code', {
+  preValidation: [fastify.serviceAuth],
+  schema: {
+    params: z.object({ code: z.string().min(1) }),
+    body: z.object({
+      contractId: z.string().min(1).optional(),
+      decimals: z.number().int().min(0).optional(),
+      name: z.string().min(1).optional(),
+      isActive: z.boolean().optional(),
+    }),
+  },
+}, async (request, reply) => {
+  const { code } = request.params as { code: string };
+  const body = request.body as z.infer<typeof UpdateSupportedAssetBody>;
+
+  try {
+    const asset = await prisma.supportedAsset.update({
+      where: { code },
+      data: body,
+    });
+
+    await logAuditEvent({
+      action: 'UPDATE_SUPPORTED_ASSET',
+      entityType: 'SupportedAsset',
+      entityId: asset.code,
+      actorId: 'admin',
+      actorType: 'SERVICE',
+      changes: { updates: body },
+      ipAddress: request.ip,
+    });
+
+    return { data: asset };
+  } catch (error: any) {
+    if (error.code === 'P2025') {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Asset not found'));
+    }
+    request.log.error({ error }, 'Failed to update supported asset');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
+// DELETE /api/admin/assets/:code — admin endpoint to delete asset
+fastify.delete('/api/admin/assets/:code', {
+  preValidation: [fastify.serviceAuth],
+  schema: {
+    params: z.object({ code: z.string().min(1) }),
+  },
+}, async (request, reply) => {
+  const { code } = request.params as { code: string };
+
+  try {
+    await prisma.supportedAsset.delete({
+      where: { code },
+    });
+
+    await logAuditEvent({
+      action: 'DELETE_SUPPORTED_ASSET',
+      entityType: 'SupportedAsset',
+      entityId: code,
+      actorId: 'admin',
+      actorType: 'SERVICE',
+      changes: {},
+      ipAddress: request.ip,
+    });
+
+    return reply.code(204).send();
+  } catch (error: any) {
+    if (error.code === 'P2025') {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Asset not found'));
+    }
+    request.log.error({ error }, 'Failed to delete supported asset');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
 fastify.get('/api/quote', async (request, reply) => {
   const query = new URLSearchParams(request.query as Record<string, string>).toString();
   const path = query ? `/api/quote?${query}` : '/api/quote';

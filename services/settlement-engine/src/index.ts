@@ -899,6 +899,125 @@ fastify.get<{ Params: { batchId: string } }>(
   }
 );
 
+// ============================================================================
+// SETTLEMENT BATCHING JOB (#320)
+// ============================================================================
+
+// BullMQ repeatable job that runs every BATCH_INTERVAL_SECONDS to batch
+// pending settlements by asset. Only creates batches for assets with
+// >= BATCH_MIN_COUNT settlements.
+
+const batchQueue = new Queue('settlement-batching', {
+  connection: redis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: 100,
+    removeOnFail: 100,
+  },
+});
+
+const batchWorker = new Worker(
+  'settlement-batching',
+  async (job) => {
+    const traceId = job.data.traceId || crypto.randomUUID();
+    fastify.log.info({ traceId }, 'Starting settlement batching job');
+
+    try {
+      // Fetch all pending settlements
+      const pendingSettlements = await prisma.settlement.findMany({
+        where: { status: 'pending' },
+      });
+
+      if (pendingSettlements.length === 0) {
+        fastify.log.info({ traceId }, 'No pending settlements to batch');
+        return { batched: 0 };
+      }
+
+      // Group by asset
+      const grouped = pendingSettlements.reduce((acc, s) => {
+        if (!acc[s.asset]) acc[s.asset] = [];
+        acc[s.asset].push(s);
+        return acc;
+      }, {} as Record<string, typeof pendingSettlements>);
+
+      let batchedCount = 0;
+
+      // Create batches for assets with >= BATCH_MIN_COUNT
+      for (const [asset, settlements] of Object.entries(grouped)) {
+        if (settlements.length >= env.BATCH_MIN_COUNT) {
+          const totalGross = settlements.reduce(
+            (sum, s) => sum.plus(s.grossAmount),
+            new BigNumber(0)
+          ).toString();
+          const totalFees = settlements.reduce(
+            (sum, s) => sum.plus(s.feeAmount),
+            new BigNumber(0)
+          ).toString();
+          const totalNet = settlements.reduce(
+            (sum, s) => sum.plus(s.netAmount),
+            new BigNumber(0)
+          ).toString();
+
+          const batch = await prisma.settlementBatch.create({
+            data: {
+              asset,
+              totalCount: settlements.length,
+              totalGross,
+              totalFees,
+              totalNet,
+            },
+          });
+
+          // Update settlements with batchId and mark completed
+          await prisma.settlement.updateMany({
+            where: { id: { in: settlements.map((s) => s.id) } },
+            data: { batchId: batch.id, status: 'completed' },
+          });
+
+          fastify.log.info(
+            { traceId, batchId: batch.id, asset, count: settlements.length },
+            'Created settlement batch'
+          );
+
+          batchedCount += settlements.length;
+        } else {
+          fastify.log.info(
+            { traceId, asset, count: settlements.length },
+            'Skipping batch (below min count)'
+          );
+        }
+      }
+
+      fastify.log.info({ traceId, batchedCount }, 'Settlement batching job completed');
+      return { batched: batchedCount };
+    } catch (error) {
+      fastify.log.error({ traceId, error }, 'Settlement batching job failed');
+      throw error;
+    }
+  },
+  { connection: redis, concurrency: 1 }
+);
+
+// Schedule the batching job to run every BATCH_INTERVAL_SECONDS
+await batchQueue.add(
+  'batch-pending-settlements',
+  { traceId: crypto.randomUUID() },
+  {
+    repeat: {
+      every: env.BATCH_INTERVAL_SECONDS * 1000,
+    },
+  }
+);
+
+batchWorker.on('completed', (job) => {
+  fastify.log.info({ jobId: job.id }, 'Batching job completed');
+});
+
+batchWorker.on('failed', (job, err) => {
+  fastify.log.error({ jobId: job?.id, error: err }, 'Batching job failed');
+});
+
 
 
 // ============================================================================
@@ -932,15 +1051,17 @@ async function gracefulShutdown(signal: string): Promise<void> {
     // 1b. Close the metrics server
     await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
 
-    // 2. Close BullMQ worker (drain and close gracefully, force-stop after 10s)
-    fastify.log.info('Closing BullMQ worker...');
+    // 2. Close BullMQ workers (drain and close gracefully, force-stop after 10s)
+    fastify.log.info('Closing BullMQ workers...');
     await closeWorkerWithTimeout(worker, 'settlements', fastify.log, getActiveSettlementJob);
-    fastify.log.info('BullMQ worker closed');
+    await closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => null);
+    fastify.log.info('BullMQ workers closed');
 
     // 3. Close BullMQ queues
     fastify.log.info('Closing BullMQ queues...');
     await settlementQueue.close();
     await settlementDLQ.close();
+    await batchQueue.close();
     await closeWorkerWithTimeout(webhookWorker, 'settlement-webhooks', fastify.log, getActiveWebhookJob);
     await webhookQueue.close();
     fastify.log.info('BullMQ queues closed');
