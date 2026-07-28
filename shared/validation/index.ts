@@ -167,6 +167,12 @@ export const EnvSchema = z.object({
   // Indexer — lag warning threshold (number of ledgers behind the Stellar tip)
   INDEXER_LAG_WARN_THRESHOLD: z.string().transform((s) => parseInt(s, 10)).default('10'),
 
+  // Indexer — smart startup ledger discovery (#352)
+  // When no indexed events exist, start from max(1, tip - INITIAL_BACKFILL_LEDGERS).
+  INITIAL_BACKFILL_LEDGERS: z.string().transform((s) => parseInt(s, 10)).default('1000'),
+  // Manual override: skip auto-discovery and start from this ledger.
+  INDEX_FROM_LEDGER: z.string().optional(),
+
   // Indexer — Event retention policy
   EVENT_RETENTION_DAYS: z.string().transform((s) => parseInt(s, 10)).default('30').refine(
     (val) => process.env.NODE_ENV !== 'production' || val >= 1,

@@ -801,6 +801,60 @@ export function stopCleanupScheduler(): void {
 }
 // ── Startup ───────────────────────────────────────────────────────────────────
 
+/**
+ * Discovers the correct starting ledger for the polling loop (#352).
+ *
+ * Priority:
+ *   1. INDEX_FROM_LEDGER env var (manual override)
+ *   2. Latest indexed event ledger + 1 (resume where we left off)
+ *   3. Network tip - INITIAL_BACKFILL_LEDGERS (fresh deployment)
+ *   4. Ledger 1 (RPC failure fallback)
+ */
+export async function discoverStartLedger(): Promise<number> {
+  // 1. Manual override
+  if (env.INDEX_FROM_LEDGER) {
+    const manual = parseInt(env.INDEX_FROM_LEDGER, 10);
+    if (Number.isFinite(manual) && manual >= 1) {
+      fastify.log.info({ ledger: manual }, '[Indexer] Starting from manual INDEX_FROM_LEDGER');
+      return manual;
+    }
+    fastify.log.warn({ raw: env.INDEX_FROM_LEDGER }, '[Indexer] Invalid INDEX_FROM_LEDGER — ignoring');
+  }
+
+  // 2. Resume from latest indexed event
+  try {
+    const latest = await prisma.indexedEvent.findFirst({
+      orderBy: { ledger: 'desc' },
+      select: { ledger: true },
+    });
+    if (latest) {
+      const resumeFrom = latest.ledger + 1;
+      fastify.log.info({ ledger: resumeFrom, latestIndexed: latest.ledger }, '[Indexer] Resuming from latest indexed event');
+      return resumeFrom;
+    }
+  } catch (err) {
+    fastify.log.warn({ err: String(err) }, '[Indexer] Failed to query latest indexed event');
+  }
+
+  // 3. Fresh deployment — start from network tip minus backfill window
+  try {
+    const tip = await server.getLatestLedger();
+    const backfill = env.INITIAL_BACKFILL_LEDGERS;
+    const startLedger = Math.max(1, tip.sequence - backfill);
+    fastify.log.info(
+      { tip: tip.sequence, backfill, startLedger },
+      '[Indexer] Fresh deployment — starting from network tip minus backfill',
+    );
+    return startLedger;
+  } catch (err) {
+    fastify.log.warn({ err: String(err) }, '[Indexer] Failed to query Stellar RPC for tip — falling back to ledger 1');
+  }
+
+  // 4. Fallback
+  fastify.log.warn('[Indexer] No indexed events and RPC unavailable — starting from ledger 1');
+  return 1;
+}
+
 const start = async () => {
   try {
     // #391 — wait for both dependencies before accepting traffic
@@ -809,6 +863,9 @@ const start = async () => {
 
     // #387 — Redis memory monitoring
     startRedisMemoryMonitor(redisHealth, fastify.log);
+
+    // #352 — smart startup ledger discovery
+    latestLedgerCursor = await discoverStartLedger();
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
     fastify.log.info('[Indexer] Starting Stellar RPC polling loop...');
