@@ -86,6 +86,7 @@ export function createMockPrisma(initialData: MockData = {}) {
         createdAt: new Date(),
         updatedAt: new Date(),
         deletedAt: null,
+        status: 'active',
         settings: {},
         ...data,
       };

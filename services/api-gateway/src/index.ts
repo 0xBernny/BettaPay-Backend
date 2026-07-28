@@ -11,6 +11,8 @@
  *   GET    /api/merchants/:id        — fetch merchant (protected)
  *   DELETE /api/merchants/:id        — soft-delete merchant (protected)
  *   POST   /api/merchants/:id/restore — restore soft-deleted merchant (protected)
+ *   POST   /api/merchants/:id/suspend  — suspend merchant (service-auth, #317)
+ *   POST   /api/merchants/:id/unsuspend — unsuspend merchant (service-auth, #317)
  *   PATCH  /api/merchants/:id/settings — update merchant fee rules / settings (protected)
  *   POST   /api/payments             — initiate payment session (protected)
  *   GET    /api/payments/:id         — fetch payment session
@@ -710,6 +712,73 @@ fastify.post<{ Params: { id: string } }>('/api/merchants/:id/restore', {
   return reply.code(200).send({ success: true, merchant: restored });
 });
 
+// #317 — Suspend a merchant without deleting their data. Suspended merchants
+// cannot create new payments or settlements, but existing payments/settlements
+// remain readable and their state can still be updated. Re-suspending an
+// already-suspended merchant returns 409.
+fastify.post<{ Params: { id: string } }>('/api/merchants/:id/suspend', {
+  preValidation: [fastify.serviceAuth],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const { id } = request.params;
+  // Look up with deletedAt: null so soft-deleted merchants cannot be suspended.
+  const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
+  if (!merchant) {
+    return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+  }
+  if (merchant.status === 'suspended') {
+    return reply.code(409).send(createErrorResponse(
+      ErrorCodes.INVALID_REQUEST,
+      'Merchant is already suspended',
+      { merchantId: id, status: merchant.status },
+    ));
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const merchantUpdate = await tx.merchant.update({
+      where: { id },
+      data: { status: 'suspended' },
+    });
+    await logAuditEvent('merchant.suspended', 'merchant', merchantUpdate.id, { before: merchant, after: merchantUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+    return merchantUpdate;
+  });
+
+  const { secretHash: _hash, ...safeMerchant } = updated;
+  return reply.code(200).send({ data: safeMerchant });
+});
+
+// #317 — Lift a suspension. Unsuspending an already-active merchant returns 409
+// so the operation is a clear no-op rather than silently succeeding.
+fastify.post<{ Params: { id: string } }>('/api/merchants/:id/unsuspend', {
+  preValidation: [fastify.serviceAuth],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const { id } = request.params;
+  const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
+  if (!merchant) {
+    return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+  }
+  if (merchant.status === 'active') {
+    return reply.code(409).send(createErrorResponse(
+      ErrorCodes.INVALID_REQUEST,
+      'Merchant is already active',
+      { merchantId: id, status: merchant.status },
+    ));
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const merchantUpdate = await tx.merchant.update({
+      where: { id },
+      data: { status: 'active' },
+    });
+    await logAuditEvent('merchant.unsuspended', 'merchant', merchantUpdate.id, { before: merchant, after: merchantUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+    return merchantUpdate;
+  });
+
+  const { secretHash: _hash, ...safeMerchant } = updated;
+  return reply.code(200).send({ data: safeMerchant });
+});
+
 // Update per-merchant settings (fee rules, tier). Merges into existing settings so
 // a partial update does not wipe unrelated keys. The settlement engine reads
 // settings.feeBps from here when computing fees.
@@ -747,6 +816,23 @@ fastify.post<{ Body: z.infer<typeof CreatePaymentBody> }>('/api/payments', {
 }, async (request, reply) => {
   // ── 1. Parse and validate request body ──────────────────────────────────────
   const d = CreatePaymentBody.parse(request.body);
+
+  // ── 1a. #317 — Block suspended merchants from creating new payments. ───────
+  // Existing payments and state transitions remain readable / updatable.
+  const paymentMerchant = await prisma.merchant.findFirst({
+    where: { id: d.merchantId, deletedAt: null },
+    select: { id: true, status: true },
+  });
+  if (!paymentMerchant) {
+    return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+  }
+  if (paymentMerchant.status === 'suspended') {
+    return reply.code(403).send(createErrorResponse(
+      ErrorCodes.MERCHANT_SUSPENDED,
+      'Merchant is suspended and cannot create payments',
+      { merchantId: d.merchantId, status: paymentMerchant.status },
+    ));
+  }
 
   // ── 2. Read and validate optional Idempotency-Key header ────────────────────
   const idempotencyKey = readIdempotencyKey(request);
@@ -1040,9 +1126,19 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>('/api/settlements',
 }, async (request, reply) => {
     const d = CreateSettlementBody.parse(request.body);
     const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
-    
+
     if (!merchant) {
       return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+    }
+
+    // #317 — Suspended merchants cannot create settlements. Existing data
+    // (payments, settlements) remains readable and updatable while suspended.
+    if (merchant.status === 'suspended') {
+      return reply.code(403).send(createErrorResponse(
+        ErrorCodes.MERCHANT_SUSPENDED,
+        'Merchant is suspended and cannot create settlements',
+        { merchantId: d.merchantId, status: merchant.status },
+      ));
     }
 
     const settings = merchant.settings as {

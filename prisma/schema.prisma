@@ -20,18 +20,30 @@ enum SettlementStatus {
   failed
 }
 
+// #317 — intermediate suspended state without data deletion. New merchants
+// default to 'active'; suspending flips to 'suspended' and blocks creation
+// of new payments and settlements while keeping existing data readable.
+enum MerchantStatus {
+  active
+  suspended
+}
+
 model Merchant {
-  id          String       @id
+  id          String          @id
   name        String
   ownerId     String
-  createdAt   DateTime     @default(now())
+  createdAt   DateTime        @default(now())
   deletedAt   DateTime?
+  // #317 — Merchant suspension status. Existing rows are backfilled to
+  // 'active' by the add_merchant_status migration.
+  status      MerchantStatus  @default(active)
   settings    Json?
   secretHash  String?
   payments    Payment[]
   settlements Settlement[]
 
   @@unique([ownerId])
+  @@index([status])
 }
 
 model Payment {
