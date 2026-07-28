@@ -58,6 +58,7 @@ import {
   waitForRedis,
   startRedisMemoryMonitor,
   startMetricsServer,
+  runStartupChecks,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
@@ -81,6 +82,7 @@ type SettlementJobData = {
   merchantId: string;
   grossAmount: string;
   asset: string;
+  traceId?: string;
 };
 
 type SettlementRecord = NonNullable<Awaited<ReturnType<typeof prisma.settlement.findUnique>>>;
@@ -199,9 +201,14 @@ const metricsServer = startMetricsServer({
 const worker = new Worker('settlements', async job => {
   const settlementId = job.data.id;
   const merchantId = job.data.merchantId;
+  const traceId = job.data.traceId;
+
+  const log = traceId
+    ? fastify.log.child({ traceId })
+    : fastify.log;
 
   if (job.attemptsMade > 0) {
-    fastify.log.warn({
+    log.warn({
       jobId: job.id,
       attempt: job.attemptsMade + 1,
       maxAttempts: 3,
@@ -214,7 +221,7 @@ const worker = new Worker('settlements', async job => {
   const requeueDelayMs = 5000;
   let acquired = false;
 
-  fastify.log.info({
+  log.info({
     jobId: job.id,
     merchantId,
     amount: job.data.grossAmount,
@@ -227,7 +234,7 @@ const worker = new Worker('settlements', async job => {
     if (acquired) break;
 
     if (attempt < maxRetries) {
-      fastify.log.info({
+      log.info({
         merchantId,
         settlementId,
         attempt: attempt + 1,
@@ -244,7 +251,7 @@ const worker = new Worker('settlements', async job => {
       return;
     }
 
-    fastify.log.error({
+    log.error({
       merchantId,
       settlementId,
     }, 'Settlement failed: merchant concurrency limit exceeded after max retries');
@@ -258,7 +265,7 @@ const worker = new Worker('settlements', async job => {
       data: { status: 'completed', completedAt: new Date() },
     });
 
-    fastify.log.info({ settlementId }, 'Settlement completed in database');
+    log.info({ settlementId }, 'Settlement completed in database');
 
     if (updatedSettlement.webhookUrl) {
       await webhookQueue.add('deliver', {
@@ -267,7 +274,7 @@ const worker = new Worker('settlements', async job => {
       });
     }
   } catch (error) {
-    fastify.log.error({ error, settlementId }, 'Settlement processing failed');
+    log.error({ error, settlementId }, 'Settlement processing failed');
 
     const updatedSettlement = await prisma.settlement.update({
       where: { id: settlementId },
@@ -280,7 +287,7 @@ const worker = new Worker('settlements', async job => {
         url: updatedSettlement.webhookUrl,
         event: { event: 'settlement.failed', data: updatedSettlement as unknown as Record<string, unknown> },
       }).catch((err: unknown) => {
-        fastify.log.error({ err, settlementId }, 'Failed to enqueue failure webhook');
+        log.error({ err, settlementId }, 'Failed to enqueue failure webhook');
       });
     }
 
@@ -664,11 +671,14 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
       },
     });
 
+    const traceId = (request as unknown as { traceId?: string }).traceId;
+
     const jobData: SettlementJobData = {
       id: settlement.id,
       merchantId: settlement.merchantId,
       grossAmount: settlement.grossAmount,
       asset: settlement.asset,
+      traceId,
     };
 
     await settlementQueue.add('process-settlement', jobData);
@@ -972,9 +982,31 @@ process.on('SIGINT', () => {
 
 const start = async () => {
   try {
-    // #391 — wait for both dependencies before accepting traffic
-    await connectWithRetry(prisma, fastify.log);
-    await waitForRedis(redis, fastify.log);
+    await runStartupChecks({
+      service: 'settlement-engine',
+      version: SERVICE_VERSION,
+      logger: fastify.log,
+      checks: [
+        {
+          name: 'prisma',
+          fn: () => connectWithRetry(prisma, fastify.log),
+          critical: true,
+        },
+        {
+          name: 'redis',
+          fn: () => waitForRedis(redis, fastify.log),
+          critical: true,
+        },
+        {
+          name: 'bullmq',
+          fn: async () => {
+            const counts = await settlementQueue.getJobCounts();
+            fastify.log.info({ counts }, 'BullMQ queue reachable');
+          },
+          critical: false,
+        },
+      ],
+    });
 
     // #387 — Redis memory monitoring
     startRedisMemoryMonitor(redis, fastify.log);
