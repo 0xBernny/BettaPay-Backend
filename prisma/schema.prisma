@@ -20,6 +20,13 @@ enum SettlementStatus {
   failed
 }
 
+enum KycStatus {
+  unverified
+  pending
+  verified
+  rejected
+}
+
 model Merchant {
   id          String       @id
   name        String
@@ -28,6 +35,7 @@ model Merchant {
   deletedAt   DateTime?
   settings    Json?
   secretHash  String?
+  kycStatus   KycStatus    @default(unverified)
   payments    Payment[]
   settlements Settlement[]
 

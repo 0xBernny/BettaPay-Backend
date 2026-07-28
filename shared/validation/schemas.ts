@@ -405,6 +405,14 @@ export const UpdateMerchantNameBody = z.object({
 });
 export type UpdateMerchantNameBody = z.infer<typeof UpdateMerchantNameBody>;
 
+export const KycStatusEnum = z.enum(['unverified', 'pending', 'verified', 'rejected']);
+export type KycStatusEnum = z.infer<typeof KycStatusEnum>;
+
+export const UpdateMerchantKycBody = z.object({
+  kycStatus: KycStatusEnum,
+});
+export type UpdateMerchantKycBody = z.infer<typeof UpdateMerchantKycBody>;
+
 export const SupportedAssetSchema = z.object({
   code: z.string().min(1),
   contractId: z.string().min(1),
@@ -446,10 +454,18 @@ export const SettlementListQuery = PaginationQuery.extend({
   status: z.enum(['pending', 'processing', 'completed', 'failed']).optional(),
   from: isoDateString.optional(),
   to: isoDateString.optional(),
+  startDate: isoDateString.optional(),
+  endDate: isoDateString.optional(),
   includeDeleted: z.coerce.boolean().default(false),
 }).refine(
-  (data) => !data.from || !data.to || data.from <= data.to,
-  { message: 'from must be before to' }
+  (data) => {
+    const start = data.startDate ?? data.from;
+    const end = data.endDate ?? data.to;
+    if (end && !start) return false;
+    if (start && end && start > end) return false;
+    return true;
+  },
+  { message: 'endDate requires startDate; startDate must be before endDate' }
 );
 export type SettlementListQuery = z.infer<typeof SettlementListQuery>;
 

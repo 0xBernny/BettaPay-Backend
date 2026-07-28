@@ -51,6 +51,7 @@ import {
   WalletVerifyBody,
   SettlementListQuery,
   BulkCancelPaymentsBody,
+  UpdateMerchantKycBody,
   PAYMENT_STATUS_TRANSITIONS,
   SETTLEMENT_STATUS_TRANSITIONS,
   isValidTransition,
@@ -72,6 +73,8 @@ import { Keypair } from '@stellar/stellar-sdk';
 import { OAuth2Client } from 'google-auth-library';
 import { registerGatewayHealthRoutes } from './health.js';
 import { startAbandonedPaymentsCron, stopAbandonedPaymentsCron } from './abandoned-payments-cron.js';
+import { createWebhookQueue, type WebhookJobData } from '@bettapay/webhook-delivery';
+import { Queue } from 'bullmq';
 import { readServiceVersion } from '@bettapay/validation';
 
 declare module 'fastify' {
@@ -720,6 +723,11 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantSetti
 }, async (request, reply) => {
   const d = UpdateMerchantSettingsBody.parse(request.body);
 
+  // Reject attempts to set kycStatus via the merchant settings endpoint
+  if ('kycStatus' in (request.body as Record<string, unknown>)) {
+    return reply.code(403).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'kycStatus cannot be updated via this endpoint'));
+  }
+
   const { id } = request.params;
   const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
   if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
@@ -733,6 +741,30 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantSetti
       data: { settings: nextSettings as object },
     });
     await logAuditEvent('merchant.updated', 'merchant', merchantUpdate.id, { before: merchant, after: merchantUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+    return merchantUpdate;
+  });
+
+  return reply.code(200).send({ data: { merchant: updated } });
+});
+
+// Admin-only: update merchant KYC status
+fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantKycBody> }>('/api/admin/merchants/:id/kyc', {
+  preValidation: [fastify.serviceAuth],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const d = UpdateMerchantKycBody.parse(request.body);
+  const { id } = request.params;
+
+  const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
+  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const merchantUpdate = await tx.merchant.update({
+      where: { id },
+      data: { kycStatus: d.kycStatus },
+    });
+    await logAuditEvent('merchant.kyc.updated', 'merchant', merchantUpdate.id, { before: { kycStatus: merchant.kycStatus }, after: { kycStatus: merchantUpdate.kycStatus } }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
     return merchantUpdate;
   });
 
@@ -987,7 +1019,7 @@ fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: 
   config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
 }, async (request, reply) => {
   const query = SettlementListQuery.parse(request.query);
-  const { merchantId, status, from, to, limit, offset, includeDeleted } = query as any;
+  const { merchantId, status, from, to, startDate, endDate, limit, offset, includeDeleted } = query as any;
   const where: any = {};
   if (merchantId) {
     where.merchantId = merchantId;
@@ -995,13 +1027,15 @@ fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: 
   if (status) {
     where.status = status;
   }
-  if (from || to) {
+  const effectiveFrom = startDate ?? from;
+  const effectiveTo = endDate ?? to;
+  if (effectiveFrom || effectiveTo) {
     where.initiatedAt = {};
-    if (from) {
-      where.initiatedAt.gte = new Date(from);
+    if (effectiveFrom) {
+      where.initiatedAt.gte = new Date(effectiveFrom);
     }
-    if (to) {
-      where.initiatedAt.lte = new Date(to);
+    if (effectiveTo) {
+      where.initiatedAt.lte = new Date(effectiveTo);
     }
   }
 
@@ -1485,7 +1519,8 @@ const start = async () => {
     startRedisMemoryMonitor(redis, app.log);
 
     if (process.env.NODE_ENV !== 'test') {
-      startAbandonedPaymentsCron(prisma, app.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24);
+      const webhookQueue = createWebhookQueue('gateway-expired-webhooks', { url: env.REDIS_URL });
+      startAbandonedPaymentsCron(prisma, app.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24, webhookQueue);
     }
     await app.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {
