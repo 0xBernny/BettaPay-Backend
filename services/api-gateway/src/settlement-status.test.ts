@@ -9,7 +9,7 @@ test('authorization: PATCH /api/settlements/:id/status returns 401 without valid
   const res = await app.inject({
     method: 'PATCH',
     url: '/api/settlements/set_1/status',
-    payload: { status: 'PROCESSING' },
+    payload: { status: 'processing' },
   });
 
   t.equal(res.statusCode, 401, 'returns 401 Unauthorized without JWT');
@@ -17,7 +17,7 @@ test('authorization: PATCH /api/settlements/:id/status returns 401 without valid
   t.end();
 });
 
-test('PENDING transitions to PROCESSING and persists in DB', async (t) => {
+test('PENDING transitions to processing and persists in DB', async (t) => {
   const { app, mockPrisma } = createTestApp({}, {
     settlements: [{ id: 'set_1', status: 'PENDING', merchantId: 'm1', totalAmount: '100.00', completedAt: null }],
   });
@@ -27,20 +27,20 @@ test('PENDING transitions to PROCESSING and persists in DB', async (t) => {
     method: 'PATCH',
     url: '/api/settlements/set_1/status',
     headers: { authorization: `Bearer ${token}` },
-    payload: { status: 'PROCESSING' },
+    payload: { status: 'processing' },
   });
 
   t.equal(res.statusCode, 200, 'returns 200');
-  t.equal(JSON.parse(res.body).status, 'PROCESSING', 'updates to PROCESSING');
+  t.equal(JSON.parse(res.body).status, 'processing', 'updates to processing');
 
   const stored = await mockPrisma.settlement.findUnique({ where: { id: 'set_1' } });
-  t.equal(stored.status, 'PROCESSING', 'updates status in mock DB');
+  t.equal(stored.status, 'processing', 'updates status in mock DB');
 
   await app.close();
   t.end();
 });
 
-test('PROCESSING transitions to COMPLETED and sets completedAt in DB', async (t) => {
+test('PROCESSING transitions to completed and sets completedAt in DB', async (t) => {
   const { app, mockPrisma } = createTestApp({}, {
     settlements: [{ id: 'set_1', status: 'PROCESSING', merchantId: 'm1', totalAmount: '100.00', completedAt: null }],
   });
@@ -75,11 +75,13 @@ test('invalid transition returns 422', async (t) => {
     method: 'PATCH',
     url: '/api/settlements/set_1/status',
     headers: { authorization: `Bearer ${token}` },
-    payload: { status: 'COMPLETED' },
+    payload: { status: 'completed' },
   });
 
   t.equal(res.statusCode, 422, 'returns 422');
-  t.equal(JSON.parse(res.body).from, 'PENDING', 'reports current status');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.details.from, 'PENDING', 'reports current status');
+  t.ok(Array.isArray(body.error.details.allowedTransitions), 'includes allowedTransitions in error');
 
   await app.close();
   t.end();
@@ -93,7 +95,7 @@ test('missing settlement returns 404', async (t) => {
     method: 'PATCH',
     url: '/api/settlements/missing_set/status',
     headers: { authorization: `Bearer ${token}` },
-    payload: { status: 'PROCESSING' },
+    payload: { status: 'processing' },
   });
 
   t.equal(res.statusCode, 404, 'returns 404');

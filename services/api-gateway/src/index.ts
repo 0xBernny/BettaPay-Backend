@@ -48,6 +48,10 @@ import {
   WalletChallengeQuery,
   WalletVerifyBody,
   SettlementListQuery,
+  BulkCancelPaymentsBody,
+  PAYMENT_STATUS_TRANSITIONS,
+  SETTLEMENT_STATUS_TRANSITIONS,
+  isValidTransition,
   createErrorResponse,
   ErrorCodes,
   registerErrorHandler,
@@ -73,17 +77,6 @@ declare module 'fastify' {
     authenticate: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
 }
-
-
-
-// Allowed payment status transitions. `initiated` is the only non-terminal state;
-// completed, failed, and cancelled are terminal and cannot transition further.
-const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
-  initiated: ['completed', 'failed', 'cancelled'],
-  completed: [],
-  failed: [],
-  cancelled: [],
-};
 
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -331,6 +324,46 @@ fastify.decorate('authenticate', async function (request: FastifyRequest, reply:
   } catch (err) {
     request.log.error(err);
     reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
+});
+
+// Per-merchant concurrent request limiting via Redis.
+// Uses INCR with a TTL so that abandoned connections (e.g. dropped before
+// onResponse fires) are automatically cleaned up after 30 seconds.
+const MERCHANT_CONCURRENCY_TTL_SEC = 30;
+const merchantMaxConcurrency = env.MERCHANT_MAX_CONCURRENCY;
+
+fastify.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) => {
+  const merchantId = (request.user as any)?.merchantId;
+  if (!merchantId) return;
+
+  const key = `concurrency:${merchantId}`;
+  try {
+    const count = await redis.incr(key);
+    if (count === 1) {
+      await redis.expire(key, MERCHANT_CONCURRENCY_TTL_SEC);
+    }
+    if (count > merchantMaxConcurrency) {
+      await redis.decr(key);
+      return reply
+        .code(429)
+        .header('Retry-After', '1')
+        .send(createErrorResponse(ErrorCodes.CONCURRENCY_EXCEEDED, 'Too many concurrent requests'));
+    }
+  } catch (err) {
+    request.log.error({ err, merchantId }, 'Concurrency limiter Redis error — allowing request through');
+  }
+});
+
+fastify.addHook('onResponse', async (request: FastifyRequest, _reply: FastifyReply) => {
+  const merchantId = (request.user as any)?.merchantId;
+  if (!merchantId) return;
+
+  const key = `concurrency:${merchantId}`;
+  try {
+    await redis.decr(key);
+  } catch (err) {
+    request.log.error({ err, merchantId }, 'Concurrency limiter Redis DECR error');
   }
 });
 
@@ -827,10 +860,11 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdatePaymentStatus
   if (!payment) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Payment not found'));
 
   const allowed = PAYMENT_STATUS_TRANSITIONS[payment.status] ?? [];
-  if (!allowed.includes(d.status)) {
+  if (!isValidTransition(PAYMENT_STATUS_TRANSITIONS, payment.status, d.status)) {
     return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid status transition', {
       from: payment.status,
       to: d.status,
+      allowedTransitions: allowed,
     }));
   }
 
@@ -843,6 +877,67 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdatePaymentStatus
     return paymentUpdate;
   });
   return reply.send({ data: updated });
+});
+
+// Bulk-cancel initiated payments belonging to the authenticated merchant.
+fastify.post<{ Body: z.infer<typeof BulkCancelPaymentsBody> }>('/api/payments/bulk-cancel', {
+  preValidation: [fastify.authenticate],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const d = BulkCancelPaymentsBody.parse(request.body);
+  const merchantId = (request.user as any).merchantId as string;
+
+  // Deduplicate IDs
+  const uniqueIds = [...new Set(d.paymentIds)];
+
+  const payments = await prisma.payment.findMany({
+    where: { id: { in: uniqueIds } },
+  });
+
+  const paymentMap = new Map(payments.map(p => [p.id, p]));
+
+  const cancelledIds: string[] = [];
+  const skippedIds: string[] = [];
+  const errors: { id: string; reason: string }[] = [];
+
+  for (const id of uniqueIds) {
+    const payment = paymentMap.get(id);
+    if (!payment) {
+      skippedIds.push(id);
+      continue;
+    }
+    if (payment.merchantId !== merchantId) {
+      skippedIds.push(id);
+      continue;
+    }
+    if (payment.status !== 'initiated') {
+      skippedIds.push(id);
+      continue;
+    }
+    cancelledIds.push(id);
+  }
+
+  if (cancelledIds.length > 0) {
+    await prisma.$transaction(async (tx) => {
+      for (const id of cancelledIds) {
+        const before = paymentMap.get(id)!;
+        const updated = await tx.payment.update({
+          where: { id },
+          data: { status: 'cancelled' },
+        });
+        await logAuditEvent('payment.status.changed', 'payment', id, { before, after: updated }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+      }
+    });
+  }
+
+  return reply.code(200).send({
+    cancelled: cancelledIds.length,
+    skipped: skippedIds.length,
+    errors: errors.length,
+    cancelledIds,
+    skippedIds,
+  });
 });
 
 fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementStatusBody> }>('/api/settlements/:id/status', {
@@ -861,20 +956,13 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementSta
   const settlement = await prisma.settlement.findUnique({ where: { id } });
   if (!settlement) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Settlement not found'));
 
-  const SETTLEMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
-    PENDING: ['PROCESSING', 'FAILED'],
-    PROCESSING: ['COMPLETED', 'FAILED'],
-    COMPLETED: [],
-    FAILED: []
-  };
-
   const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
-  if (!allowed.includes(d.status)) {
-    return reply.code(422).send({
-      error: 'Invalid status transition',
+  if (!isValidTransition(SETTLEMENT_STATUS_TRANSITIONS, settlement.status, d.status)) {
+    return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid status transition', {
       from: settlement.status,
       to: d.status,
-    });
+      allowedTransitions: allowed,
+    }));
   }
 
   const updated = await prisma.$transaction(async (tx) => {
@@ -897,7 +985,7 @@ fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: 
   config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
 }, async (request, reply) => {
   const query = SettlementListQuery.parse(request.query);
-  const { merchantId, status, from, to, limit, offset } = query as any;
+  const { merchantId, status, from, to, limit, offset, includeDeleted } = query as any;
   const where: any = {};
   if (merchantId) {
     where.merchantId = merchantId;
@@ -913,6 +1001,12 @@ fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: 
     if (to) {
       where.initiatedAt.lte = new Date(to);
     }
+  }
+
+  // When includeDeleted is false, exclude settlements belonging to soft-deleted merchants.
+  // Service-auth callers (preValidation: [fastify.serviceAuth]) always see everything.
+  if (!includeDeleted) {
+    where.merchant = { deletedAt: null };
   }
 
   const [records, total] = await Promise.all([
