@@ -48,6 +48,7 @@ import {
   startRedisMemoryMonitor,
   startMetricsServer,
 } from '@bettapay/validation';
+import { buildPaginationMeta } from '@bettapay/shared-types';
 import type { EventType } from '@bettapay/validation';
 import * as promClient from 'prom-client';
 
@@ -422,10 +423,10 @@ fastify.get('/api/health', async (_request, reply) => {
   return reply.code(statusCode).send(health);
 });
 
-// Issue #67 — paginated events endpoint with { total, limit, offset, hasMore }
+// Issue #67 — paginated events endpoint using the shared PaginatedResponse envelope
 // Internal endpoint — requires a valid x-service-token (#117).
 fastify.get('/api/events', { preValidation: [fastify.serviceAuth] }, async (request) => {
-  const { limit, offset } = PaginationQuery.parse(request.query ?? {});
+  const { limit, page } = PaginationQuery.parse(request.query ?? {});
   const typeParam = (request.query as Record<string, unknown>)?.type as string | undefined;
 
   const where: Record<string, unknown> = {};
@@ -441,14 +442,13 @@ fastify.get('/api/events', { preValidation: [fastify.serviceAuth] }, async (requ
     prisma.indexedEvent.findMany({
       where,
       take: limit,
-      skip: offset,
+      skip: (page - 1) * limit,
       orderBy: { indexedAt: 'desc' },
     }),
     prisma.indexedEvent.count({ where }),
   ]);
 
-  const hasMore = offset + limit < total;
-  return { data: dbEvents, pagination: { total, limit, offset, hasMore }, latestLedgerCursor };
+  return { data: dbEvents, pagination: buildPaginationMeta(page, limit, total), latestLedgerCursor };
 });
 
 // Issue #68 — replay historical events for a ledger range (all contracts)
