@@ -58,6 +58,7 @@
  */
 
 import { Queue, Worker, type ConnectionOptions, type WorkerOptions, type QueueOptions } from 'bullmq';
+import crypto from 'crypto';
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -67,6 +68,9 @@ export interface WebhookJobData {
   url: string;
   /** Arbitrary JSON-serialisable event payload. */
   event: Record<string, unknown>;
+  /** Optional HMAC signing secret.  When present the worker includes an
+   *  X-BettaPay-Signature header so the merchant can verify authenticity. */
+  signingSecret?: string;
 }
 
 /** Subset of a logger that the worker uses for structured output. */
@@ -80,8 +84,11 @@ export interface WebhookLogger {
 export interface WebhookQueueOptions {
   /** Number of completed jobs to keep in Redis (default 100). */
   removeOnCompleteCount?: number;
-  /** Number of failed jobs to keep in Redis for inspection (default 500). */
-  removeOnFailCount?: number;
+  /**
+   * Number of failed jobs to keep in Redis for inspection (default 500).
+   * Set to `false` to keep ALL failed jobs (useful for dead-letter patterns).
+   */
+  removeOnFail?: false | number;
   /** Number of delivery attempts before the job is marked failed (default 5). */
   attempts?: number;
   /** Initial back-off delay in milliseconds for exponential retry (default 1000). */
@@ -115,6 +122,24 @@ export const WEBHOOK_DEFAULTS = {
   removeOnFailCount: 500,
 } as const;
 
+// ── HMAC-SHA256 signing ──────────────────────────────────────────────────────
+
+/**
+ * Computes an HMAC-SHA256 signature over the raw JSON body.
+ *
+ * The returned header format is: `t={unix_seconds},s={hex_hmac}`
+ * Merchants should reject signatures older than 5 minutes to prevent replay.
+ *
+ * @param body   The raw JSON string that will be POSTed.
+ * @param secret The per-subscription signing secret.
+ * @returns      The value for the X-BettaPay-Signature header.
+ */
+export function signPayload(body: string, secret: string): string {
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const hmac = crypto.createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');
+  return `t=${timestamp},s=${hmac}`;
+}
+
 // ── Factory: Queue ────────────────────────────────────────────────────────────
 
 /**
@@ -133,9 +158,11 @@ export function createWebhookQueue(
     attempts = WEBHOOK_DEFAULTS.attempts,
     backoffDelay = WEBHOOK_DEFAULTS.backoffDelay,
     removeOnCompleteCount = WEBHOOK_DEFAULTS.removeOnCompleteCount,
-    removeOnFailCount = WEBHOOK_DEFAULTS.removeOnFailCount,
+    removeOnFail: removeOnFailOpt,
     queueOptions = {},
   } = opts;
+
+  const removeOnFailCount = removeOnFailOpt ?? WEBHOOK_DEFAULTS.removeOnFailCount;
 
   return new Queue<WebhookJobData>(name, {
     connection,
@@ -143,7 +170,7 @@ export function createWebhookQueue(
       attempts,
       backoff: { type: 'exponential', delay: backoffDelay },
       removeOnComplete: { count: removeOnCompleteCount },
-      removeOnFail: { count: removeOnFailCount },
+      removeOnFail: removeOnFailOpt === false ? false : { count: removeOnFailCount },
     },
     ...queueOptions,
   });
@@ -178,10 +205,17 @@ export function createWebhookWorker(
   const worker = new Worker<WebhookJobData>(
     queueName,
     async (job) => {
-      const { url, event } = job.data;
+      const { url, event, signingSecret } = job.data;
       const attempt = job.attemptsMade + 1; // attemptsMade is 0-indexed
 
       logger?.info({ url, jobId: job.id, attempt }, '[webhook-delivery] Delivering webhook');
+
+      const body = JSON.stringify({ event });
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+      if (signingSecret) {
+        headers['X-BettaPay-Signature'] = signPayload(body, signingSecret);
+      }
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -189,8 +223,8 @@ export function createWebhookWorker(
       try {
         const response = await fetchImpl(url, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ event }),
+          headers,
+          body,
           signal: controller.signal,
         });
 

@@ -22,7 +22,7 @@
  *   GET    /api/quote                — proxy to FX engine (timeout-aware)
  */
 
-import Fastify, { type FastifyRequest, type FastifyReply } from 'fastify';
+import Fastify, { type FastifyBaseLogger, type FastifyRequest, type FastifyReply } from 'fastify';
 import cors from '@fastify/cors';
 import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
@@ -1384,6 +1384,61 @@ fastify.get('/api/quote', async (request, reply) => {
   return fastify;
 }
 
+// ─── Warmup ─────────────────────────────────────────────────────────────────
+
+interface DownstreamService {
+  name: string;
+  healthUrl: string;
+}
+
+function getDownstreamServices(env: ReturnType<typeof validateEnv>): DownstreamService[] {
+  return [
+    { name: 'fx-engine', healthUrl: `${env.FX_ENGINE_URL}/api/health` },
+    { name: 'indexer', healthUrl: `${env.INDEXER_URL}/api/health` },
+  ];
+}
+
+/**
+ * Make best-effort warmup requests to downstream services so their caches,
+ * connection pools, and health state are ready before the gateway accepts
+ * traffic. Each call carries a unique x-trace-id so operators can correlate
+ * startup events across services.
+ *
+ * Errors are logged but never thrown — a downstream that is still warming up
+ * should not prevent the gateway from starting.
+ */
+async function warmupDownstreamServices(
+  env: ReturnType<typeof validateEnv>,
+  logger: FastifyBaseLogger,
+): Promise<void> {
+  const services = getDownstreamServices(env);
+
+  await Promise.allSettled(
+    services.map(async (svc) => {
+      const traceId = crypto.randomUUID();
+      const startTime = Date.now();
+
+      try {
+        const response = await fetch(svc.healthUrl, {
+          headers: { 'x-trace-id': traceId },
+          signal: AbortSignal.timeout(5_000),
+        });
+        const durationMs = Date.now() - startTime;
+        logger.info(
+          { traceId, targetService: svc.name, statusCode: response.status, durationMs },
+          'Warmup completed',
+        );
+      } catch (err) {
+        const durationMs = Date.now() - startTime;
+        logger.warn(
+          { traceId, targetService: svc.name, durationMs, err },
+          'Warmup failed — downstream may not be ready',
+        );
+      }
+    }),
+  );
+}
+
 // Graceful shutdown
 let mainApp: ReturnType<typeof Fastify> | null = null;
 let metricsServer: ReturnType<typeof startMetricsServer> | null = null;
@@ -1422,6 +1477,9 @@ const start = async () => {
     // #391 — wait for dependencies before accepting traffic
     await connectWithRetry(prisma, app.log);
     await waitForRedis(redis, app.log);
+
+    // #314 — warmup downstream services with unique trace IDs
+    await warmupDownstreamServices(env, app.log);
 
     // #387 — Redis memory monitoring
     startRedisMemoryMonitor(redis, app.log);
