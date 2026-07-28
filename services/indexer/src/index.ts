@@ -17,7 +17,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import crypto from 'crypto';
 import { Queue, Worker } from 'bullmq';
-import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
+import { createWebhookQueue, createWebhookWorker, WEBHOOK_DEFAULTS } from '@bettapay/webhook-delivery';
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { PrismaClient, WebhookSubscription } from '@prisma/client';
 import { rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
@@ -125,6 +125,36 @@ const webhookWorker = createWebhookWorker('indexer-webhooks', connectionParams, 
   },
 });
 const getActiveWebhookJob = trackActiveJob(webhookWorker);
+
+// ── Dead-letter queue (DLQ) for webhooks that exhaust all retries (#354) ─────
+const DLQ_QUEUE_NAME = 'indexer-webhooks-dlq';
+const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
+  connection: connectionParams,
+  defaultJobOptions: {
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 1000 },
+  },
+});
+
+webhookWorker.on('failed', async (job, err) => {
+  if (!job || job.attemptsMade < (job.opts.attempts ?? WEBHOOK_DEFAULTS.attempts)) return;
+  // All retries exhausted — move to DLQ
+  try {
+    await dlqQueue.add('failed-delivery', {
+      ...job.data,
+      failedAt: new Date().toISOString(),
+      error: err?.message ?? String(err),
+      attempts: job.attemptsMade,
+      originalJobId: job.id,
+    } as any);
+    fastify.log.warn(
+      { jobId: job.id, url: job.data.url },
+      '[Indexer] Webhook moved to dead-letter queue after all retries',
+    );
+  } catch (dlqErr) {
+    fastify.log.error({ err: dlqErr }, '[Indexer] Failed to enqueue job to DLQ');
+  }
+});
 
 // #386 — exponential backoff retry strategy
 const redisHealth = createRedisClient(env.REDIS_URL, fastify.log);
@@ -236,20 +266,31 @@ const replayWorker = new Worker(
               if (existing) continue;
             }
 
-            await prisma.indexedEvent.create({
-              data: {
-                id: 'evt_' + crypto.randomUUID().replace(/-/g, ''),
-                stellarId,
-                contractId: resolvedContractId,
-                contractName,
-                topics,
-                type: topics[0],
-                rawValue,
-                decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
-                ledger: evt.ledger,
-                indexedAt: new Date(),
-              },
-            });
+            try {
+              await prisma.indexedEvent.create({
+                data: {
+                  id: 'evt_' + crypto.randomUUID().replace(/-/g, ''),
+                  stellarId,
+                  contractId: resolvedContractId,
+                  contractName,
+                  topics,
+                  type: topics[0],
+                  rawValue,
+                  decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
+                  ledger: evt.ledger,
+                  indexedAt: new Date(),
+                },
+              });
+            } catch (err: any) {
+              if (err?.code === 'P2002') {
+                fastify.log.debug(
+                  { stellarId, contractId: resolvedContractId, ledger: evt.ledger },
+                  '[Indexer] Replay duplicate event — skipping (composite constraint)',
+                );
+                continue;
+              }
+              throw err;
+            }
 
             processedLedgers = Math.max(processedLedgers, evt.ledger - fromLedger + 1);
             await updateReplayProgress(job.id!, {
@@ -365,23 +406,35 @@ export async function persistEvent(
   rawValue: string,
   decodedPayload: unknown,
   ledger: number
-): Promise<Record<string, unknown>> {
+): Promise<Record<string, unknown> | null> {
   const id = 'evt_' + crypto.randomUUID().replace(/-/g, '');
 
-  const record = await prisma.indexedEvent.create({
-    data: {
-      id,
-      stellarId,
-      contractId,
-      contractName,
-      topics,
-      type,
-      rawValue,
-      decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
-      ledger,
-      indexedAt: new Date(),
-    },
-  });
+  let record: Record<string, unknown>;
+  try {
+    record = await prisma.indexedEvent.create({
+      data: {
+        id,
+        stellarId,
+        contractId,
+        contractName,
+        topics,
+        type,
+        rawValue,
+        decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
+        ledger,
+        indexedAt: new Date(),
+      },
+    }) as Record<string, unknown>;
+  } catch (err: any) {
+    if (err?.code === 'P2002') {
+      fastify.log.debug(
+        { stellarId, contractId, ledger, type },
+        '[Indexer] Duplicate event — skipping (composite constraint)',
+      );
+      return null;
+    }
+    throw err;
+  }
 
   fastify.log.info({ id, type, contractName, ledger }, '[Indexer] Event indexed');
 
@@ -396,7 +449,11 @@ export async function persistEvent(
 
   const subs = cacheState.subscriptions.data;
   for (const sub of subs) {
-    await webhookQueue.add('deliver', { url: sub.url, event: record as Record<string, unknown> });
+    await webhookQueue.add('deliver', {
+      url: sub.url,
+      event: record as Record<string, unknown>,
+      signingSecret: sub.signingSecret ?? undefined,
+    });
   }
 
   return record as Record<string, unknown>;
@@ -556,6 +613,58 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', { preValidation:
   return reply.code(204).send();
 });
 
+// ── Admin: dead-letter queue (#354) ──────────────────────────────────────────
+
+fastify.get('/api/admin/webhooks/dead-letter', { preValidation: [fastify.serviceAuth] }, async (request) => {
+  const { limit = 50, offset = 0 } = (request.query as Record<string, unknown>) as { limit?: number; offset?: number };
+  const safeLimit = Math.min(Number(limit) || 50, 200);
+  const safeOffset = Math.max(Number(offset) || 0, 0);
+
+  const jobs = await dlqQueue.getJobs(['failed'], safeOffset, safeOffset + safeLimit - 1);
+  const total = await dlqQueue.getJobCounts('failed');
+
+  return {
+    data: jobs.map((job) => ({
+      id: job.id,
+      url: job.data.url,
+      event: job.data.event,
+      failedAt: (job.data as any).failedAt,
+      error: (job.data as any).error,
+      attempts: (job.data as any).attempts,
+      originalJobId: (job.data as any).originalJobId,
+      timestamp: job.timestamp,
+    })),
+    pagination: { total: total.failed, limit: safeLimit, offset: safeOffset },
+  };
+});
+
+fastify.post<{ Params: { id: string } }>(
+  '/api/admin/webhooks/dead-letter/:id/replay',
+  { preValidation: [fastify.serviceAuth] },
+  async (request, reply) => {
+    const { id } = request.params;
+    const job = await dlqQueue.getJob(id);
+    if (!job) {
+      return reply.code(404).send({
+        error: { code: 'NOT_FOUND', message: `DLQ job ${id} not found` },
+      });
+    }
+
+    // Re-enqueue on the main webhook delivery queue
+    await webhookQueue.add('deliver', {
+      url: job.data.url,
+      event: job.data.event,
+      signingSecret: job.data.signingSecret,
+    });
+
+    // Remove from DLQ
+    await job.remove();
+
+    fastify.log.info({ jobId: id, url: job.data.url }, '[Indexer] DLQ job replayed');
+    return { status: 'requeued', jobId: id, url: job.data.url };
+  },
+);
+
 // ── Stellar RPC polling loop ──────────────────────────────────────────────────
 
 async function pollEvents() {
@@ -598,8 +707,8 @@ async function pollEvents() {
         const contractName = getContractName(resolvedContractId);
         const stellarId = typeof evt.id === 'string' ? evt.id : null;
 
-        await persistEvent(stellarId, topics, topics[0], resolvedContractId, contractName, rawValue, decodedPayload, evt.ledger);
-        if (latestLedgerCursor !== undefined) {
+        const result = await persistEvent(stellarId, topics, topics[0], resolvedContractId, contractName, rawValue, decodedPayload, evt.ledger);
+        if (latestLedgerCursor !== undefined && result !== null) {
           latestLedgerCursor = Math.max(latestLedgerCursor, evt.ledger + 1);
         }
       }
@@ -715,9 +824,10 @@ process.on('SIGTERM', async () => {
   await prisma.$disconnect();
   await replayQueue.close();
   await closeWorkerWithTimeout(replayWorker, 'indexer-replays', fastify.log, getActiveReplayJob);
-  await replayProgressRedis.quit().catch(() => {});
   await webhookQueue.close();
   await closeWorkerWithTimeout(webhookWorker, 'indexer-webhooks', fastify.log, getActiveWebhookJob);
+  await dlqQueue.close();
+  await replayProgressRedis.quit().catch(() => {});
   await fastify.close();
   await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
   process.exit(0);

@@ -86,7 +86,7 @@ model Settlement {
 
 model IndexedEvent {
   id             String   @id
-  stellarId      String?  @unique
+  stellarId      String?
   contractId     String
   contractName   String?
   topics         String[]
@@ -96,6 +96,7 @@ model IndexedEvent {
   ledger         Int
   indexedAt      DateTime @default(now())
 
+  @@unique([stellarId, contractId, ledger])
   @@index([ledger])
   @@index([type])
   @@index([contractId])
