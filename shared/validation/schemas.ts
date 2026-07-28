@@ -401,6 +401,32 @@ export const UpdateMerchantNameBody = z.object({
 });
 export type UpdateMerchantNameBody = z.infer<typeof UpdateMerchantNameBody>;
 
+export const SupportedAssetSchema = z.object({
+  code: z.string().min(1),
+  contractId: z.string().min(1),
+  decimals: z.number().int().min(0),
+  name: z.string().min(1),
+  isActive: z.boolean(),
+});
+export type SupportedAsset = z.infer<typeof SupportedAssetSchema>;
+
+export const CreateSupportedAssetBody = z.object({
+  code: z.string().min(1),
+  contractId: z.string().min(1),
+  decimals: z.number().int().min(0),
+  name: z.string().min(1),
+  isActive: z.boolean().default(true),
+});
+export type CreateSupportedAssetBody = z.infer<typeof CreateSupportedAssetBody>;
+
+export const UpdateSupportedAssetBody = z.object({
+  contractId: z.string().min(1).optional(),
+  decimals: z.number().int().min(0).optional(),
+  name: z.string().min(1).optional(),
+  isActive: z.boolean().optional(),
+});
+export type UpdateSupportedAssetBody = z.infer<typeof UpdateSupportedAssetBody>;
+
 export const BulkCancelPaymentsBody = z.object({
   paymentIds: z.array(z.string().min(1)).min(1, 'At least one payment ID is required').max(100, 'Maximum 100 payment IDs allowed'),
 });
