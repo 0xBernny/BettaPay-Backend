@@ -34,6 +34,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import BigNumber from 'bignumber.js';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { computeSettlementAmounts } from './settlement-amounts.js';
+import type { DiscountTier } from './settlement-amounts.js';
 import { acquireSemaphore, releaseSemaphore, getActiveCount } from './redis-semaphore.js';
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import {
@@ -197,6 +198,53 @@ const metricsServer = startMetricsServer({
 });
 
 // ── Database & Redis Setup ───────────────────────────────────────────────────────
+
+// ── Monthly volume helper (Redis-cached, 5-min TTL) ─────────────────────────
+//
+// Used by volume-based fee discounts (#323).  Queries the sum of grossAmount
+// for the current calendar month for a given merchant, caching the result in
+// Redis for MONTHLY_VOLUME_CACHE_TTL_SECONDS to avoid a DB round-trip on
+// every settlement request.
+//
+// Cache key: `monthlyVol:{merchantId}:{YYYY-MM}`
+// On Redis miss or error: falls back to a live DB query; on DB error: returns 0.
+const MONTHLY_VOLUME_CACHE_TTL_SECONDS = 300; // 5 minutes
+
+async function getMonthlyVolume(merchantId: string): Promise<number> {
+  const now = new Date();
+  const yearMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const cacheKey = `monthlyVol:${merchantId}:${yearMonth}`;
+
+  try {
+    const cached = await redis.get(cacheKey);
+    if (cached !== null) {
+      const parsed = parseFloat(cached);
+      return isFinite(parsed) ? parsed : 0;
+    }
+  } catch {
+    // Redis unavailable — fall through to DB query
+  }
+
+  try {
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const result = await prisma.$queryRaw<[{ sum: string | null }]>`
+      SELECT COALESCE(SUM(CAST("grossAmount" AS DECIMAL)), 0)::text AS sum
+      FROM "Settlement"
+      WHERE "merchantId" = ${merchantId}
+        AND "initiatedAt" >= ${monthStart}
+        AND "status" IN ('completed', 'pending', 'processing')
+    `;
+    const volume = parseFloat(result[0]?.sum ?? '0');
+    const safeVolume = isFinite(volume) ? volume : 0;
+
+    // Populate cache (best-effort; ignore Redis errors)
+    await redis.set(cacheKey, String(safeVolume), 'EX', MONTHLY_VOLUME_CACHE_TTL_SECONDS).catch(() => {});
+
+    return safeVolume;
+  } catch {
+    return 0;
+  }
+}
 
 const worker = new Worker('settlements', async job => {
   const settlementId = job.data.id;
@@ -624,7 +672,27 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     }
     const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
 
-    const { grossAmount, feeAmount, netAmount, feeSnapshot } = computeSettlementAmounts(d.amount, feeBps);
+    // Fetch monthly volume for volume-based fee discount (#323).
+    // Redis-cached with a 5-min TTL; falls back to DB query on cache miss.
+    const monthlyVolume = await getMonthlyVolume(d.merchantId);
+    const discountTiers: DiscountTier[] = env.FEE_DISCOUNT_TIERS ?? [];
+
+    const { grossAmount, feeAmount, netAmount, feeSnapshot } = computeSettlementAmounts(
+      d.amount,
+      feeBps,
+      monthlyVolume,
+      discountTiers,
+    );
+
+    if (feeSnapshot.discountApplied > 0) {
+      fastify.log.info({
+        merchantId: d.merchantId,
+        monthlyVolume,
+        baseBps: feeBps,
+        effectiveBps: feeSnapshot.feeBpsApplied,
+        discountBps: feeSnapshot.discountApplied,
+      }, '[Settlement] Volume-based fee discount applied');
+    }
 
     const rawIdempotencyKey = request.headers['idempotency-key'];
     const idempotencyKey = Array.isArray(rawIdempotencyKey) ? rawIdempotencyKey[0] : rawIdempotencyKey;
@@ -719,6 +787,10 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     const feeBps = parsedFeeRule.success ? parsedFeeRule.data.feeBps : env.FEES_DEFAULT_BPS;
     const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
 
+    // Fetch monthly volume for volume-based fee discount (#323).
+    const monthlyVolume = await getMonthlyVolume(d.merchantId);
+    const discountTiers: DiscountTier[] = env.FEE_DISCOUNT_TIERS ?? [];
+
     // Fetch current daily total
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
@@ -780,7 +852,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         }
       }
 
-      const { grossAmount, feeAmount, netAmount } = computeSettlementAmounts(item.amount, feeBps);
+      const { grossAmount, feeAmount, netAmount } = computeSettlementAmounts(item.amount, feeBps, monthlyVolume, discountTiers);
       const settlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
 
       validItems.push({
