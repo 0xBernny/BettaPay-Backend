@@ -14,6 +14,7 @@
   "dependencies": {
     "@bettapay/webhook-delivery": "workspace:*",
     "@bettapay/validation": "workspace:*",
+    "@bettapay/shared-types": "workspace:^",
     "@fastify/cors": "*",
     "@fastify/rate-limit": "^11.1.0",
     "@prisma/adapter-pg": "^7.8.0",

@@ -107,6 +107,25 @@ export function createMockPrisma(initialData: MockData = {}) {
     },
   };
 
+  function filterSettlements(where: any = {}) {
+    let result = [...store.settlements];
+    if (where?.merchantId) {
+      result = result.filter((s) => s.merchantId === where.merchantId);
+    }
+    if (where?.status) {
+      result = result.filter((s) => s.status === where.status);
+    }
+    if (where?.initiatedAt?.gte) {
+      const gte = new Date(where.initiatedAt.gte);
+      result = result.filter((s) => new Date(s.initiatedAt) >= gte);
+    }
+    if (where?.initiatedAt?.lte) {
+      const lte = new Date(where.initiatedAt.lte);
+      result = result.filter((s) => new Date(s.initiatedAt) <= lte);
+    }
+    return result;
+  }
+
   const mockSettlement = {
     findUnique: async ({ where }: { where: { id: string } }) => {
       return store.settlements.find((s) => s.id === where.id) || null;
@@ -114,16 +133,16 @@ export function createMockPrisma(initialData: MockData = {}) {
     findFirst: async ({ where }: { where: any }) => {
       return store.settlements.find((s) => s.id === where.id) || null;
     },
-    findMany: async ({ where }: { where?: any } = {}) => {
-      let result = [...store.settlements];
-      if (where?.merchantId) {
-        result = result.filter((s) => s.merchantId === where.merchantId);
-      }
-      if (where?.initiatedAt?.gte) {
-        const gte = new Date(where.initiatedAt.gte);
-        result = result.filter((s) => new Date(s.initiatedAt) >= gte);
-      }
-      return result;
+    findMany: async ({ where, take, skip }: { where?: any; take?: number; skip?: number } = {}) => {
+      const result = filterSettlements(where).sort(
+        (a, b) => new Date(b.initiatedAt).getTime() - new Date(a.initiatedAt).getTime()
+      );
+      const start = skip || 0;
+      const end = take !== undefined ? start + take : undefined;
+      return result.slice(start, end);
+    },
+    count: async ({ where }: { where?: any } = {}) => {
+      return filterSettlements(where).length;
     },
     create: async ({ data }: { data: any }) => {
       const created = {

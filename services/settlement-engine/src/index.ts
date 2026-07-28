@@ -62,6 +62,7 @@ import {
   runStartupChecks,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
+import { buildPaginationMeta } from '@bettapay/shared-types';
 
 
 
@@ -414,14 +415,13 @@ fastify.get('/api/settlements', async (request, reply): Promise<PaginatedRespons
   const records = await prisma.settlement.findMany({
     where,
     take: limit,
-    skip: offset,
+    skip: (page - 1) * limit,
     orderBy: { initiatedAt: 'desc' },
   });
   const total = await prisma.settlement.count({ where });
-  const hasMore = offset + limit < total;
   return {
     data: records,
-    pagination: { total, limit, offset, hasMore }
+    pagination: buildPaginationMeta(page, limit, total)
   };
 });
 

@@ -445,8 +445,8 @@ export const BulkCancelPaymentsBody = z.object({
 export type BulkCancelPaymentsBody = z.infer<typeof BulkCancelPaymentsBody>;
 
 export const PaginationQuery = z.object({
-  limit: z.coerce.number().max(200).default(50),
-  offset: z.coerce.number().min(0).default(0),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 export type PaginationQuery = z.infer<typeof PaginationQuery>;
 

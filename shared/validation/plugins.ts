@@ -159,7 +159,7 @@ export function createServiceAuth(
 
     if (!token || !timingSafeStrEqual(token, secret)) {
       request.log?.warn({ reqId: request.id }, 'serviceAuth: missing or invalid service token');
-      await reply
+      return reply
         .code(401)
         .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid or missing service token'));
     }
