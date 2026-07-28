@@ -15,11 +15,13 @@
   "dependencies": {
     "@bettapay/shared-types": "workspace:^",
     "@bettapay/validation": "workspace:*",
+    "@bettapay/webhook-delivery": "workspace:*",
     "@fastify/helmet": "^12.0.0",
     "@fastify/rate-limit": "~11.0.0",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
     "@stellar/stellar-sdk": "^16.0.1",
+    "bullmq": "^5.79.1",
     "google-auth-library": "^10.9.0",
     "ioredis": "^5.11.1",
     "pg": "^8.22.0",
