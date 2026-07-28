@@ -357,6 +357,33 @@ export const UpdateSettlementStatusBody = z.object({
 });
 export type UpdateSettlementStatusBody = z.infer<typeof UpdateSettlementStatusBody>;
 
+// ─── Status transition state machines ─────────────────────────────────────────
+// These maps define which status transitions are valid for payments and
+// settlements. Any transition not in the map is rejected with 422.
+
+export const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
+  initiated: ['completed', 'failed', 'cancelled'],
+  completed: [],
+  failed: [],
+  cancelled: [],
+};
+
+export const SETTLEMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
+  pending: ['processing', 'failed'],
+  processing: ['completed', 'failed'],
+  completed: [],
+  failed: [],
+};
+
+export function isValidTransition(
+  transitions: Record<string, readonly string[]>,
+  from: string,
+  to: string,
+): boolean {
+  const allowed = transitions[from] ?? [];
+  return allowed.includes(to);
+}
+
 // Per-merchant fee rule configuration. feeBps is basis points (1% = 100 bps),
 // capped at 10000 (100%). Unknown keys are stripped; the route merges these into
 // the merchant's existing settings rather than replacing them.
@@ -389,6 +416,7 @@ export const SettlementListQuery = PaginationQuery.extend({
   status: z.enum(['pending', 'processing', 'completed', 'failed']).optional(),
   from: isoDateString.optional(),
   to: isoDateString.optional(),
+  includeDeleted: z.coerce.boolean().default(false),
 }).refine(
   (data) => !data.from || !data.to || data.from <= data.to,
   { message: 'from must be before to' }

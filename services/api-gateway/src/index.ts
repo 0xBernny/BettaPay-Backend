@@ -49,6 +49,9 @@ import {
   WalletVerifyBody,
   SettlementListQuery,
   BulkCancelPaymentsBody,
+  PAYMENT_STATUS_TRANSITIONS,
+  SETTLEMENT_STATUS_TRANSITIONS,
+  isValidTransition,
   createErrorResponse,
   ErrorCodes,
   registerErrorHandler,
@@ -74,17 +77,6 @@ declare module 'fastify' {
     authenticate: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
 }
-
-
-
-// Allowed payment status transitions. `initiated` is the only non-terminal state;
-// completed, failed, and cancelled are terminal and cannot transition further.
-const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
-  initiated: ['completed', 'failed', 'cancelled'],
-  completed: [],
-  failed: [],
-  cancelled: [],
-};
 
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -868,10 +860,11 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdatePaymentStatus
   if (!payment) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Payment not found'));
 
   const allowed = PAYMENT_STATUS_TRANSITIONS[payment.status] ?? [];
-  if (!allowed.includes(d.status)) {
+  if (!isValidTransition(PAYMENT_STATUS_TRANSITIONS, payment.status, d.status)) {
     return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid status transition', {
       from: payment.status,
       to: d.status,
+      allowedTransitions: allowed,
     }));
   }
 
@@ -963,20 +956,13 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementSta
   const settlement = await prisma.settlement.findUnique({ where: { id } });
   if (!settlement) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Settlement not found'));
 
-  const SETTLEMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
-    PENDING: ['PROCESSING', 'FAILED'],
-    PROCESSING: ['COMPLETED', 'FAILED'],
-    COMPLETED: [],
-    FAILED: []
-  };
-
   const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
-  if (!allowed.includes(d.status)) {
-    return reply.code(422).send({
-      error: 'Invalid status transition',
+  if (!isValidTransition(SETTLEMENT_STATUS_TRANSITIONS, settlement.status, d.status)) {
+    return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid status transition', {
       from: settlement.status,
       to: d.status,
-    });
+      allowedTransitions: allowed,
+    }));
   }
 
   const updated = await prisma.$transaction(async (tx) => {
@@ -999,7 +985,7 @@ fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: 
   config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
 }, async (request, reply) => {
   const query = SettlementListQuery.parse(request.query);
-  const { merchantId, status, from, to, limit, offset } = query as any;
+  const { merchantId, status, from, to, limit, offset, includeDeleted } = query as any;
   const where: any = {};
   if (merchantId) {
     where.merchantId = merchantId;
@@ -1015,6 +1001,12 @@ fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: 
     if (to) {
       where.initiatedAt.lte = new Date(to);
     }
+  }
+
+  // When includeDeleted is false, exclude settlements belonging to soft-deleted merchants.
+  // Service-auth callers (preValidation: [fastify.serviceAuth]) always see everything.
+  if (!includeDeleted) {
+    where.merchant = { deletedAt: null };
   }
 
   const [records, total] = await Promise.all([
