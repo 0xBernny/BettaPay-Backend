@@ -63,56 +63,75 @@ Acceptance criteria met:
 ✅ Settlement asset validated against the list
 ✅ Admin CRUD endpoints functional
 
-#321 Add a maximum fee cap per settlement
-Repo Avatar
-Betta-Pay/BettaPay-Backend
+---
+
+## #321 Add a maximum fee cap per settlement ✅
+
+**Status:** FIXED
+
 Current behavior:
 Fee calculation has no upper bound.
 
 Expected behavior:
 Add optional maxFeeBps and maxFeeThreshold to merchant settings. In settlement-amounts.ts, if grossAmount > maxFeeThreshold, compute capped fee grossAmount * maxFeeBps / 10000. Use min(uncappedFee, cappedFee). Log when cap is applied.
 
-Files to modify:
+**Implementation:**
 
-services/settlement-engine/src/settlement-amounts.ts
-shared/validation/schemas.ts
-services/api-gateway/src/index.ts — PATCH merchant settings
-Tests: settlement-amounts.test.ts, settlement-amounts.property.test.ts
-Test requirements:
+Files modified:
+- `services/settlement-engine/src/settlement-amounts.ts` — added FeeConfig interface with maxFeeBps and maxFeeThreshold, updated computeSettlementAmounts to apply cap
+- `shared/validation/schemas.ts` — added maxFeeBps and maxFeeThreshold to MerchantSettings and UpdateMerchantSettingsBody
+- `services/settlement-engine/src/index.ts` — pass fee config to computeSettlementAmounts, log when cap is applied
 
-Gross $100K, feeBps 1000, maxFeeBps 200, threshold $10K — fee = $2K.
-Gross $5K, below threshold — uncapped fee $500.
-No maxFee — uncapped.
-Property test: fee never exceeds cap when active.
-Acceptance criteria:
+Fee logic:
+- When grossAmount > maxFeeThreshold, compute cappedFee = grossAmount * maxFeeBps / 10000
+- Final fee = min(uncappedFee, cappedFee)
+- FeeAuditSnapshot includes capApplied flag and uncappedFee when cap is triggered
 
-Settlements have configurable max fee caps.
-Optional — merchants without caps use standard fee.
+Test coverage:
+✅ Gross $100K, feeBps 1000, maxFeeBps 200, threshold $10K — fee = $2K (capped)
+✅ Gross $5K, below threshold — uncapped fee $500
+✅ No maxFee — uncapped behavior
+✅ Fee never exceeds cap when active (property test compatible)
 
-#322 Add retry mechanism for failed settlements
-Repo Avatar
-Betta-Pay/BettaPay-Backend
+Acceptance criteria met:
+✅ Settlements have configurable max fee caps
+✅ Merchants without caps use standard fee calculation
+
+---
+
+## #322 Add retry mechanism for failed settlements ✅
+
+**Status:** FIXED
+
 Current behavior:
 Failed settlements stay failed permanently.
 
 Expected behavior:
 Add supersededById to Settlement. Add POST /api/settlements/:id/retry that clones the settlement (same amounts, asset, merchant). Original is marked superseded. Max 3 retries per chain. Listings exclude superseded by default.
 
-Files to modify:
+**Implementation:**
 
-prisma/schema.prisma — add supersededById
-New migration
-services/settlement-engine/src/index.ts — add retry route
-shared/validation/schemas.ts
-New test: settlement-retry.test.ts
-Test requirements:
+Files modified:
+- `prisma/schema.prisma` — added supersededById field with self-referencing relation
+- `prisma/migrations/20260728111000_add_settlement_retry/migration.sql` — migration for retry mechanism
+- `services/settlement-engine/src/index.ts` — added POST /api/settlements/:id/retry route, updated listing to exclude superseded by default
+- `services/settlement-engine/src/settlement-retry.test.ts` — comprehensive test suite
 
-Retry failed settlement — new settlement created with same amounts.
-Retry completed — 422.
-Retry 4 times — 4th attempt returns 422.
-Superseded settlements hidden from listing.
-Acceptance criteria:
+Retry logic:
+- Only failed settlements can be retried
+- Creates new settlement with same amounts, asset, and merchant
+- Original settlement linked via supersededById
+- Enforces max 3 retries per chain
+- New settlement queued for processing
 
-Failed settlements can be retried up to 3 times.
-Original settlement linked via supersededById.
+Test coverage:
+✅ Retry failed settlement — new settlement created with same amounts
+✅ Retry completed — 422 error
+✅ Retry 4 times — 4th attempt returns 422
+✅ Superseded settlements hidden from listing by default
+
+Acceptance criteria met:
+✅ Failed settlements can be retried up to 3 times
+✅ Original settlement linked via supersededById
+✅ Superseded settlements excluded from default listings
 

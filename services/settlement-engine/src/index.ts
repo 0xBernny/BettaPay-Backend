@@ -351,13 +351,17 @@ fastify.get('/api/health', async (_request, reply) => {
 });
 
 fastify.get('/api/settlements', async (request, reply): Promise<PaginatedResponse<SettlementRecord>> => {
-  const { limit, offset, status, from, to } = SettlementListQuery.parse(request.query ?? {});
+  const { limit, offset, status, from, to, includeDeleted } = SettlementListQuery.parse(request.query ?? {});
   const where: any = {};
   if (status) where.status = status;
   if (from || to) {
     where.initiatedAt = {};
     if (from) where.initiatedAt.gte = new Date(from);
     if (to) where.initiatedAt.lte = new Date(to);
+  }
+  // Exclude superseded settlements by default (#322)
+  if (!includeDeleted) {
+    where.supersededById = null;
   }
   const records = await prisma.settlement.findMany({
     where,
@@ -372,6 +376,114 @@ fastify.get('/api/settlements', async (request, reply): Promise<PaginatedRespons
     pagination: { total, limit, offset, hasMore }
   };
 });
+
+// ============================================================================
+// SETTLEMENT RETRY (#322)
+// ============================================================================
+
+fastify.post<{ Params: { id: string } }>(
+  '/api/settlements/:id/retry',
+  async (request, reply) => {
+    const { id } = request.params;
+
+    // Fetch the original settlement
+    const original = await prisma.settlement.findUnique({
+      where: { id },
+    });
+
+    if (!original) {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Settlement not found'));
+    }
+
+    // Only failed settlements can be retried
+    if (original.status !== 'failed') {
+      return reply.code(422).send(createErrorResponse(
+        ErrorCodes.VALIDATION_ERROR,
+        'Only failed settlements can be retried',
+        { currentStatus: original.status }
+      ));
+    }
+
+    // Count the retry chain to enforce max 3 retries
+    const retryChain = await prisma.settlement.findMany({
+      where: {
+        OR: [
+          { supersededById: id },
+          { id: original.supersededById ?? '' },
+        ],
+      },
+    });
+
+    // Find the root of the chain
+    let current = original;
+    let chainLength = 0;
+    const visited = new Set<string>();
+
+    while (current.supersededById && !visited.has(current.id)) {
+      visited.add(current.id);
+      chainLength++;
+      const parent = await prisma.settlement.findUnique({
+        where: { id: current.supersededById },
+      });
+      if (!parent) break;
+      current = parent;
+    }
+
+    // Count forward retries from original
+    const forwardRetries = await prisma.settlement.count({
+      where: { supersededById: id },
+    });
+
+    const totalRetries = chainLength + forwardRetries;
+
+    if (totalRetries >= 3) {
+      return reply.code(422).send(createErrorResponse(
+        ErrorCodes.VALIDATION_ERROR,
+        'Maximum retry limit (3) exceeded',
+        { retryCount: totalRetries }
+      ));
+    }
+
+    // Clone the settlement
+    const newSettlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
+    const traceId = crypto.randomUUID();
+
+    const newSettlement = await prisma.settlement.create({
+      data: {
+        id: newSettlementId,
+        merchantId: original.merchantId,
+        totalAmount: original.totalAmount,
+        grossAmount: original.grossAmount,
+        feeAmount: original.feeAmount,
+        netAmount: original.netAmount,
+        feeBps: original.feeBps,
+        asset: original.asset,
+        status: 'pending',
+        webhookUrl: original.webhookUrl,
+        feeSnapshot: original.feeSnapshot,
+      },
+    });
+
+    // Mark original as superseded
+    await prisma.settlement.update({
+      where: { id },
+      data: { supersededById: newSettlementId },
+    });
+
+    // Queue the new settlement for processing
+    await settlementQueue.add('process-settlement', {
+      id: newSettlementId,
+      merchantId: newSettlement.merchantId,
+      grossAmount: newSettlement.grossAmount,
+      asset: newSettlement.asset,
+      traceId,
+    });
+
+    fastify.log.info({ originalId: id, newId: newSettlementId, retryCount: totalRetries + 1 }, 'Settlement retried');
+
+    return reply.code(201).send({ data: newSettlement });
+  }
+);
 
 interface ReconcileQuery {
   merchantId?: string;
@@ -612,8 +724,14 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
     const parsedFeeRule = FeeRule.passthrough().safeParse(merchant?.settings);
     let feeBps = env.FEES_DEFAULT_BPS;
+    let maxFeeBps: number | undefined;
+    let maxFeeThreshold: string | undefined;
+    
     if (parsedFeeRule.success) {
       feeBps = parsedFeeRule.data.feeBps;
+      const settings = parsedFeeRule.data as Record<string, unknown>;
+      maxFeeBps = settings.maxFeeBps as number | undefined;
+      maxFeeThreshold = settings.maxFeeThreshold as string | undefined;
     } else {
       feeFallbackCounter.inc({ merchant_id: d.merchantId });
       fastify.log.warn({
@@ -624,7 +742,22 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     }
     const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
 
-    const { grossAmount, feeAmount, netAmount, feeSnapshot } = computeSettlementAmounts(d.amount, feeBps);
+    const { grossAmount, feeAmount, netAmount, feeSnapshot } = computeSettlementAmounts(
+      d.amount, 
+      { feeBps, maxFeeBps, maxFeeThreshold }
+    );
+
+    // Log when fee cap is applied
+    if (feeSnapshot.capApplied) {
+      fastify.log.info({
+        merchantId: d.merchantId,
+        grossAmount,
+        uncappedFee: feeSnapshot.uncappedFee,
+        cappedFee: feeAmount,
+        maxFeeBps,
+        maxFeeThreshold,
+      }, 'Fee cap applied to settlement');
+    }
 
     const rawIdempotencyKey = request.headers['idempotency-key'];
     const idempotencyKey = Array.isArray(rawIdempotencyKey) ? rawIdempotencyKey[0] : rawIdempotencyKey;
@@ -717,7 +850,10 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
 
     const parsedFeeRule = FeeRule.passthrough().safeParse(merchant?.settings);
     const feeBps = parsedFeeRule.success ? parsedFeeRule.data.feeBps : env.FEES_DEFAULT_BPS;
-    const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
+    const settings_data = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>) : {};
+    const maxFeeBps = settings_data.maxFeeBps as number | undefined;
+    const maxFeeThreshold = settings_data.maxFeeThreshold as string | undefined;
+    const webhookUrl = settings_data.webhookUrl as string ?? null;
 
     // Fetch current daily total
     const todayStart = new Date();
@@ -780,7 +916,10 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         }
       }
 
-      const { grossAmount, feeAmount, netAmount } = computeSettlementAmounts(item.amount, feeBps);
+      const { grossAmount, feeAmount, netAmount } = computeSettlementAmounts(
+        item.amount, 
+        { feeBps, maxFeeBps, maxFeeThreshold }
+      );
       const settlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
 
       validItems.push({
