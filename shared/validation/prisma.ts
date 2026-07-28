@@ -1,5 +1,28 @@
 export type PrismaLogLevel = 'query' | 'info' | 'warn' | 'error';
 
+const ALL_PRISMA_LOG_LEVELS: readonly PrismaLogLevel[] = ['query', 'info', 'warn', 'error'];
+
+function isPrismaLogLevel(value: string): value is PrismaLogLevel {
+  return (ALL_PRISMA_LOG_LEVELS as readonly string[]).includes(value);
+}
+
+// PRISMA_LOG_LEVELS is a comma-separated override, e.g. "error,warn". Falls
+// back to the NODE_ENV default when unset, empty, or containing no valid level.
+function parsePrismaLogLevelsOverride(raw: string | undefined): PrismaLogLevel[] | undefined {
+  if (!raw) return undefined;
+  const levels = raw
+    .split(',')
+    .map((level) => level.trim().toLowerCase())
+    .filter(isPrismaLogLevel);
+  return levels.length > 0 ? levels : undefined;
+}
+
+function defaultPrismaLogLevelsForEnv(nodeEnv: string | undefined): PrismaLogLevel[] {
+  if (nodeEnv === 'production') return ['error', 'warn'];
+  if (nodeEnv === 'test') return ['error'];
+  return ['query', 'info', 'warn', 'error'];
+}
+
 export interface PrismaQueryEvent {
   query: string;
   duration: number;
@@ -28,10 +51,10 @@ export function shouldEnablePrismaQueryLogging(): boolean {
 }
 
 export function getPrismaLogLevels(): PrismaLogLevel[] {
-  const levels: PrismaLogLevel[] = ['error', 'warn'];
-  if (shouldEnablePrismaQueryLogging()) {
-    levels.push('query');
-  }
+  const override = parsePrismaLogLevelsOverride(process.env.PRISMA_LOG_LEVELS);
+  const levels = override ?? defaultPrismaLogLevelsForEnv(process.env.NODE_ENV);
+  const source = override ? 'PRISMA_LOG_LEVELS override' : `NODE_ENV=${process.env.NODE_ENV ?? 'development'} default`;
+  console.log(`[Prisma] log levels: ${levels.join(', ')} (${source})`);
   return levels;
 }
 

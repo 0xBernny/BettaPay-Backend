@@ -1,32 +1,8 @@
 import test from 'tape';
-import Fastify from 'fastify';
-import { createErrorResponse, ErrorCodes } from '@bettapay/validation';
 import type { IndexerClient, IndexerEvent } from './clients/indexer-client.js';
-
-// Mirrors the GET /api/payments/:id enrichment logic in src/index.ts, backed by
-// an in-memory payment and an injectable indexer client (same self-contained
-// style as payment-status.test.ts) so no DB or live indexer is required.
+import { createTestApp } from './test-utils.js';
 
 const PAYMENT = { id: 'pay_1', merchantId: 'merchant_1', status: 'completed', amount: '10.00', asset: 'USDC' };
-
-function buildApp(indexer: IndexerClient, payment: typeof PAYMENT | null = PAYMENT) {
-  const app = Fastify({ logger: false });
-
-  app.get<{ Params: { id: string }; Querystring: { includeEvents?: string } }>(
-    '/api/payments/:id',
-    async (request, reply) => {
-      if (!payment) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Payment not found'));
-
-      if (request.query.includeEvents === 'true') {
-        const events = await indexer.getPaymentEvents(payment.merchantId);
-        return { ...payment, events };
-      }
-      return payment;
-    },
-  );
-
-  return app;
-}
 
 const sampleEvents: IndexerEvent[] = [
   { id: 'evt_0', contractId: 'C1', topics: ['PaymentCompleted'], type: 'PaymentCompleted', rawValue: 'AAAA', ledger: 100, indexedAt: 'now' },
@@ -40,7 +16,8 @@ test('includeEvents=true enriches the payment with indexer events', async (t) =>
       return sampleEvents;
     },
   };
-  const app = buildApp(indexer);
+
+  const { app } = createTestApp({ indexerClient: indexer }, { payments: [PAYMENT] });
   const res = await app.inject({ method: 'GET', url: '/api/payments/pay_1?includeEvents=true' });
   const body = JSON.parse(res.body);
 
@@ -58,7 +35,8 @@ test('indexer unavailability degrades to payment data with events: null', async 
       return null; // simulates indexer down / timeout
     },
   };
-  const app = buildApp(indexer);
+
+  const { app } = createTestApp({ indexerClient: indexer }, { payments: [PAYMENT] });
   const res = await app.inject({ method: 'GET', url: '/api/payments/pay_1?includeEvents=true' });
   const body = JSON.parse(res.body);
 
@@ -77,7 +55,8 @@ test('without includeEvents the indexer is not queried', async (t) => {
       return sampleEvents;
     },
   };
-  const app = buildApp(indexer);
+
+  const { app } = createTestApp({ indexerClient: indexer }, { payments: [PAYMENT] });
   const res = await app.inject({ method: 'GET', url: '/api/payments/pay_1' });
   const body = JSON.parse(res.body);
 
@@ -90,7 +69,7 @@ test('without includeEvents the indexer is not queried', async (t) => {
 
 test('a missing payment returns 404 regardless of includeEvents', async (t) => {
   const indexer: IndexerClient = { async getPaymentEvents() { return sampleEvents; } };
-  const app = buildApp(indexer, null);
+  const { app } = createTestApp({ indexerClient: indexer }, { payments: [] });
   const res = await app.inject({ method: 'GET', url: '/api/payments/nope?includeEvents=true' });
   t.equal(res.statusCode, 404, 'returns 404 Not Found');
   await app.close();

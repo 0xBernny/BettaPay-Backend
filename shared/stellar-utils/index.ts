@@ -3,7 +3,7 @@
  * Provides helpers for interacting with the Stellar blockchain
  */
 
-import { StrKey } from '@stellar/stellar-sdk';
+import { StrKey, Keypair } from '@stellar/stellar-sdk';
 
 type Amount = string;
 type Stroops = string;
@@ -11,87 +11,30 @@ type Stroops = string;
 export function validateStellarAddress(address: string): boolean {
   return StrKey.isValidEd25519PublicKey(address);
 }
+export const validateStellarPublicKey = validateStellarAddress;
 
-/**
- * Builds a normalized Stellar set-options operation object for multi-signature
- * account configuration. Supports master weight, signing thresholds, and additional
- * signers. All threshold and weight values must be integers in the range 0–255.
- *
- * @param params.masterWeight  Weight of the account's master key (0 removes signing authority)
- * @param params.lowThreshold  Threshold for low-security operations
- * @param params.medThreshold  Threshold for medium-security operations
- * @param params.highThreshold Threshold for high-security operations
- * @param params.signer        Additional signer to add or remove from the account
- * @throws {Error} When any threshold or weight value is outside 0–255
- * @throws {Error} When signer.key is not a valid Stellar address
- */
-export function buildSetOptionsOp(params: {
-  masterWeight?: number;
-  lowThreshold?: number;
-  medThreshold?: number;
-  highThreshold?: number;
-  signer?: { key: string; weight: number };
-}): {
-  type: 'setOptions';
-  masterWeight: number | null;
-  lowThreshold: number | null;
-  medThreshold: number | null;
-  highThreshold: number | null;
-  signer: { key: string; weight: number } | null;
-} {
-  const { masterWeight, lowThreshold, medThreshold, highThreshold, signer } = params;
-
-  const thresholdFields: Record<string, number | undefined> = {
-    masterWeight,
-    lowThreshold,
-    medThreshold,
-    highThreshold,
-  };
-
-  for (const [field, value] of Object.entries(thresholdFields)) {
-    if (value !== undefined) {
-      if (!Number.isInteger(value) || value < 0 || value > 255) {
-        throw new Error(`${field} must be an integer between 0 and 255`);
-      }
-    }
-  }
-
-  if (signer !== undefined) {
-    if (!validateStellarAddress(signer.key)) {
-      throw new Error('signer.key must be a valid Stellar address');
-    }
-    if (!Number.isInteger(signer.weight) || signer.weight < 0 || signer.weight > 255) {
-      throw new Error('signer.weight must be an integer between 0 and 255');
-    }
-  }
-
-  return {
-    type: 'setOptions',
-    masterWeight: masterWeight ?? null,
-    lowThreshold: lowThreshold ?? null,
-    medThreshold: medThreshold ?? null,
-    highThreshold: highThreshold ?? null,
-    signer: signer ?? null,
-  };
+export function validateTransactionHash(hash: string): boolean {
+  return /^[0-9a-fA-F]{64}$/.test(hash);
 }
 
 /**
- * Converts a decimal string amount to Stellar stroops (the smallest unit).
+ * Generate a random Ed25519 Stellar keypair.
  *
- * Expected format: a non-negative decimal string matching `/^\d+(\.\d+)?$/`
- * (e.g. `"100"`, `"0.5"`, `"100.0000001"`). Negative numbers, empty strings,
- * scientific notation, and leading/trailing spaces are all rejected.
- * If the fractional part has more digits than `decimals`, excess digits are truncated.
+ * The returned `secretKey` is the master seed and **must** be stored
+ * securely (e.g. encrypted at rest, environment variable, or secret
+ * manager). It must **never** be logged, included in error messages,
+ * or sent over unencrypted channels.
  *
- * @param decimalStr - Non-negative numeric string representing the amount.
- * @param decimals   - Number of decimal places for the asset (default 7, matching XLM/USDC).
- * @returns The equivalent amount expressed as a string of integer stroops.
- * @throws {TypeError} If `decimalStr` is not a valid non-negative numeric string.
+ * @returns An object with `publicKey` (G…) and `secretKey` (S…).
  */
-export function toStellarAmount(decimalStr: Amount, decimals = 7): Stroops {
-  if (!/^\d+(\.\d+)?$/.test(decimalStr)) {
-    throw new TypeError('toStellarAmount: input must be a valid numeric string');
-  }
+export function generateStellarKeypair(): { publicKey: string; secretKey: string } {
+  const keypair = Keypair.random();
+  return { publicKey: keypair.publicKey(), secretKey: keypair.secret() };
+}
+
+// Convert decimal string to stroops (string of integer stroops)
+export function toStellarAmount(decimalStr: string, decimals = 7): string {
+  // naive conversion: multiply decimal by 10^decimals
   const [whole, frac = ''] = decimalStr.split('.');
   const paddedFrac = (frac + '0'.repeat(decimals)).slice(0, decimals);
   const stroops = BigInt(whole || '0') * BigInt(10 ** decimals) + BigInt(paddedFrac || '0');
@@ -137,6 +80,34 @@ export function buildPaymentOperation(params: { source?: string; destination: st
     destination: params.destination,
     asset: params.asset,
     amount: params.amount
+  };
+}
+
+export function buildSetOptionsOp(params: any) {
+  if (params.masterWeight !== undefined) {
+    if (!Number.isInteger(params.masterWeight) || params.masterWeight < 0 || params.masterWeight > 255) throw new Error('masterWeight must be an integer between 0 and 255');
+  }
+  if (params.lowThreshold !== undefined) {
+    if (!Number.isInteger(params.lowThreshold) || params.lowThreshold < 0 || params.lowThreshold > 255) throw new Error('lowThreshold must be an integer between 0 and 255');
+  }
+  if (params.medThreshold !== undefined) {
+    if (!Number.isInteger(params.medThreshold) || params.medThreshold < 0 || params.medThreshold > 255) throw new Error('medThreshold must be an integer between 0 and 255');
+  }
+  if (params.highThreshold !== undefined) {
+    if (!Number.isInteger(params.highThreshold) || params.highThreshold < 0 || params.highThreshold > 255) throw new Error('highThreshold must be an integer between 0 and 255');
+  }
+  if (params.signer) {
+    if (!validateStellarAddress(params.signer.key)) throw new Error('signer.key must be a valid Stellar address');
+    if (!Number.isInteger(params.signer.weight) || params.signer.weight < 0 || params.signer.weight > 255) throw new Error('signer.weight must be an integer between 0 and 255');
+  }
+
+  return {
+    type: 'setOptions',
+    masterWeight: params.masterWeight ?? null,
+    lowThreshold: params.lowThreshold ?? null,
+    medThreshold: params.medThreshold ?? null,
+    highThreshold: params.highThreshold ?? null,
+    signer: params.signer ?? null
   };
 }
 

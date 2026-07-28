@@ -13,7 +13,8 @@ export interface AuditLogLogger {
 export interface AuditLogRequestLike {
   headers?: Record<string, unknown>;
   ip?: string | null;
-  user?: Record<string, unknown> | null;
+  // Fastify JWT decorates `user` as string | object | Buffer — narrow at use sites.
+  user?: unknown;
 }
 
 function getRequestIp(request?: AuditLogRequestLike | null): string | null {

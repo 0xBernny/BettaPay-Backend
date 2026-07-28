@@ -9,24 +9,31 @@
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/health-all.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/authenticate.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/payment-status.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/request-timeout.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/payment-idempotency.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/payment-fx-quote.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/request-body-limit.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/upstream-fetch.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/genReqId-usage.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/merchant-auth.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/clients/indexer-client.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/clients/fx-client.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/clients/settlement-client.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/payment-events-enrichment.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/service-auth.test.ts"
+    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/health-all.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/authenticate.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/payment-status.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/request-timeout.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/payment-idempotency.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/payment-fx-quote.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/request-body-limit.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/upstream-fetch.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/genReqId-usage.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/merchant-auth.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/clients/indexer-client.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/clients/fx-client.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/clients/settlement-client.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/payment-events-enrichment.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/service-auth.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/wallet-auth-challenge.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/warmup-downstream.test.ts",
+    "test:integration": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/integration/response-envelope.test.ts"
   },
   "dependencies": {
     "@bettapay/shared-types": "workspace:^",
     "@bettapay/validation": "workspace:*",
+    "@bettapay/webhook-delivery": "workspace:*",
     "@fastify/helmet": "^12.0.0",
     "@fastify/rate-limit": "~11.0.0",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
     "@stellar/stellar-sdk": "^16.0.1",
+    "bullmq": "^5.79.1",
     "google-auth-library": "^10.9.0",
+    "ioredis": "^5.11.1",
     "pg": "^8.22.0",
+    "prom-client": "^15.1.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
     "@types/pg": "^8.20.0",
+    "@types/sinon": "^22.0.0",
     "@types/tape": "^5.6.4",
+    "sinon": "^22.0.0",
     "tape": "^5.9.0",
     "typescript": "^5.3.3"
   }

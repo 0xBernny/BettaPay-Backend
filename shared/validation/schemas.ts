@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { CurrencyCode } from './currency.js';
 import { validateStellarAddress } from '@bettapay/stellar-utils';
+import { WebhookUrlSchema } from './webhookSchema.js';
+
 
 // Entity schemas
 export const idSchema = z.string().min(1);
@@ -105,6 +107,13 @@ export const settlementSchema = z.object({
   initiatedAt: isoDateString,
   completedAt: isoDateString.optional(),
   status: z.enum(['pending','processing','completed','failed']),
+  feeSnapshot: z.object({
+    feeBpsApplied: z.number(),
+    maxFeeBpsApplied: z.number(),
+    discountApplied: z.number(),
+    monthlyVolumeAtTime: z.number(),
+    feeVersion: z.string(),
+  }).optional(),
 });
 
 export const fxQuoteSchema = z.object({
@@ -212,32 +221,10 @@ export function safeParseEvent(raw: unknown) {
 
 // ─── Webhook URL validation ───────────────────────────────────────────────────
 
-const PRIVATE_HOST_PATTERN =
-  /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|::1|\[::1\]|0\.0\.0\.0)$/i;
-
-function isPrivateOrLocalhost(urlString: string): boolean {
-  try {
-    const { hostname } = new URL(urlString);
-    return PRIVATE_HOST_PATTERN.test(hostname);
-  } catch {
-    return false;
-  }
-}
-
-export const WebhookUrlSchema = z
-  .string()
-  .url('Webhook URL must be a valid URL')
-  .max(2048, 'Webhook URL must not exceed 2048 characters')
-  .refine(
-    (url) => process.env.NODE_ENV !== 'production' || url.startsWith('https://'),
-    'Webhook URL must use HTTPS in production'
-  )
-  .refine(
-    (url) => process.env.NODE_ENV !== 'production' || !isPrivateOrLocalhost(url),
-    'Webhook URL must not point to localhost or private IP addresses'
-  );
-
-export type WebhookUrl = z.infer<typeof WebhookUrlSchema>;
+// Canonical WebhookUrlSchema now lives in ./webhookSchema.ts (imported above)
+// and is re-exported from the package root via index.ts's
+// `export * from './webhookSchema.js'`. It is only imported here (not
+// re-exported) to avoid a duplicate-export collision in index.ts's barrel
 
 // ─── Health Check Schemas ──────────────────────────────────────────────────────
 
@@ -300,7 +287,9 @@ export type IdempotencyKey = z.infer<typeof IdempotencyKeySchema>;
 
 export const MerchantSettings = z.object({
   feeBps: z.number().int().min(0).max(10000).optional(),
-  webhookUrl: z.string().url().optional(),
+  maxFeeBps: z.number().int().min(0).max(10000).optional(),
+  maxFeeThreshold: z.string().regex(/^\d+(\.\d+)?$/, 'maxFeeThreshold must be a numeric string').optional(),
+  webhookUrl: WebhookUrlSchema.optional(),
   preferredAsset: z.string().optional(),
   autoSettle: z.boolean().optional(),
   maxSettlementAmount: z.number().positive().optional(),
@@ -315,7 +304,7 @@ export const CreateMerchantBody = z.object({
   name: z.string().min(1, 'name is required'),
   ownerId: StellarAddressSchema, // validated Stellar public key
   settings: MerchantSettings.optional(),
-  secret: z.string().optional(),
+  secret: z.string().min(20, 'secret must be at least 20 characters').optional(),
 });
 
 export const CreatePaymentBody = z.object({
@@ -346,6 +335,14 @@ export const CreateSettlementBody = z.object({
   message: 'Provide either amount/asset OR items array, not both',
 });
 
+export const BulkSettlementBody = z.object({
+  merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
+  settlements: z.array(z.object({
+    amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
+    asset: CurrencyCode,
+  })),
+});
+
 export const AuthTokenBody = z.object({
   merchantId: StellarAddressSchema,
   secret: z.string().min(1, 'secret is required'),
@@ -362,11 +359,40 @@ export const UpdateSettlementStatusBody = z.object({
 });
 export type UpdateSettlementStatusBody = z.infer<typeof UpdateSettlementStatusBody>;
 
+// ─── Status transition state machines ─────────────────────────────────────────
+// These maps define which status transitions are valid for payments and
+// settlements. Any transition not in the map is rejected with 422.
+
+export const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
+  initiated: ['completed', 'failed', 'cancelled'],
+  completed: [],
+  failed: [],
+  cancelled: [],
+};
+
+export const SETTLEMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
+  pending: ['processing', 'failed'],
+  processing: ['completed', 'failed'],
+  completed: [],
+  failed: [],
+};
+
+export function isValidTransition(
+  transitions: Record<string, readonly string[]>,
+  from: string,
+  to: string,
+): boolean {
+  const allowed = transitions[from] ?? [];
+  return allowed.includes(to);
+}
+
 // Per-merchant fee rule configuration. feeBps is basis points (1% = 100 bps),
 // capped at 10000 (100%). Unknown keys are stripped; the route merges these into
 // the merchant's existing settings rather than replacing them.
 export const UpdateMerchantSettingsBody = z.object({
   feeBps: z.number().int().min(0).max(10000).optional(),
+  maxFeeBps: z.number().int().min(0).max(10000).optional(),
+  maxFeeThreshold: z.string().regex(/^\d+(\.\d+)?$/, 'maxFeeThreshold must be a numeric string').optional(),
   tier: z.string().optional(),
   minSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'minSettlementAmount must be a numeric string').optional(),
   maxSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'maxSettlementAmount must be a numeric string').optional(),
@@ -379,9 +405,48 @@ export const UpdateMerchantNameBody = z.object({
 });
 export type UpdateMerchantNameBody = z.infer<typeof UpdateMerchantNameBody>;
 
+export const KycStatusEnum = z.enum(['unverified', 'pending', 'verified', 'rejected']);
+export type KycStatusEnum = z.infer<typeof KycStatusEnum>;
+
+export const UpdateMerchantKycBody = z.object({
+  kycStatus: KycStatusEnum,
+});
+export type UpdateMerchantKycBody = z.infer<typeof UpdateMerchantKycBody>;
+
+export const SupportedAssetSchema = z.object({
+  code: z.string().min(1),
+  contractId: z.string().min(1),
+  decimals: z.number().int().min(0),
+  name: z.string().min(1),
+  isActive: z.boolean(),
+});
+export type SupportedAsset = z.infer<typeof SupportedAssetSchema>;
+
+export const CreateSupportedAssetBody = z.object({
+  code: z.string().min(1),
+  contractId: z.string().min(1),
+  decimals: z.number().int().min(0),
+  name: z.string().min(1),
+  isActive: z.boolean().default(true),
+});
+export type CreateSupportedAssetBody = z.infer<typeof CreateSupportedAssetBody>;
+
+export const UpdateSupportedAssetBody = z.object({
+  contractId: z.string().min(1).optional(),
+  decimals: z.number().int().min(0).optional(),
+  name: z.string().min(1).optional(),
+  isActive: z.boolean().optional(),
+});
+export type UpdateSupportedAssetBody = z.infer<typeof UpdateSupportedAssetBody>;
+
+export const BulkCancelPaymentsBody = z.object({
+  paymentIds: z.array(z.string().min(1)).min(1, 'At least one payment ID is required').max(100, 'Maximum 100 payment IDs allowed'),
+});
+export type BulkCancelPaymentsBody = z.infer<typeof BulkCancelPaymentsBody>;
+
 export const PaginationQuery = z.object({
-  limit: z.coerce.number().max(200).default(50),
-  offset: z.coerce.number().min(0).default(0),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 export type PaginationQuery = z.infer<typeof PaginationQuery>;
 
@@ -389,9 +454,18 @@ export const SettlementListQuery = PaginationQuery.extend({
   status: z.enum(['pending', 'processing', 'completed', 'failed']).optional(),
   from: isoDateString.optional(),
   to: isoDateString.optional(),
+  startDate: isoDateString.optional(),
+  endDate: isoDateString.optional(),
+  includeDeleted: z.coerce.boolean().default(false),
 }).refine(
-  (data) => !data.from || !data.to || data.from <= data.to,
-  { message: 'from must be before to' }
+  (data) => {
+    const start = data.startDate ?? data.from;
+    const end = data.endDate ?? data.to;
+    if (end && !start) return false;
+    if (start && end && start > end) return false;
+    return true;
+  },
+  { message: 'endDate requires startDate; startDate must be before endDate' }
 );
 export type SettlementListQuery = z.infer<typeof SettlementListQuery>;
 
@@ -409,6 +483,7 @@ export type DateRangeQuery = z.infer<typeof DateRangeQuery>;
 export type CreateMerchantBody = z.infer<typeof CreateMerchantBody>;
 export type CreatePaymentBody = z.infer<typeof CreatePaymentBody>;
 export type CreateSettlementBody = z.infer<typeof CreateSettlementBody>;
+export type BulkSettlementBody = z.infer<typeof BulkSettlementBody>;
 export type AuthTokenBody = z.infer<typeof AuthTokenBody>;
 export type UpdatePaymentStatusBody = z.infer<typeof UpdatePaymentStatusBody>;
 export type UpdateMerchantSettingsBody = z.infer<typeof UpdateMerchantSettingsBody>;

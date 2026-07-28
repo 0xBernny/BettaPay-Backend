@@ -1,83 +1,103 @@
 import test from 'tape';
-import Fastify from 'fastify';
-import { UpdateSettlementStatusBody } from '@bettapay/validation';
+import { createTestApp, generateTestJwt } from './test-utils.js';
 
-const SETTLEMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
-  pending: ['processing'],
-  processing: ['completed', 'failed'],
-  completed: [],
-  failed: [],
-};
+test('authorization: PATCH /api/settlements/:id/status returns 401 without valid JWT', async (t) => {
+  const { app } = createTestApp({}, {
+    settlements: [{ id: 'set_1', status: 'PENDING', merchantId: 'm1', totalAmount: '100.00', completedAt: null }],
+  });
 
-function buildApp(initialStatus: string) {
-  const app = Fastify({ logger: false });
-  const settlement: { id: string; status: string; completedAt?: string | null } | null =
-    initialStatus === 'missing' ? null : { id: 'set_1', status: initialStatus, completedAt: null };
+  const res = await app.inject({
+    method: 'PATCH',
+    url: '/api/settlements/set_1/status',
+    payload: { status: 'processing' },
+  });
 
-  app.patch<{ Params: { id: string }; Body: { status?: unknown } }>(
-    '/api/settlements/:id/status',
-    async (request, reply) => {
-let d;
-      try {
-        d = UpdateSettlementStatusBody.parse(request.body);
-      } catch {
-        return reply.code(400).send({ error: 'Invalid request payload' });
-      }
-
-      if (!settlement) return reply.code(404).send({ error: 'Settlement not found' });
-
-      const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
-      if (!allowed.includes(d.status)) {
-        return reply.code(422).send({ error: 'Invalid status transition', from: settlement.status, to: d.status });
-      }
-
-      settlement.status = d.status;
-      if (d.status === 'completed' || d.status === 'failed') {
-        settlement.completedAt = new Date().toISOString();
-      }
-      return reply.send(settlement);
-    }
-  );
-
-  return app;
-}
-
-async function patch(app: ReturnType<typeof buildApp>, status: unknown) {
-  return app.inject({ method: 'PATCH', url: '/api/settlements/set_1/status', payload: { status } });
-}
-
-test('pending transitions to processing', async (t) => {
-  const app = buildApp('pending');
-  const res = await patch(app, 'processing');
-  t.equal(res.statusCode, 200, 'returns 200');
-  t.equal(JSON.parse(res.body).status, 'processing', 'updates to processing');
+  t.equal(res.statusCode, 401, 'returns 401 Unauthorized without JWT');
   await app.close();
   t.end();
 });
 
-test('processing transitions to completed and sets completedAt', async (t) => {
-  const app = buildApp('processing');
-  const res = await patch(app, 'completed');
+test('PENDING transitions to processing and persists in DB', async (t) => {
+  const { app, mockPrisma } = createTestApp({}, {
+    settlements: [{ id: 'set_1', status: 'PENDING', merchantId: 'm1', totalAmount: '100.00', completedAt: null }],
+  });
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'PATCH',
+    url: '/api/settlements/set_1/status',
+    headers: { authorization: `Bearer ${token}` },
+    payload: { status: 'processing' },
+  });
+
+  t.equal(res.statusCode, 200, 'returns 200');
+  t.equal(JSON.parse(res.body).status, 'processing', 'updates to processing');
+
+  const stored = await mockPrisma.settlement.findUnique({ where: { id: 'set_1' } });
+  t.equal(stored.status, 'processing', 'updates status in mock DB');
+
+  await app.close();
+  t.end();
+});
+
+test('PROCESSING transitions to completed and sets completedAt in DB', async (t) => {
+  const { app, mockPrisma } = createTestApp({}, {
+    settlements: [{ id: 'set_1', status: 'PROCESSING', merchantId: 'm1', totalAmount: '100.00', completedAt: null }],
+  });
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'PATCH',
+    url: '/api/settlements/set_1/status',
+    headers: { authorization: `Bearer ${token}` },
+    payload: { status: 'completed' },
+  });
+
   t.equal(res.statusCode, 200, 'returns 200');
   const body = JSON.parse(res.body);
   t.equal(body.status, 'completed', 'updates to completed');
   t.ok(body.completedAt, 'sets completedAt on terminal status');
+
+  const stored = await mockPrisma.settlement.findUnique({ where: { id: 'set_1' } });
+  t.ok(stored.completedAt, 'persists completedAt timestamp in mock DB');
+
   await app.close();
   t.end();
 });
 
 test('invalid transition returns 422', async (t) => {
-  const app = buildApp('pending');
-  const res = await patch(app, 'completed');
+  const { app } = createTestApp({}, {
+    settlements: [{ id: 'set_1', status: 'PENDING', merchantId: 'm1', totalAmount: '100.00', completedAt: null }],
+  });
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'PATCH',
+    url: '/api/settlements/set_1/status',
+    headers: { authorization: `Bearer ${token}` },
+    payload: { status: 'completed' },
+  });
+
   t.equal(res.statusCode, 422, 'returns 422');
-  t.equal(JSON.parse(res.body).from, 'pending', 'reports current status');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.details.from, 'PENDING', 'reports current status');
+  t.ok(Array.isArray(body.error.details.allowedTransitions), 'includes allowedTransitions in error');
+
   await app.close();
   t.end();
 });
 
 test('missing settlement returns 404', async (t) => {
-  const app = buildApp('missing');
-  const res = await patch(app, 'processing');
+  const { app } = createTestApp({}, { settlements: [] });
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'PATCH',
+    url: '/api/settlements/missing_set/status',
+    headers: { authorization: `Bearer ${token}` },
+    payload: { status: 'processing' },
+  });
+
   t.equal(res.statusCode, 404, 'returns 404');
   await app.close();
   t.end();

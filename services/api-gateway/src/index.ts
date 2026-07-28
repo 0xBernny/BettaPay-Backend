@@ -22,15 +22,19 @@
  *   GET    /api/quote                — proxy to FX engine (timeout-aware)
  */
 
-import Fastify, { type FastifyRequest, type FastifyReply } from 'fastify';
+import Fastify, { type FastifyBaseLogger, type FastifyRequest, type FastifyReply } from 'fastify';
 import cors from '@fastify/cors';
 import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
+import zlib from 'zlib';
+import { Transform } from 'stream';
 import { z } from 'zod';
-import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
+import { validateEnvOrExit, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor, startMetricsServer, logFeatureFlags } from '@bettapay/validation';
+import * as promClient from 'prom-client';
 import { createFxClient } from './clients/fx-client.js';
-import { createIndexerClient } from './clients/indexer-client.js';
+import { createIndexerClient, type IndexerClient } from './clients/indexer-client.js';
+import { UpstreamReadTimeoutError } from './upstream-fetch.js';
 import {
   createSettlementClient,
   SettlementEngineUnavailableError,
@@ -39,21 +43,31 @@ import {
   CreateMerchantBody,
   CreatePaymentBody,
   CreateSettlementBody,
+  CreateSupportedAssetBody,
+  UpdateSupportedAssetBody,
   UpdatePaymentStatusBody,
   UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
   UpdateMerchantNameBody,
-  GoogleAuthBody,
   WalletChallengeQuery,
   WalletVerifyBody,
+  SettlementListQuery,
+  PaginationQuery,
+  BulkCancelPaymentsBody,
+  UpdateMerchantKycBody,
+  PAYMENT_STATUS_TRANSITIONS,
+  SETTLEMENT_STATUS_TRANSITIONS,
+  isValidTransition,
   createErrorResponse,
   ErrorCodes,
   registerErrorHandler,
   registerServiceAuth,
   createAuditLogger,
+  timingSafeStrEqual,
 } from '@bettapay/validation';
 import type { Merchant } from '@prisma/client';
 import type { ApiResponse, PaginatedResponse } from '@bettapay/shared-types';
+import { buildPaginationMeta } from '@bettapay/shared-types';
 import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import helmet from '@fastify/helmet';
@@ -62,6 +76,9 @@ import { fetchUpstream, UpstreamTimeoutError } from './upstream-fetch.js';
 import { Keypair } from '@stellar/stellar-sdk';
 import { OAuth2Client } from 'google-auth-library';
 import { registerGatewayHealthRoutes } from './health.js';
+import { startAbandonedPaymentsCron, stopAbandonedPaymentsCron } from './abandoned-payments-cron.js';
+import { createWebhookQueue, type WebhookJobData } from '@bettapay/webhook-delivery';
+import { Queue } from 'bullmq';
 import { readServiceVersion } from '@bettapay/validation';
 
 declare module 'fastify' {
@@ -70,19 +87,56 @@ declare module 'fastify' {
   }
 }
 
-
-
-// Allowed payment status transitions. `initiated` is the only non-terminal state;
-// completed, failed, and cancelled are terminal and cannot transition further.
-const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
-  initiated: ['completed', 'failed', 'cancelled'],
-  completed: [],
-  failed: [],
-  cancelled: [],
-};
-
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Caps decompressed request bodies. Fastify's own bodyLimit only sees the
+// compressed (on-the-wire) byte count, so a small gzip payload can otherwise
+// decompress to many times its transmitted size before bodyLimit ever applies.
+const MAX_DECOMPRESSED_BODY_BYTES = 1_048_576;
+
+class DecompressedSizeLimitError extends Error {
+  statusCode = 413;
+  code = 'DECOMPRESSED_BODY_TOO_LARGE';
+  constructor() {
+    super('Decompressed request body exceeds the maximum allowed size');
+  }
+}
+
+class InvalidGzipStreamError extends Error {
+  statusCode = 400;
+  code = 'INVALID_GZIP_STREAM';
+  constructor() {
+    super('Request body is not a valid gzip stream');
+  }
+}
+
+// Wraps a gunzip stream with a byte counter so an oversized decompressed
+// payload is rejected (413) before it is buffered into memory, and any
+// decompression failure surfaces as a 400 rather than a hung connection.
+function createLimitedGunzipStream(maxBytes: number): { input: zlib.Gunzip; output: Transform } {
+  const gunzip = zlib.createGunzip();
+  let received = 0;
+
+  const limiter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      received += chunk.length;
+      if (received > maxBytes) {
+        callback(new DecompressedSizeLimitError());
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+
+  gunzip.on('error', () => {
+    limiter.destroy(new InvalidGzipStreamError());
+  });
+
+  gunzip.pipe(limiter);
+
+  return { input: gunzip, output: limiter };
+}
 
 function readIdempotencyKey(request: FastifyRequest): string | null {
   const raw = request.headers['idempotency-key'];
@@ -93,12 +147,14 @@ function readIdempotencyKey(request: FastifyRequest): string | null {
 
 const isProduction = process.env.NODE_ENV === 'production';
 
-const env = validateEnv(process.env);
+const env = validateEnvOrExit(process.env);
 const PORT = Number(process.env.PORT ?? '3000');
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
 // --- Request lifecycle timeouts ---------------------------------------------
+
+
 // REQUEST_TIMEOUT_MS bounds how long a single request may run. If a handler
 // (e.g. a slow DB query or a hung upstream service) exceeds it, the per-request
 // hook below replies 408 Request Timeout so the client connection is released
@@ -113,42 +169,34 @@ const SERVICE_VERSION = readServiceVersion(import.meta.url);
 const REQUEST_TIMEOUT_MS = 30_000;
 const CONNECTION_TIMEOUT_MS = 31_000;
 
-const fastify = Fastify({
-  logger: createLoggerOptions({ level: env.LOG_LEVEL }),
-  requestTimeout: REQUEST_TIMEOUT_MS,
-  connectionTimeout: CONNECTION_TIMEOUT_MS,
-  // Limit request body size to 1MB (1,048,576 bytes) to protect the API gateway
-  // from oversized payload attacks and align with typical financial transaction payload sizes.
-  bodyLimit: 1_048_576,
-});
+// --- App Factory & Configuration Options ------------------------------------
+export interface AppOptions {
+  prisma?: PrismaClient;
+  indexerClient?: ReturnType<typeof createIndexerClient>;
+  settlementClient?: ReturnType<typeof createSettlementClient>;
+  fxClient?: ReturnType<typeof createFxClient>;
+  logger?: any;
+  fetchImpl?: typeof fetch;
+}
 
-registerRequestId(fastify);
+let defaultPrisma: PrismaClient | null = null;
+export function getDefaultPrisma(): PrismaClient {
+  if (!defaultPrisma) {
+    const pool = new pg.Pool({
+      connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
+      max: env.DATABASE_POOL_SIZE,
+      connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
+    });
+    const adapter = new PrismaPg(pool);
+    defaultPrisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
+  }
+  return defaultPrisma;
+}
 
-registerErrorHandler(fastify);
-// Distributed tracing: normalise x-request-id / x-trace-id and bind to the
-// request logger so trace context is logged and propagated downstream (#118).
-registerTracing(fastify);
-registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
-
-// Indexer HTTP client for optional on-chain event enrichment (Issue #116).
-// Enrichment is best-effort: indexer failures degrade to payment-only responses.
-const indexerClient = createIndexerClient({
-  baseUrl: env.INDEXER_URL,
-  serviceToken: env.INTER_SERVICE_SECRET,
-  logger: fastify.log,
-});
-
-const settlementClient = createSettlementClient({
-  baseUrl: env.SETTLEMENT_ENGINE_URL,
-  serviceToken: env.INTER_SERVICE_SECRET,
-  logger: fastify.log,
-});
-
-const fxClient = createFxClient({
-  baseUrl: env.FX_ENGINE_URL,
-  serviceToken: env.INTER_SERVICE_SECRET,
-  logger: fastify.log,
-});
+// Set by buildApp() when it creates the app's Redis client — shutdown()/start()
+// (defined after buildApp, at module scope) need it but don't have their own
+// handle on the instance buildApp created internally.
+let sharedRedis: ReturnType<typeof createRedisClient> | null = null;
 
 // --- Response logging hooks -------------------------------------------------
 const SENSITIVE_FIELDS = new Set(['token', 'secret', 'secretHash', 'password', 'privateKey', 'secretKey']);
@@ -206,74 +254,65 @@ function redactObject(obj: Record<string, any>) {
   return out;
 }
 
-fastify.addHook('onRequest', async (request, reply) => {
-  // Mark request start for response time calculation
-  (request as any).__startTime = Date.now();
-
-  // Per-request timeout guard. Fastify's requestTimeout only bounds how long the
-  // client takes to *send* a request; it does not abort a slow handler. This timer
-  // covers that case: if the response is not sent within REQUEST_TIMEOUT_MS, reply
-  // 408 so the caller is not left hanging. (The slow handler keeps running, but the
-  // client connection is freed.) The timer is cleared in the onResponse hook below.
-  const timeoutTimer = setTimeout(() => {
-    if (!reply.sent) {
-      reply.code(408).send(createErrorResponse(ErrorCodes.REQUEST_TIMEOUT, 'Request Timeout'));
-    }
-  }, REQUEST_TIMEOUT_MS);
-  (request as any).__timeoutTimer = timeoutTimer;
-});
-
-fastify.addHook('onResponse', async (request) => {
-  const timeoutTimer = (request as any).__timeoutTimer;
-  if (timeoutTimer) clearTimeout(timeoutTimer);
-});
-
-fastify.addHook('onSend', async (request, reply, payload) => {
-  try {
-    const headers = request.headers as Record<string, any>;
-    const reqId = (headers['x-request-id'] as string) || (request.id as string) || 'unknown';
-    const method = request.method;
-    const url = request.url;
-    const statusCode = reply.statusCode || 0;
-    const start = (request as any).__startTime || Date.now();
-    const responseTime = Date.now() - start;
-
-    const baseLog = { reqId, method, url, statusCode, responseTime };
-
-    if (statusCode >= 400) {
-      // attempt to parse payload (may be string, Buffer, object)
-      let body: any = payload;
-      try {
-        if (typeof payload === 'string') body = JSON.parse(payload as string);
-      } catch (e) {
-        // leave as raw string
-      }
-
-      const safeBody = typeof body === 'object' && body !== null ? redactObject(body as Record<string, any>) : body;
-      fastify.log.warn({ ...baseLog, response: safeBody }, 'Error response');
-    } else {
-      fastify.log.info(baseLog, 'Response summary');
-    }
-  } catch (err) {
-    fastify.log.error({ err }, 'onSend hook failed');
-  }
-
-  return payload;
-});
-
 function hashSecret(secret: string): string {
   return crypto.createHash('sha256').update(secret).digest('hex');
 }
 
-const pool = new pg.Pool({
-  connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
-  max: env.DATABASE_POOL_SIZE,
-  connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
-});
-const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
-setupPrismaQueryLogging(prisma, fastify.log);
-const logAuditEvent = createAuditLogger(prisma as unknown as Parameters<typeof createAuditLogger>[0], fastify.log);
+export function buildApp(opts: AppOptions = {}) {
+  const fastify = Fastify({
+    logger: opts.logger !== undefined ? opts.logger : createLoggerOptions({ level: env.LOG_LEVEL }),
+    requestTimeout: REQUEST_TIMEOUT_MS,
+    connectionTimeout: CONNECTION_TIMEOUT_MS,
+    bodyLimit: 1_048_576,
+  });
+
+  registerRequestId(fastify);
+  registerErrorHandler(fastify);
+  registerTracing(fastify);
+  registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
+
+  // Guards against decompression bombs: Fastify's own bodyLimit only checks
+  // the compressed (on-the-wire) size, so a small gzip payload could otherwise
+  // decompress to well beyond the intended cap before anything notices.
+  fastify.addHook('preParsing', async (request, _reply, payload) => {
+    const contentEncoding = request.headers['content-encoding'];
+    if (!contentEncoding || contentEncoding === 'identity') {
+      return payload;
+    }
+    if (contentEncoding !== 'gzip') {
+      return payload;
+    }
+
+    // The decompressed size no longer matches the original (compressed)
+    // Content-Length, so drop it — otherwise Fastify's own body reader
+    // rejects the request with FST_ERR_CTP_INVALID_CONTENT_LENGTH.
+    delete request.headers['content-length'];
+
+    const { input, output } = createLimitedGunzipStream(MAX_DECOMPRESSED_BODY_BYTES);
+    payload.pipe(input);
+    return output;
+  });
+
+  const prisma = opts.prisma ?? getDefaultPrisma();
+  const indexerClient = opts.indexerClient ?? createIndexerClient({
+    baseUrl: env.INDEXER_URL,
+    serviceToken: env.INTER_SERVICE_SECRET,
+    logger: fastify.log,
+    timeoutMs: env.READ_TIMEOUT_MS,
+  });
+  const settlementClient = opts.settlementClient ?? createSettlementClient({
+    baseUrl: env.SETTLEMENT_ENGINE_URL,
+    serviceToken: env.INTER_SERVICE_SECRET,
+    logger: fastify.log,
+    timeoutMs: env.WRITE_TIMEOUT_MS,
+  });
+  const fxClient = opts.fxClient ?? createFxClient({
+    baseUrl: env.FX_ENGINE_URL,
+    serviceToken: env.INTER_SERVICE_SECRET,
+    logger: fastify.log,
+    timeoutMs: env.READ_TIMEOUT_MS,
+  });
+  const logAuditEvent = createAuditLogger(prisma as unknown as Parameters<typeof createAuditLogger>[0], fastify.log);
 
 // Setup plugins
 fastify.register(helmet, { contentSecurityPolicy: false, hsts: { maxAge: 31536000 }, referrerPolicy: { policy: 'no-referrer' } });
@@ -302,9 +341,71 @@ fastify.register(rateLimit, {
   }
 });
 
-fastify.register(rateLimit, {
-  max: 100,
-  timeWindow: '1 minute',
+// Exposes standard X-RateLimit-* response headers on every rate-limited
+// route. The installed @fastify/rate-limit version tracks hit counts in a
+// store that's private to its own onRequest hook, with no read-only "peek"
+// API, so we mirror it with our own counter built from the same
+// `createRateLimit` helper and the route's own (global or overridden) limit
+// config. One `checkRateLimit` instance is cached per route so its counter
+// persists (and accumulates) across requests exactly like the real one —
+// both increment exactly once per request against the same max/window, so
+// they always agree on the numbers. Routes opted out via
+// `config: { rateLimit: false }` (e.g. health checks) are skipped.
+const rateLimitCheckers = new WeakMap<object, ReturnType<typeof fastify.createRateLimit>>();
+
+fastify.addHook('onSend', async (request: FastifyRequest, reply: FastifyReply, payload) => {
+  const routeConfig = request.routeOptions?.config as { rateLimit?: false | Record<string, unknown> } | undefined;
+  if (!routeConfig || routeConfig.rateLimit === false) {
+    return payload;
+  }
+
+  let checkRateLimit = rateLimitCheckers.get(routeConfig);
+  if (!checkRateLimit) {
+    checkRateLimit = fastify.createRateLimit(
+      typeof routeConfig.rateLimit === 'object' ? routeConfig.rateLimit : {}
+    );
+    rateLimitCheckers.set(routeConfig, checkRateLimit);
+  }
+
+  const result = await checkRateLimit(request) as {
+    max?: number;
+    remaining?: number;
+    ttlInSeconds?: number;
+  };
+
+  if (typeof result.max === 'number') {
+    reply.header('X-RateLimit-Limit', result.max);
+    reply.header('X-RateLimit-Remaining', result.remaining ?? 0);
+    reply.header('X-RateLimit-Reset', Math.ceil(Date.now() / 1000) + (result.ttlInSeconds ?? 0));
+  }
+
+  return payload;
+});
+
+// --- Same-origin enforcement --------------------------------------------------
+// Reject cross-origin mutations that lack an explicit CORS preflight.
+// Server-to-server calls (no Origin header, authenticated via x-service-token)
+// are exempt. GET/HEAD are also exempt since they cannot cause state changes.
+const ALLOWED_ORIGINS_SET = new Set(env.ALLOWED_ORIGINS.map(o => o.toLowerCase()));
+
+fastify.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
+  const method = request.method;
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return;
+
+  const origin = request.headers.origin;
+  if (!origin) return;
+
+  const normalised = origin.trim().replace(/\/+$/, '').toLowerCase();
+  const isAllowed = [...ALLOWED_ORIGINS_SET].some(
+    allowed => timingSafeStrEqual(normalised, allowed),
+  );
+
+  if (!isAllowed) {
+    request.log.warn({ origin, method, url: request.url }, 'Rejected cross-origin mutation');
+    return reply
+      .code(403)
+      .send(createErrorResponse(ErrorCodes.INVALID_ORIGIN, 'Request origin is not allowed'));
+  }
 });
 
 // Request body logging for mutation endpoints
@@ -329,7 +430,47 @@ fastify.decorate('authenticate', async function (request: FastifyRequest, reply:
     await request.jwtVerify();
   } catch (err) {
     request.log.error(err);
-    reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
+});
+
+// Per-merchant concurrent request limiting via Redis.
+// Uses INCR with a TTL so that abandoned connections (e.g. dropped before
+// onResponse fires) are automatically cleaned up after 30 seconds.
+const MERCHANT_CONCURRENCY_TTL_SEC = 30;
+const merchantMaxConcurrency = env.MERCHANT_MAX_CONCURRENCY;
+
+fastify.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) => {
+  const merchantId = (request.user as any)?.merchantId;
+  if (!merchantId) return;
+
+  const key = `concurrency:${merchantId}`;
+  try {
+    const count = await redis.incr(key);
+    if (count === 1) {
+      await redis.expire(key, MERCHANT_CONCURRENCY_TTL_SEC);
+    }
+    if (count > merchantMaxConcurrency) {
+      await redis.decr(key);
+      return reply
+        .code(429)
+        .header('Retry-After', '1')
+        .send(createErrorResponse(ErrorCodes.CONCURRENCY_EXCEEDED, 'Too many concurrent requests'));
+    }
+  } catch (err) {
+    request.log.error({ err, merchantId }, 'Concurrency limiter Redis error — allowing request through');
+  }
+});
+
+fastify.addHook('onResponse', async (request: FastifyRequest, _reply: FastifyReply) => {
+  const merchantId = (request.user as any)?.merchantId;
+  if (!merchantId) return;
+
+  const key = `concurrency:${merchantId}`;
+  try {
+    await redis.decr(key);
+  } catch (err) {
+    request.log.error({ err, merchantId }, 'Concurrency limiter Redis DECR error');
   }
 });
 
@@ -353,11 +494,13 @@ registerGatewayHealthRoutes({
   },
   startTime,
   serviceVersion: SERVICE_VERSION,
+  fetchImpl: opts.fetchImpl,
 });
 
 // --- Wallet Auth Challenge Store ----------------------------------------------
-// TODO: migrate to Redis for multi-instance deployments
-const challengeMap = new Map<string, { challenge: string; expiresAt: number }>();
+// #386 — exponential backoff retry strategy
+const redis = createRedisClient(env.REDIS_URL, fastify.log);
+sharedRedis = redis;
 
 fastify.get<{ Querystring: WalletChallengeQuery }>('/api/auth/wallet/challenge', {
   config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
@@ -366,7 +509,12 @@ fastify.get<{ Querystring: WalletChallengeQuery }>('/api/auth/wallet/challenge',
   const nonce = crypto.randomBytes(32).toString('hex');
   const challenge = `BettaPay:${address}:${nonce}`;
   const expiresAt = Date.now() + 2 * 60 * 1000; // 2 minutes
-  challengeMap.set(address, { challenge, expiresAt });
+  try {
+    await redis.set(`wallet_challenge:${address}`, JSON.stringify({ challenge, expiresAt }), 'PX', 120000);
+  } catch (err) {
+    request.log.error({ err }, 'Failed to set wallet challenge in Redis');
+    return reply.code(503).send({ error: 'Authentication service unavailable' });
+  }
   return reply.send({ challenge, expiresAt });
 });
 
@@ -374,30 +522,59 @@ fastify.post<{ Body: WalletVerifyBody }>('/api/auth/wallet/verify', {
   config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
 }, async (request, reply) => {
   const d = WalletVerifyBody.parse(request.body);
-  const stored = challengeMap.get(d.address);
+  const ip = request.ip;
+  const lockoutKey = `wallet_lockout:${d.address}`;
   
-  if (!stored) {
+  const failedAttempts = parseInt((await redis.get(lockoutKey)) || '0', 10);
+  const maxAttempts = parseInt(process.env.AUTH_MAX_FAILED_ATTEMPTS || '5', 10);
+  if (failedAttempts >= maxAttempts) {
+    request.log.warn({ address: d.address, ip }, '[Auth] Wallet verify locked out due to too many failed attempts');
+    return reply.code(429).send({ error: 'Too many failed attempts. Try again later.' });
+  }
+
+  let storedRaw;
+  try {
+    storedRaw = await redis.get(`wallet_challenge:${d.address}`);
+  } catch (err) {
+    request.log.error({ err }, 'Failed to get wallet challenge from Redis');
+    return reply.code(503).send({ error: 'Authentication service unavailable' });
+  }
+
+  if (!storedRaw) {
     return reply.code(400).send({ error: 'Challenge expired or not found' });
   }
+
+  const stored = JSON.parse(storedRaw);
+
   if (Date.now() > stored.expiresAt) {
-    challengeMap.delete(d.address);
+    await redis.del(`wallet_challenge:${d.address}`).catch(() => {});
     return reply.code(400).send({ error: 'Challenge expired' });
   }
   if (stored.challenge !== d.challenge) {
     return reply.code(400).send({ error: 'Invalid challenge' });
   }
   
-  challengeMap.delete(d.address); // Single use
+  await redis.del(`wallet_challenge:${d.address}`).catch(() => {}); // Single use
   
   try {
     const keypair = Keypair.fromPublicKey(d.address);
     const isValid = keypair.verify(Buffer.from(d.challenge, 'utf-8'), Buffer.from(d.signature, 'base64'));
     if (!isValid) {
+      const lockoutMinutes = parseInt(process.env.AUTH_LOCKOUT_MINUTES || '15', 10);
+      await redis.incr(lockoutKey);
+      await redis.expire(lockoutKey, lockoutMinutes * 60);
+      request.log.warn({ address: d.address, ip }, '[Auth] Invalid signature during wallet verify');
       return reply.code(401).send({ error: 'Invalid signature' });
     }
   } catch (err) {
+    const lockoutMinutes = parseInt(process.env.AUTH_LOCKOUT_MINUTES || '15', 10);
+    await redis.incr(lockoutKey);
+    await redis.expire(lockoutKey, lockoutMinutes * 60);
+    request.log.warn({ address: d.address, ip }, '[Auth] Signature verification failed');
     return reply.code(401).send({ error: 'Signature verification failed' });
   }
+  
+  await redis.del(lockoutKey).catch(() => {}); // reset on success
   
   const merchant = await prisma.merchant.upsert({
     where: { ownerId: d.address },
@@ -414,38 +591,144 @@ fastify.post<{ Body: WalletVerifyBody }>('/api/auth/wallet/verify', {
   return reply.send({ token });
 });
 
-const googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID);
 
-fastify.post<{ Body: GoogleAuthBody }>('/api/auth/google', {
-  config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
-}, async (request, reply) => {
+const walletChallenges = new Map<string, { challenge: string; expiresAt: number }>();
+
+interface WalletChallengeRouteBody {
+  address?: unknown;
+}
+
+const WalletChallengeBody = z.object({
+  address: z.string().min(1, 'address is required'),
+});
+
+fastify.post<{ Body: WalletChallengeRouteBody }>('/api/auth/challenge', async (request, reply) => {
+  const d = WalletChallengeBody.parse(request.body);
+  const challenge = crypto.randomBytes(32).toString('hex');
+  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 mins
+  walletChallenges.set(d.address, { challenge, expiresAt });
+  return reply.send({ challenge, expiresAt: new Date(expiresAt).toISOString() });
+});
+
+interface WalletVerifyRouteBody {
+  address?: unknown;
+  signature?: unknown;
+}
+
+const LegacyWalletVerifyBody = z.object({
+  address: z.string().min(1, 'address is required'),
+  signature: z.string().min(1, 'signature is required'),
+});
+
+fastify.post<{ Body: WalletVerifyRouteBody }>('/api/auth/verify', async (request, reply) => {
+  const d = LegacyWalletVerifyBody.parse(request.body);
+  const challengeInfo = walletChallenges.get(d.address);
+
+  if (!challengeInfo) {
+    return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge not found or expired'));
+  }
+
+  if (Date.now() > challengeInfo.expiresAt) {
+    walletChallenges.delete(d.address);
+    return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired'));
+  }
+
+  try {
+    const keypair = Keypair.fromPublicKey(d.address);
+    const isValid = keypair.verify(Buffer.from(challengeInfo.challenge), Buffer.from(d.signature, 'hex'));
+    if (!isValid) {
+      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid signature'));
+    }
+  } catch (err) {
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid signature'));
+  }
+
+  walletChallenges.delete(d.address);
+
+  let merchant;
+  try {
+    merchant = await prisma.merchant.upsert({
+      where: { id: d.address },
+      update: {},
+      create: {
+        id: d.address,
+        name: `Merchant ${d.address.substring(0, 6)}`,
+        ownerId: `owner-${d.address.substring(0, 6)}`,
+        settings: {},
+      }
+    });
+  } catch (err: any) {
+    if (err.code === 'P2002') {
+      merchant = await prisma.merchant.findUnique({ where: { id: d.address } });
+    } else {
+      throw err;
+    }
+  }
+
+  if (!merchant) {
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Failed to upsert merchant'));
+  }
+
+  const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
+  return reply.send({ token });
+});
+
+interface GoogleAuthRouteBody {
+  token?: unknown;
+}
+
+const GoogleAuthBody = z.object({
+  token: z.string().min(1, 'token is required'),
+});
+
+fastify.post<{ Body: GoogleAuthRouteBody }>('/api/auth/google', async (request, reply) => {
   const d = GoogleAuthBody.parse(request.body);
   
   try {
-    const ticket = await googleClient.verifyIdToken({
-      idToken: d.idToken,
-      audience: env.GOOGLE_CLIENT_ID,
+    const client = new OAuth2Client();
+    const ticket = await client.verifyIdToken({
+      idToken: d.token,
+      audience: process.env.GOOGLE_CLIENT_ID,
     });
     const payload = ticket.getPayload();
-    if (!payload || !payload.email) {
-      return reply.code(401).send({ error: 'Invalid Google payload' });
+    if (!payload) {
+      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Google token verification failed: invalid token payload'));
     }
-    
-    const merchant = await prisma.merchant.upsert({
-      where: { ownerId: payload.email },
-      update: {},
-      create: {
-        id: crypto.randomUUID(),
-        name: payload.name || 'My Business',
-        ownerId: payload.email,
-        settings: {}
+    const email = payload.email;
+    if (!email) {
+      return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Email missing in Google token payload'));
+    }
+
+    if (env.ALLOWED_EMAIL_DOMAINS.length > 0) {
+      const domain = email.split('@')[1]?.toLowerCase();
+      if (!domain || !env.ALLOWED_EMAIL_DOMAINS.includes(domain)) {
+        request.log.info({ email, domain }, '[Auth] Google OAuth rejected: email domain not allowed');
+        return reply.code(403).send(createErrorResponse(ErrorCodes.INVALID_ORIGIN, 'Email domain not allowed', { domain }));
       }
+    }
+
+    request.log.info({ email }, '[Auth] Google OAuth accepted');
+
+    let merchant = await prisma.merchant.findFirst({
+      where: { ownerId: email, deletedAt: null }
     });
-    
-    const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
-    return reply.send({ token });
-  } catch (err) {
-    return reply.code(401).send({ error: 'Google authentication failed' });
+    if (!merchant) {
+      const merchantId = `google_${crypto.randomBytes(8).toString('hex')}`;
+      merchant = await prisma.merchant.create({
+        data: {
+          id: merchantId,
+          name: email.split('@')[0] + ' Merchant',
+          ownerId: email,
+          settings: {},
+        }
+      });
+    }
+
+    const jwtToken = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
+    return reply.send({ token: jwtToken });
+  } catch (err: any) {
+    request.log.error({ err }, '[Auth] Google OAuth failed');
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Google token verification failed'));
   }
 });
 
@@ -471,7 +754,11 @@ fastify.post<{ Body: z.infer<typeof CreateMerchantBody> }>('/api/merchants', {
       await logAuditEvent('merchant.created', 'merchant', created.id, { before: null, after: created }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
       return created;
     });
-    return reply.code(201).send({ success: true, merchant, secret });
+    if (!d.secret) {
+      fastify.log.warn({ merchantId: merchant.id }, 'Auto-generated merchant secret returned in response. This will only be shown once.');
+    }
+    const { secretHash: _hash, ...safeMerchant } = merchant;
+    return reply.code(201).send({ data: { merchant: safeMerchant, secret } });
 });
 
 fastify.get<{ Params: { id: string } }>('/api/merchants/:id', {
@@ -538,6 +825,11 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantSetti
 }, async (request, reply) => {
   const d = UpdateMerchantSettingsBody.parse(request.body);
 
+  // Reject attempts to set kycStatus via the merchant settings endpoint
+  if ('kycStatus' in (request.body as Record<string, unknown>)) {
+    return reply.code(403).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'kycStatus cannot be updated via this endpoint'));
+  }
+
   const { id } = request.params;
   const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
   if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
@@ -554,7 +846,31 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantSetti
     return merchantUpdate;
   });
 
-  return reply.code(200).send({ success: true, merchant: updated });
+  return reply.code(200).send({ data: { merchant: updated } });
+});
+
+// Admin-only: update merchant KYC status
+fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantKycBody> }>('/api/admin/merchants/:id/kyc', {
+  preValidation: [fastify.serviceAuth],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const d = UpdateMerchantKycBody.parse(request.body);
+  const { id } = request.params;
+
+  const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
+  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const merchantUpdate = await tx.merchant.update({
+      where: { id },
+      data: { kycStatus: d.kycStatus },
+    });
+    await logAuditEvent('merchant.kyc.updated', 'merchant', merchantUpdate.id, { before: { kycStatus: merchant.kycStatus }, after: { kycStatus: merchantUpdate.kycStatus } }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+    return merchantUpdate;
+  });
+
+  return reply.code(200).send({ data: { merchant: updated } });
 });
 
 // Payments
@@ -588,7 +904,7 @@ fastify.post<{ Body: z.infer<typeof CreatePaymentBody> }>('/api/payments', {
         { idempotencyKey, paymentId: existing.id },
         'Idempotency hit — returning cached payment'
       );
-      return reply.code(200).send(existing);
+      return reply.code(200).send({ data: existing });
     }
   }
 
@@ -597,12 +913,27 @@ fastify.post<{ Body: z.infer<typeof CreatePaymentBody> }>('/api/payments', {
     ? new Date(Date.now() + IDEMPOTENCY_TTL_MS)
     : null;
 
-    const fxQuote = d.convertTo
-      ? await fxClient.getQuote(
+    let fxQuote: Awaited<ReturnType<typeof fxClient.getQuote>> = null;
+    if (d.convertTo) {
+      try {
+        fxQuote = await fxClient.getQuote(
           { from: d.asset, to: d.convertTo, amount: d.amount },
           request.headers,
-        )
-      : null;
+        );
+      } catch (err) {
+        if (err instanceof UpstreamReadTimeoutError) {
+          request.log.warn(
+            { service: err.service, endpoint: err.endpoint },
+            'fx-service read timeout — no cached quote available, returning 503',
+          );
+          return reply
+            .code(503)
+            .header('Retry-After', '5')
+            .send(createErrorResponse(ErrorCodes.GATEWAY_TIMEOUT, 'FX service temporarily unavailable, please retry'));
+        }
+        throw err;
+      }
+    }
 
     const payment = await prisma.$transaction(async (tx) => {
       const created = await tx.payment.create({
@@ -628,10 +959,10 @@ fastify.post<{ Body: z.infer<typeof CreatePaymentBody> }>('/api/payments', {
     );
 
     if (d.convertTo) {
-      return reply.code(201).send({ ...payment, fxQuote });
+      return reply.code(201).send({ data: { ...payment, fxQuote } });
     }
 
-    return reply.code(201).send(payment);
+    return reply.code(201).send({ data: payment });
 });
 
 fastify.get<{ Params: { id: string }; Querystring: { includeEvents?: string } }>('/api/payments/:id', async (request, reply) => {
@@ -645,10 +976,10 @@ fastify.get<{ Params: { id: string }; Querystring: { includeEvents?: string } }>
   if (request.query.includeEvents === 'true') {
     // Forward tracing headers so the indexer call is part of the same trace (#118).
     const events = await indexerClient.getPaymentEvents(payment.merchantId, request.headers);
-    return { ...payment, events };
+    return { data: { ...payment, events } };
   }
 
-  return payment;
+  return { data: payment };
 });
 
 // Enforce valid status transitions. The DB enum and Prisma allow any status, so
@@ -665,10 +996,11 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdatePaymentStatus
   if (!payment) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Payment not found'));
 
   const allowed = PAYMENT_STATUS_TRANSITIONS[payment.status] ?? [];
-  if (!allowed.includes(d.status)) {
+  if (!isValidTransition(PAYMENT_STATUS_TRANSITIONS, payment.status, d.status)) {
     return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid status transition', {
       from: payment.status,
       to: d.status,
+      allowedTransitions: allowed,
     }));
   }
 
@@ -680,7 +1012,68 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdatePaymentStatus
     await logAuditEvent('payment.status.changed', 'payment', paymentUpdate.id, { before: payment, after: paymentUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
     return paymentUpdate;
   });
-  return reply.send(updated);
+  return reply.send({ data: updated });
+});
+
+// Bulk-cancel initiated payments belonging to the authenticated merchant.
+fastify.post<{ Body: z.infer<typeof BulkCancelPaymentsBody> }>('/api/payments/bulk-cancel', {
+  preValidation: [fastify.authenticate],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const d = BulkCancelPaymentsBody.parse(request.body);
+  const merchantId = (request.user as any).merchantId as string;
+
+  // Deduplicate IDs
+  const uniqueIds = [...new Set(d.paymentIds)];
+
+  const payments = await prisma.payment.findMany({
+    where: { id: { in: uniqueIds } },
+  });
+
+  const paymentMap = new Map(payments.map(p => [p.id, p]));
+
+  const cancelledIds: string[] = [];
+  const skippedIds: string[] = [];
+  const errors: { id: string; reason: string }[] = [];
+
+  for (const id of uniqueIds) {
+    const payment = paymentMap.get(id);
+    if (!payment) {
+      skippedIds.push(id);
+      continue;
+    }
+    if (payment.merchantId !== merchantId) {
+      skippedIds.push(id);
+      continue;
+    }
+    if (payment.status !== 'initiated') {
+      skippedIds.push(id);
+      continue;
+    }
+    cancelledIds.push(id);
+  }
+
+  if (cancelledIds.length > 0) {
+    await prisma.$transaction(async (tx) => {
+      for (const id of cancelledIds) {
+        const before = paymentMap.get(id)!;
+        const updated = await tx.payment.update({
+          where: { id },
+          data: { status: 'cancelled' },
+        });
+        await logAuditEvent('payment.status.changed', 'payment', id, { before, after: updated }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+      }
+    });
+  }
+
+  return reply.code(200).send({
+    cancelled: cancelledIds.length,
+    skipped: skippedIds.length,
+    errors: errors.length,
+    cancelledIds,
+    skippedIds,
+  });
 });
 
 fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementStatusBody> }>('/api/settlements/:id/status', {
@@ -699,20 +1092,13 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementSta
   const settlement = await prisma.settlement.findUnique({ where: { id } });
   if (!settlement) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Settlement not found'));
 
-  const SETTLEMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
-    PENDING: ['PROCESSING', 'FAILED'],
-    PROCESSING: ['COMPLETED', 'FAILED'],
-    COMPLETED: [],
-    FAILED: []
-  };
-
   const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
-  if (!allowed.includes(d.status)) {
-    return reply.code(422).send({
-      error: 'Invalid status transition',
+  if (!isValidTransition(SETTLEMENT_STATUS_TRANSITIONS, settlement.status, d.status)) {
+    return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid status transition', {
       from: settlement.status,
       to: d.status,
-    });
+      allowedTransitions: allowed,
+    }));
   }
 
   const updated = await prisma.$transaction(async (tx) => {
@@ -726,34 +1112,74 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementSta
     await logAuditEvent('settlement.status.changed', 'settlement', settlementUpdate.id, { before: settlement, after: settlementUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
     return settlementUpdate;
   });
-  return reply.send(updated);
+  return reply.send({ data: updated });
 });
 
 // Settlements
-fastify.get('/api/settlements', {
-  preValidation: [fastify.authenticate],
+//
+// Authorization: service-to-service callers (x-service-token) may pass
+// merchantId to filter across merchants. Merchant-authenticated callers
+// (JWT) are always scoped to their own merchantId — the query parameter is
+// ignored for them so one merchant can never read another's settlements.
+fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: string } }>('/api/settlements', {
+  preValidation: async (request: FastifyRequest, reply: FastifyReply) => {
+    if (request.headers['x-service-token']) {
+      await fastify.serviceAuth(request, reply);
+      return;
+    }
+    await fastify.authenticate(request, reply);
+  },
   config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
 }, async (request, reply) => {
-  const { merchantId, from, to } = request.query as { merchantId?: string; from?: string; to?: string };
+  const query = SettlementListQuery.parse(request.query);
+  const { status, from, to, limit, page } = query;
+  const requestedMerchantId = (request.query as { merchantId?: string }).merchantId;
+
+  const isServiceAuth = Boolean(request.headers['x-service-token']);
+  const scopedMerchantId = isServiceAuth
+    ? requestedMerchantId
+    : (request.user as { merchantId?: string } | undefined)?.merchantId;
+
+  const { merchantId, status, from, to, startDate, endDate, limit, offset, includeDeleted } = query as any;
   const where: any = {};
-  if (merchantId) {
-    where.merchantId = merchantId;
+  if (scopedMerchantId) {
+    where.merchantId = scopedMerchantId;
   }
-  if (from || to) {
+  if (status) {
+    where.status = status;
+  }
+  const effectiveFrom = startDate ?? from;
+  const effectiveTo = endDate ?? to;
+  if (effectiveFrom || effectiveTo) {
     where.initiatedAt = {};
-    if (from) {
-      where.initiatedAt.gte = new Date(from);
+    if (effectiveFrom) {
+      where.initiatedAt.gte = new Date(effectiveFrom);
     }
-    if (to) {
-      where.initiatedAt.lte = new Date(to);
+    if (effectiveTo) {
+      where.initiatedAt.lte = new Date(effectiveTo);
     }
   }
 
-  const records = await prisma.settlement.findMany({
-    where,
-    orderBy: { initiatedAt: 'desc' },
-  });
-  return { settlements: records, total: records.length };
+  // When includeDeleted is false, exclude settlements belonging to soft-deleted merchants.
+  // Service-auth callers (preValidation: [fastify.serviceAuth]) always see everything.
+  if (!includeDeleted) {
+    where.merchant = { deletedAt: null };
+  }
+
+  const [records, total] = await Promise.all([
+    prisma.settlement.findMany({
+      where,
+      orderBy: { initiatedAt: 'desc' },
+      take: limit,
+      skip: (page - 1) * limit,
+    }),
+    prisma.settlement.count({ where }),
+  ]);
+
+  return {
+    data: records,
+    pagination: buildPaginationMeta(page, limit, total),
+  };
 });
 
 fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>('/api/settlements', {
@@ -777,6 +1203,21 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>('/api/settlements',
 
     // Normalize to items array (backward compatibility: single amount/asset becomes single-item batch)
     const items = d.items || (d.amount && d.asset ? [{ amount: d.amount, asset: d.asset }] : []);
+
+    // #319 — Validate each asset against SupportedAsset table
+    for (const item of items) {
+      const supportedAsset = await prisma.supportedAsset.findUnique({
+        where: { code: item.asset },
+      });
+
+      if (!supportedAsset || !supportedAsset.isActive) {
+        return reply.code(422).send(createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          `Asset ${item.asset} is not supported`,
+          { asset: item.asset }
+        ));
+      }
+    }
 
     // Validate each settlement item against merchant limits
     for (const item of items) {
@@ -811,18 +1252,19 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>('/api/settlements',
     if (settings?.dailySettlementLimit) {
       const todayStart = new Date();
       todayStart.setHours(0, 0, 0, 0);
+      const startTimeMs = Date.now();
 
-      const todaySettlements = await prisma.settlement.findMany({
-        where: {
-          merchantId: d.merchantId,
-          initiatedAt: { gte: todayStart },
-        },
-        select: {
-          totalAmount: true
-        }
-      });
+      const aggregateResult = await prisma.$queryRaw<[{ sum: string | null }]>`
+        SELECT COALESCE(SUM(CAST("totalAmount" AS DECIMAL)), 0)::text as sum
+        FROM "Settlement"
+        WHERE "merchantId" = ${d.merchantId}
+        AND "initiatedAt" >= ${todayStart}
+      `;
 
-      const currentDailyTotal = todaySettlements.reduce((sum: number, s: { totalAmount: string }) => sum + parseFloat(s.totalAmount), 0);
+      const currentDailyTotal = aggregateResult?.[0]?.sum ? parseFloat(aggregateResult[0].sum) : 0;
+      const queryDurationMs = Date.now() - startTimeMs;
+      request.log.debug({ queryDurationMs, merchantId: d.merchantId }, 'Daily settlement aggregate query');
+
       const requestTotal = items.reduce((sum: number, item: any) => sum + parseFloat(item.amount), 0);
       const newDailyTotal = currentDailyTotal + requestTotal;
       const dailyLimit = parseFloat(settings.dailySettlementLimit);
@@ -861,9 +1303,8 @@ fastify.get('/api/admin/audit-log', {
   preValidation: [fastify.serviceAuth],
   config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
 }, async (request, reply) => {
+  const { page, limit } = PaginationQuery.parse(request.query ?? {});
   const query = request.query as Record<string, string | undefined>;
-  const limit = Math.min(Number(query.limit ?? 50), 200);
-  const offset = Math.max(Number(query.offset ?? 0), 0);
   const where: Record<string, unknown> = {};
 
   if (query.entityType) {
@@ -887,30 +1328,32 @@ fastify.get('/api/admin/audit-log', {
       where,
       orderBy: { createdAt: 'desc' },
       take: limit,
-      skip: offset,
+      skip: (page - 1) * limit,
     }),
     prisma.auditLog.count({ where }),
   ]);
 
-  return reply.send({ logs: rows, total, limit, offset, hasMore: offset + limit < total });
+  return reply.send({ data: rows, pagination: buildPaginationMeta(page, limit, total) });
 });
 
 fastify.get('/api/deployments', async (request, reply) => {
   return {
-    network: env.STELLAR_NETWORK_PASSPHRASE,
-    contracts: [
-      {
-        name: 'Settlement contract',
-        contractId: env.SETTLEMENT_CONTRACT_ID,
-        explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.SETTLEMENT_CONTRACT_ID}`,
-      },
-      {
-        name: 'Governance contract',
-        contractId: env.GOVERNANCE_CONTRACT_ID,
-        explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.GOVERNANCE_CONTRACT_ID}`,
-      },
-    ],
-    updatedAt: new Date().toISOString(),
+    data: {
+      network: env.STELLAR_NETWORK_PASSPHRASE,
+      contracts: [
+        {
+          name: 'Settlement contract',
+          contractId: env.SETTLEMENT_CONTRACT_ID,
+          explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.SETTLEMENT_CONTRACT_ID}`,
+        },
+        {
+          name: 'Governance contract',
+          contractId: env.GOVERNANCE_CONTRACT_ID,
+          explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.GOVERNANCE_CONTRACT_ID}`,
+        },
+      ],
+      updatedAt: new Date().toISOString(),
+    },
   };
 });
 
@@ -938,27 +1381,234 @@ async function proxyFxUpstream(
 
 fastify.get('/api/rates', async (request, reply) => proxyFxUpstream(request, reply, '/api/rates'));
 fastify.get('/api/currencies', async (request, reply) => proxyFxUpstream(request, reply, '/api/currencies'));
+
+// ============================================================================
+// SUPPORTED ASSETS (#319)
+// ============================================================================
+
+// GET /api/assets — list all supported assets
+fastify.get('/api/assets', async (request, reply) => {
+  try {
+    const assets = await prisma.supportedAsset.findMany({
+      where: { isActive: true },
+      select: {
+        code: true,
+        contractId: true,
+        decimals: true,
+        name: true,
+        isActive: true,
+      },
+    });
+
+    return { data: assets };
+  } catch (error) {
+    request.log.error({ error }, 'Failed to fetch supported assets');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
+// POST /api/admin/assets — admin endpoint to add new asset
+fastify.post('/api/admin/assets', {
+  preValidation: [fastify.serviceAuth],
+  schema: {
+    body: z.object({
+      code: z.string().min(1),
+      contractId: z.string().min(1),
+      decimals: z.number().int().min(0),
+      name: z.string().min(1),
+      isActive: z.boolean().default(true),
+    }),
+  },
+}, async (request, reply) => {
+  const body = request.body as z.infer<typeof CreateSupportedAssetBody>;
+
+  try {
+    const asset = await prisma.supportedAsset.create({
+      data: body,
+    });
+
+    await logAuditEvent({
+      action: 'CREATE_SUPPORTED_ASSET',
+      entityType: 'SupportedAsset',
+      entityId: asset.code,
+      actorId: 'admin',
+      actorType: 'SERVICE',
+      changes: { asset },
+      ipAddress: request.ip,
+    });
+
+    return reply.code(201).send({ data: asset });
+  } catch (error: any) {
+    if (error.code === 'P2002') {
+      return reply.code(409).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Asset code already exists'));
+    }
+    request.log.error({ error }, 'Failed to create supported asset');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
+// PATCH /api/admin/assets/:code — admin endpoint to update asset
+fastify.patch('/api/admin/assets/:code', {
+  preValidation: [fastify.serviceAuth],
+  schema: {
+    params: z.object({ code: z.string().min(1) }),
+    body: z.object({
+      contractId: z.string().min(1).optional(),
+      decimals: z.number().int().min(0).optional(),
+      name: z.string().min(1).optional(),
+      isActive: z.boolean().optional(),
+    }),
+  },
+}, async (request, reply) => {
+  const { code } = request.params as { code: string };
+  const body = request.body as z.infer<typeof UpdateSupportedAssetBody>;
+
+  try {
+    const asset = await prisma.supportedAsset.update({
+      where: { code },
+      data: body,
+    });
+
+    await logAuditEvent({
+      action: 'UPDATE_SUPPORTED_ASSET',
+      entityType: 'SupportedAsset',
+      entityId: asset.code,
+      actorId: 'admin',
+      actorType: 'SERVICE',
+      changes: { updates: body },
+      ipAddress: request.ip,
+    });
+
+    return { data: asset };
+  } catch (error: any) {
+    if (error.code === 'P2025') {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Asset not found'));
+    }
+    request.log.error({ error }, 'Failed to update supported asset');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
+// DELETE /api/admin/assets/:code — admin endpoint to delete asset
+fastify.delete('/api/admin/assets/:code', {
+  preValidation: [fastify.serviceAuth],
+  schema: {
+    params: z.object({ code: z.string().min(1) }),
+  },
+}, async (request, reply) => {
+  const { code } = request.params as { code: string };
+
+  try {
+    await prisma.supportedAsset.delete({
+      where: { code },
+    });
+
+    await logAuditEvent({
+      action: 'DELETE_SUPPORTED_ASSET',
+      entityType: 'SupportedAsset',
+      entityId: code,
+      actorId: 'admin',
+      actorType: 'SERVICE',
+      changes: {},
+      ipAddress: request.ip,
+    });
+
+    return reply.code(204).send();
+  } catch (error: any) {
+    if (error.code === 'P2025') {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Asset not found'));
+    }
+    request.log.error({ error }, 'Failed to delete supported asset');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
 fastify.get('/api/quote', async (request, reply) => {
   const query = new URLSearchParams(request.query as Record<string, string>).toString();
   const path = query ? `/api/quote?${query}` : '/api/quote';
   return proxyFxUpstream(request, reply, path);
 });
 
+  return fastify;
+}
+
+// ─── Warmup ─────────────────────────────────────────────────────────────────
+
+interface DownstreamService {
+  name: string;
+  healthUrl: string;
+}
+
+function getDownstreamServices(env: ReturnType<typeof validateEnv>): DownstreamService[] {
+  return [
+    { name: 'fx-engine', healthUrl: `${env.FX_ENGINE_URL}/api/health` },
+    { name: 'indexer', healthUrl: `${env.INDEXER_URL}/api/health` },
+  ];
+}
+
+/**
+ * Make best-effort warmup requests to downstream services so their caches,
+ * connection pools, and health state are ready before the gateway accepts
+ * traffic. Each call carries a unique x-trace-id so operators can correlate
+ * startup events across services.
+ *
+ * Errors are logged but never thrown — a downstream that is still warming up
+ * should not prevent the gateway from starting.
+ */
+async function warmupDownstreamServices(
+  env: ReturnType<typeof validateEnv>,
+  logger: FastifyBaseLogger,
+): Promise<void> {
+  const services = getDownstreamServices(env);
+
+  await Promise.allSettled(
+    services.map(async (svc) => {
+      const traceId = crypto.randomUUID();
+      const startTime = Date.now();
+
+      try {
+        const response = await fetch(svc.healthUrl, {
+          headers: { 'x-trace-id': traceId },
+          signal: AbortSignal.timeout(5_000),
+        });
+        const durationMs = Date.now() - startTime;
+        logger.info(
+          { traceId, targetService: svc.name, statusCode: response.status, durationMs },
+          'Warmup completed',
+        );
+      } catch (err) {
+        const durationMs = Date.now() - startTime;
+        logger.warn(
+          { traceId, targetService: svc.name, durationMs, err },
+          'Warmup failed — downstream may not be ready',
+        );
+      }
+    }),
+  );
+}
+
 // Graceful shutdown
+let mainApp: ReturnType<typeof Fastify> | null = null;
+let metricsServer: ReturnType<typeof startMetricsServer> | null = null;
 let shuttingDown = false;
 
 async function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  fastify.log.info(`Received ${signal}, shutting down gracefully...`);
+  const app = mainApp!;
+  app.log.info(`Received ${signal}, shutting down gracefully...`);
 
   try {
-    await fastify.close();
-    await prisma.$disconnect();
+    await app.close();
+    if (metricsServer) {
+      await new Promise<void>((resolve) => metricsServer!.close(() => resolve()));
+    }
+    await getDefaultPrisma().$disconnect();
+    stopAbandonedPaymentsCron();
     process.exit(0);
   } catch (err) {
-    fastify.log.error(err, 'Error during shutdown');
+    app.log.error(err, 'Error during shutdown');
     process.exit(1);
   }
 }
@@ -968,12 +1618,49 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 const start = async () => {
   try {
-    await connectWithRetry(prisma, fastify.log);
+    const app = mainApp!;
+    const prisma = getDefaultPrisma();
+    const redis = sharedRedis!;
 
-    await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    // #391 — wait for dependencies before accepting traffic
+    await connectWithRetry(prisma, app.log);
+    await waitForRedis(redis, app.log);
+
+    // #314 — warmup downstream services with unique trace IDs
+    await warmupDownstreamServices(env, app.log);
+
+    // #387 — Redis memory monitoring
+    startRedisMemoryMonitor(redis, app.log);
+
+    if (process.env.NODE_ENV !== 'test') {
+      const webhookQueue = createWebhookQueue('gateway-expired-webhooks', { url: env.REDIS_URL });
+      startAbandonedPaymentsCron(prisma, app.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24, webhookQueue);
+    }
+    await app.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {
-    fastify.log.error(err);
+    if (mainApp) mainApp.log.error(err);
+    else console.error(err);
     process.exit(1);
   }
 };
-start();
+
+const isDirectRun = Boolean(process.argv[1] && (process.argv[1].endsWith('index.ts') || process.argv[1].endsWith('index.js')));
+if (isDirectRun) {
+  mainApp = buildApp();
+
+  // Served on its own port (see startMetricsServer), not the application
+  // port — keeps the scrape endpoint unauthenticated without exposing it
+  // alongside application traffic. Started only for the real server process,
+  // not when buildApp() is called directly by tests.
+  promClient.collectDefaultMetrics();
+  metricsServer = startMetricsServer({
+    appPort: PORT,
+    contentType: promClient.register.contentType,
+    getMetrics: () => promClient.register.metrics(),
+    log: mainApp.log,
+  });
+
+  logFeatureFlags(mainApp.log);
+  start();
+}
+

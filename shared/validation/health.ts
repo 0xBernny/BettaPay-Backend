@@ -79,21 +79,42 @@ export async function checkRedisPing(
   return { name: 'redis', status: 'disconnected', latencyMs: result.latencyMs };
 }
 
+export const BULLMQ_WAITING_DEGRADED_THRESHOLD = 1000;
+
 export async function checkBullMQ(
   getJobCounts: () => Promise<Record<string, number>>,
   queueName: string,
   timeoutMs = HEALTH_CHECK_TIMEOUT_MS,
+  getIsPaused?: () => Promise<boolean>,
 ): Promise<DependencyHealth> {
-  const result = await withLatency(getJobCounts, timeoutMs);
-  if (result.ok) {
-    return {
-      name: queueName,
-      status: 'connected',
-      latencyMs: result.latencyMs,
-      details: result.value,
-    };
+  const result = await withLatency(
+    async () => ({
+      counts: await getJobCounts(),
+      isPaused: getIsPaused ? await getIsPaused() : false,
+    }),
+    timeoutMs,
+  );
+
+  if (!result.ok) {
+    return { name: queueName, status: 'disconnected', latencyMs: result.latencyMs };
   }
-  return { name: queueName, status: 'disconnected', latencyMs: result.latencyMs };
+
+  const { counts, isPaused } = result.value;
+  const details = {
+    queueName,
+    isPaused,
+    waiting: counts.waiting ?? 0,
+    active: counts.active ?? 0,
+    failed: counts.failed ?? 0,
+    delayed: counts.delayed ?? 0,
+  };
+
+  // A paused queue processes no jobs, so treat it as down regardless of job counts.
+  if (isPaused) {
+    return { name: queueName, status: 'disconnected', latencyMs: result.latencyMs, details };
+  }
+
+  return { name: queueName, status: 'connected', latencyMs: result.latencyMs, details };
 }
 
 export async function checkHttpEndpoint(
@@ -337,31 +358,40 @@ export async function buildSettlementEngineHealthResponse(options: {
   queryDatabase: () => Promise<unknown>;
   pingRedis: () => Promise<string>;
   getQueueJobCounts: () => Promise<Record<string, number>>;
+  getQueueIsPaused?: () => Promise<boolean>;
   startTime: number;
   service: string;
   version: string;
 }): Promise<HealthResponse> {
-  const { queryDatabase, pingRedis, getQueueJobCounts, startTime, service, version } = options;
+  const { queryDatabase, pingRedis, getQueueJobCounts, getQueueIsPaused, startTime, service, version } = options;
 
   const [postgresql, redisDep, bullmq] = await Promise.all([
     checkPostgresql(queryDatabase),
     checkRedisPing(pingRedis),
-    checkBullMQ(getQueueJobCounts, 'bullmq-settlement'),
+    checkBullMQ(getQueueJobCounts, 'bullmq-settlement', HEALTH_CHECK_TIMEOUT_MS, getQueueIsPaused),
   ]);
 
-  return buildHealthResponse({
+  const health = buildHealthResponse({
     service,
     version,
     startTime,
     dependencies: [postgresql, redisDep, bullmq],
     criticalDependencyNames: ['postgresql', 'redis', 'bullmq-settlement'],
   });
+
+  const waiting = bullmq.details?.waiting;
+  if (typeof waiting === 'number' && waiting > BULLMQ_WAITING_DEGRADED_THRESHOLD && health.status === 'healthy') {
+    health.status = 'degraded';
+  }
+
+  return health;
 }
 
 export async function buildIndexerHealthResponse(options: {
   queryDatabase: () => Promise<unknown>;
   pingRedis: () => Promise<string>;
   getQueueJobCounts: () => Promise<Record<string, number>>;
+  getQueueIsPaused?: () => Promise<boolean>;
   getLatestLedger: () => Promise<{ sequence: number }>;
   latestLedgerCursor?: number;
   latestLedgerSequence?: number;
@@ -374,6 +404,7 @@ export async function buildIndexerHealthResponse(options: {
     queryDatabase,
     pingRedis,
     getQueueJobCounts,
+    getQueueIsPaused,
     getLatestLedger,
     latestLedgerCursor,
     latestLedgerSequence,
@@ -386,7 +417,7 @@ export async function buildIndexerHealthResponse(options: {
   const [postgresql, redisDep, bullmq, stellarRpc] = await Promise.all([
     checkPostgresql(queryDatabase),
     checkRedisPing(pingRedis),
-    checkBullMQ(getQueueJobCounts, 'bullmq-webhooks'),
+    checkBullMQ(getQueueJobCounts, 'bullmq-webhooks', HEALTH_CHECK_TIMEOUT_MS, getQueueIsPaused),
     checkStellarRpc(getLatestLedger),
   ]);
 
@@ -422,6 +453,11 @@ export async function buildIndexerHealthResponse(options: {
     if (lag > lagWarnThreshold && health.status === 'healthy') {
       health.status = 'degraded';
     }
+  }
+
+  const waiting = bullmq.details?.waiting;
+  if (typeof waiting === 'number' && waiting > BULLMQ_WAITING_DEGRADED_THRESHOLD && health.status === 'healthy') {
+    health.status = 'degraded';
   }
 
   return health;

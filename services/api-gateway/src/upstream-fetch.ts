@@ -11,6 +11,27 @@ export class UpstreamTimeoutError extends Error {
   }
 }
 
+/**
+ * Thrown by read-path clients (fx-client, indexer-client) when a fast
+ * READ_TIMEOUT_MS fires and no cached response is available to fall back on.
+ * Callers should respond 503 Service Unavailable with a Retry-After header
+ * rather than 504 Gateway Timeout, since the upstream may still be alive and
+ * the client can safely retry.
+ */
+export class UpstreamReadTimeoutError extends Error {
+  /** Target service name for logging / error responses. */
+  readonly service: string;
+  /** Endpoint that timed out. */
+  readonly endpoint: string;
+
+  constructor(service: string, endpoint: string) {
+    super(`Read timeout: ${service}${endpoint} did not respond within the read deadline`);
+    this.name = 'UpstreamReadTimeoutError';
+    this.service = service;
+    this.endpoint = endpoint;
+  }
+}
+
 export function getRequestStartTime(request: FastifyRequest): number {
   return (request as FastifyRequest & { __startTime?: number }).__startTime ?? Date.now();
 }
