@@ -43,6 +43,7 @@ export const ErrorCodes = {
   INVALID_AMOUNT: 'INVALID_AMOUNT',
   INVALID_QUERY: 'INVALID_QUERY',
   INVALID_ORIGIN: 'INVALID_ORIGIN',
+  CONCURRENCY_EXCEEDED: 'CONCURRENCY_EXCEEDED',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -127,6 +128,9 @@ export const EnvSchema = z.object({
   // Redis — optional, falls back to localhost
   REDIS_URL: z.string().default('redis://localhost:6379'),
   REDIS_MAX_RETRIES: z.string().transform((s) => parseInt(s, 10)).default('3'),
+
+  // Per-merchant concurrent request limiting
+  MERCHANT_MAX_CONCURRENCY: z.string().transform((s) => parseInt(s, 10)).default('10'),
 
   // Stellar
   STELLAR_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),

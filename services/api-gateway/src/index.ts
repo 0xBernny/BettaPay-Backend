@@ -334,6 +334,46 @@ fastify.decorate('authenticate', async function (request: FastifyRequest, reply:
   }
 });
 
+// Per-merchant concurrent request limiting via Redis.
+// Uses INCR with a TTL so that abandoned connections (e.g. dropped before
+// onResponse fires) are automatically cleaned up after 30 seconds.
+const MERCHANT_CONCURRENCY_TTL_SEC = 30;
+const merchantMaxConcurrency = env.MERCHANT_MAX_CONCURRENCY;
+
+fastify.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) => {
+  const merchantId = (request.user as any)?.merchantId;
+  if (!merchantId) return;
+
+  const key = `concurrency:${merchantId}`;
+  try {
+    const count = await redis.incr(key);
+    if (count === 1) {
+      await redis.expire(key, MERCHANT_CONCURRENCY_TTL_SEC);
+    }
+    if (count > merchantMaxConcurrency) {
+      await redis.decr(key);
+      return reply
+        .code(429)
+        .header('Retry-After', '1')
+        .send(createErrorResponse(ErrorCodes.CONCURRENCY_EXCEEDED, 'Too many concurrent requests'));
+    }
+  } catch (err) {
+    request.log.error({ err, merchantId }, 'Concurrency limiter Redis error — allowing request through');
+  }
+});
+
+fastify.addHook('onResponse', async (request: FastifyRequest, _reply: FastifyReply) => {
+  const merchantId = (request.user as any)?.merchantId;
+  if (!merchantId) return;
+
+  const key = `concurrency:${merchantId}`;
+  try {
+    await redis.decr(key);
+  } catch (err) {
+    request.log.error({ err, merchantId }, 'Concurrency limiter Redis DECR error');
+  }
+});
+
 fastify.addHook('preHandler', async (request) => {
   if (request.body !== undefined) {
     request.body = sanitizeInput(request.body);
