@@ -10,6 +10,57 @@ declare module 'fastify' {
   }
 }
 
+export type ErrorClass = 'fatal' | 'transient' | 'validation' | 'security' | 'business';
+
+/**
+ * Classify an error into an alerting-friendly category.
+ *
+ * - `fatal`      — infrastructure outage (DB unreachable, OOM, unhandled crash)
+ * - `transient`  — retryable (rate limit, timeout, temporary upstream failure)
+ * - `validation` — bad input (Zod, Prisma unique constraint, invalid request)
+ * - `security`   — auth/authz failure (401, 403, invalid token)
+ * - `business`   — domain rule violation (insufficient funds, duplicate settlement)
+ */
+export function classifyError(error: unknown, statusCode?: number): ErrorClass {
+  // Prisma error codes
+  const prismaCode = (error as { code?: string }).code;
+  if (prismaCode === 'P1001' || prismaCode === 'P1002' || prismaCode === 'P1017') {
+    return 'fatal'; // DB unreachable / connection refused
+  }
+  if (prismaCode === 'P2002' || prismaCode === 'P2025') {
+    return 'validation'; // unique constraint / record not found
+  }
+
+  // Zod validation errors
+  if (error instanceof z.ZodError) {
+    return 'validation';
+  }
+
+  // Fastify rate-limit
+  if ((error as { statusCode?: number }).statusCode === 429) {
+    return 'transient';
+  }
+
+  // HTTP status-based classification
+  if (statusCode === 401 || statusCode === 403) {
+    return 'security';
+  }
+  if (statusCode === 400 || statusCode === 422) {
+    return 'validation';
+  }
+  if (statusCode === 503 || statusCode === 504) {
+    return 'transient';
+  }
+
+  // Network / timeout errors
+  const msg = String((error as Error).message ?? '').toLowerCase();
+  if (msg.includes('timeout') || msg.includes('econnrefused') || msg.includes('enotfound')) {
+    return 'transient';
+  }
+
+  return 'fatal';
+}
+
 export function registerErrorHandler(fastify: FastifyInstance, customLogger?: FastifyBaseLogger) {
   fastify.setErrorHandler((error, request, reply) => {
     const logger = customLogger || request.log || fastify.log;
@@ -31,8 +82,10 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
     // client can quote it when reporting the problem, and the server log entry
     // ties back to exactly that request.
     const referenceId = crypto.randomUUID();
+    const errorClass = classifyError(error);
+    const errObj = error instanceof Error ? error : new Error(String(error));
     logger.error(
-      { err: error, reqId: request.id, referenceId, stack: error.stack },
+      { err: errObj, reqId: request.id, referenceId, errorClass, stack: errObj.stack },
       'Unhandled internal error',
     );
 
@@ -53,9 +106,11 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
 
     const logger = customLogger || request.log || fastify.log;
     const referenceId = crypto.randomUUID();
+    const errorClass = classifyError(error, reply.statusCode);
+    const errObj = error instanceof Error ? error : new Error(String(error));
 
     logger.error(
-      { err: error, reqId: request.id, referenceId, stack: error.stack },
+      { err: errObj, reqId: request.id, referenceId, errorClass, stack: errObj.stack },
       'Panic recovery: unhandled error reached onError hook',
     );
 

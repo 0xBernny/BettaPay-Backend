@@ -19,6 +19,7 @@ export * from './audit.js';
 export * from './redis.js';
 export * from './metrics-server.js';
 export * from './feature-flags.js';
+export * from './startup-checks.js';
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {
@@ -42,6 +43,7 @@ export const ErrorCodes = {
   INVALID_AMOUNT: 'INVALID_AMOUNT',
   INVALID_QUERY: 'INVALID_QUERY',
   INVALID_ORIGIN: 'INVALID_ORIGIN',
+  CONCURRENCY_EXCEEDED: 'CONCURRENCY_EXCEEDED',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -89,6 +91,47 @@ export const EnvSchema = z.object({
   // Fees — default basis points applied when a merchant has no custom fee rule.
   FEES_DEFAULT_BPS: z.string().transform((s) => parseInt(s, 10)).default('100'),
 
+  // Volume-based fee discount tiers — optional JSON array of tier objects.
+  // Each tier defines a minimum monthly gross volume threshold (in USD/USDC)
+  // and a discount in basis points subtracted from the merchant's base feeBps.
+  // Tiers are evaluated in descending volumeUsd order; the highest-matching
+  // tier wins. The effective fee is clamped to [0, feeBps] (never negative).
+  //
+  // Example:
+  //   FEE_DISCOUNT_TIERS='[{"volumeUsd":10000,"discountBps":10},{"volumeUsd":50000,"discountBps":25}]'
+  //
+  // A merchant with $15 000 monthly volume and a 100 bps base fee would pay
+  // 90 bps effective fee (100 − 10 = 90).
+  FEE_DISCOUNT_TIERS: z
+    .string()
+    .optional()
+    .transform((s): Array<{ volumeUsd: number; discountBps: number }> => {
+      if (!s) return [];
+      try {
+        const parsed = JSON.parse(s);
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter(
+          (t): t is { volumeUsd: number; discountBps: number } =>
+            typeof t === 'object' &&
+            t !== null &&
+            typeof t.volumeUsd === 'number' &&
+            typeof t.discountBps === 'number' &&
+            t.volumeUsd >= 0 &&
+            t.discountBps >= 0,
+        );
+      } catch {
+        return [];
+      }
+    })
+    .pipe(
+      z.array(
+        z.object({
+          volumeUsd: z.number().nonnegative(),
+          discountBps: z.number().nonnegative(),
+        }),
+      ),
+    ),
+
   // Auth
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   JWT_EXPIRES_IN: z.string().default('24h'),
@@ -127,6 +170,9 @@ export const EnvSchema = z.object({
   REDIS_URL: z.string().default('redis://localhost:6379'),
   REDIS_MAX_RETRIES: z.string().transform((s) => parseInt(s, 10)).default('3'),
 
+  // Per-merchant concurrent request limiting
+  MERCHANT_MAX_CONCURRENCY: z.string().transform((s) => parseInt(s, 10)).default('10'),
+
   // Stellar
   STELLAR_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
   STELLAR_NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),
@@ -162,11 +208,21 @@ export const EnvSchema = z.object({
   // Indexer — lag warning threshold (number of ledgers behind the Stellar tip)
   INDEXER_LAG_WARN_THRESHOLD: z.string().transform((s) => parseInt(s, 10)).default('10'),
 
+  // Indexer — smart startup ledger discovery (#352)
+  // When no indexed events exist, start from max(1, tip - INITIAL_BACKFILL_LEDGERS).
+  INITIAL_BACKFILL_LEDGERS: z.string().transform((s) => parseInt(s, 10)).default('1000'),
+  // Manual override: skip auto-discovery and start from this ledger.
+  INDEX_FROM_LEDGER: z.string().optional(),
+
   // Indexer — Event retention policy
   EVENT_RETENTION_DAYS: z.string().transform((s) => parseInt(s, 10)).default('30').refine(
     (val) => process.env.NODE_ENV !== 'production' || val >= 1,
     { message: 'EVENT_RETENTION_DAYS must be >= 1 in production' }
   ),
+
+  // Settlement Batching — interval (seconds) for batch job and minimum count per batch
+  BATCH_INTERVAL_SECONDS: z.string().transform((s) => parseInt(s, 10)).default('300'),
+  BATCH_MIN_COUNT: z.string().transform((s) => parseInt(s, 10)).default('2'),
 });
 
 export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS' | 'FEATURE_FLAGS'> & {

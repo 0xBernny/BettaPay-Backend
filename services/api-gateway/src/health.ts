@@ -43,7 +43,7 @@ export async function buildGatewayHealthResponse(
     checkUpstreamServiceHealth(env.INDEXER_URL, 'indexer', { fetchImpl }),
   ]);
 
-  return buildHealthResponse({
+  const base = buildHealthResponse({
     service: 'api-gateway',
     version: serviceVersion,
     startTime,
@@ -51,6 +51,22 @@ export async function buildGatewayHealthResponse(
     upstream: [fxEngine, settlementEngine, indexer],
     criticalDependencyNames: ['postgresql'],
   });
+
+  // Include abandoned payments count in non-test environments
+  if (process.env.NODE_ENV !== 'test') {
+    const abandonmentMinutes = parseInt(process.env.ABANDONMENT_THRESHOLD_MINUTES ?? '1440', 10);
+    const cutoff = new Date(Date.now() - abandonmentMinutes * 60 * 1000);
+    try {
+      const count = await prisma.payment.count({
+        where: { status: 'initiated', createdAt: { lt: cutoff } },
+      });
+      (base as any).business = { abandonedPayments: count };
+    } catch {
+      (base as any).business = { abandonedPayments: -1 };
+    }
+  }
+
+  return base;
 }
 
 export async function buildAggregatedHealthResponse(

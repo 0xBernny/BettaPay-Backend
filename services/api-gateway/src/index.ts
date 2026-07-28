@@ -22,7 +22,7 @@
  *   GET    /api/quote                — proxy to FX engine (timeout-aware)
  */
 
-import Fastify, { type FastifyRequest, type FastifyReply } from 'fastify';
+import Fastify, { type FastifyBaseLogger, type FastifyRequest, type FastifyReply } from 'fastify';
 import cors from '@fastify/cors';
 import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
@@ -43,6 +43,8 @@ import {
   CreateMerchantBody,
   CreatePaymentBody,
   CreateSettlementBody,
+  CreateSupportedAssetBody,
+  UpdateSupportedAssetBody,
   UpdatePaymentStatusBody,
   UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
@@ -51,6 +53,11 @@ import {
   WalletVerifyBody,
   SettlementListQuery,
   PaginationQuery,
+  BulkCancelPaymentsBody,
+  UpdateMerchantKycBody,
+  PAYMENT_STATUS_TRANSITIONS,
+  SETTLEMENT_STATUS_TRANSITIONS,
+  isValidTransition,
   createErrorResponse,
   ErrorCodes,
   registerErrorHandler,
@@ -70,6 +77,8 @@ import { Keypair } from '@stellar/stellar-sdk';
 import { OAuth2Client } from 'google-auth-library';
 import { registerGatewayHealthRoutes } from './health.js';
 import { startAbandonedPaymentsCron, stopAbandonedPaymentsCron } from './abandoned-payments-cron.js';
+import { createWebhookQueue, type WebhookJobData } from '@bettapay/webhook-delivery';
+import { Queue } from 'bullmq';
 import { readServiceVersion } from '@bettapay/validation';
 
 declare module 'fastify' {
@@ -77,17 +86,6 @@ declare module 'fastify' {
     authenticate: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
 }
-
-
-
-// Allowed payment status transitions. `initiated` is the only non-terminal state;
-// completed, failed, and cancelled are terminal and cannot transition further.
-const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
-  initiated: ['completed', 'failed', 'cancelled'],
-  completed: [],
-  failed: [],
-  cancelled: [],
-};
 
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -433,6 +431,46 @@ fastify.decorate('authenticate', async function (request: FastifyRequest, reply:
   } catch (err) {
     request.log.error(err);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
+});
+
+// Per-merchant concurrent request limiting via Redis.
+// Uses INCR with a TTL so that abandoned connections (e.g. dropped before
+// onResponse fires) are automatically cleaned up after 30 seconds.
+const MERCHANT_CONCURRENCY_TTL_SEC = 30;
+const merchantMaxConcurrency = env.MERCHANT_MAX_CONCURRENCY;
+
+fastify.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) => {
+  const merchantId = (request.user as any)?.merchantId;
+  if (!merchantId) return;
+
+  const key = `concurrency:${merchantId}`;
+  try {
+    const count = await redis.incr(key);
+    if (count === 1) {
+      await redis.expire(key, MERCHANT_CONCURRENCY_TTL_SEC);
+    }
+    if (count > merchantMaxConcurrency) {
+      await redis.decr(key);
+      return reply
+        .code(429)
+        .header('Retry-After', '1')
+        .send(createErrorResponse(ErrorCodes.CONCURRENCY_EXCEEDED, 'Too many concurrent requests'));
+    }
+  } catch (err) {
+    request.log.error({ err, merchantId }, 'Concurrency limiter Redis error — allowing request through');
+  }
+});
+
+fastify.addHook('onResponse', async (request: FastifyRequest, _reply: FastifyReply) => {
+  const merchantId = (request.user as any)?.merchantId;
+  if (!merchantId) return;
+
+  const key = `concurrency:${merchantId}`;
+  try {
+    await redis.decr(key);
+  } catch (err) {
+    request.log.error({ err, merchantId }, 'Concurrency limiter Redis DECR error');
   }
 });
 
@@ -787,6 +825,11 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantSetti
 }, async (request, reply) => {
   const d = UpdateMerchantSettingsBody.parse(request.body);
 
+  // Reject attempts to set kycStatus via the merchant settings endpoint
+  if ('kycStatus' in (request.body as Record<string, unknown>)) {
+    return reply.code(403).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'kycStatus cannot be updated via this endpoint'));
+  }
+
   const { id } = request.params;
   const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
   if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
@@ -800,6 +843,30 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantSetti
       data: { settings: nextSettings as object },
     });
     await logAuditEvent('merchant.updated', 'merchant', merchantUpdate.id, { before: merchant, after: merchantUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+    return merchantUpdate;
+  });
+
+  return reply.code(200).send({ data: { merchant: updated } });
+});
+
+// Admin-only: update merchant KYC status
+fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantKycBody> }>('/api/admin/merchants/:id/kyc', {
+  preValidation: [fastify.serviceAuth],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const d = UpdateMerchantKycBody.parse(request.body);
+  const { id } = request.params;
+
+  const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
+  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const merchantUpdate = await tx.merchant.update({
+      where: { id },
+      data: { kycStatus: d.kycStatus },
+    });
+    await logAuditEvent('merchant.kyc.updated', 'merchant', merchantUpdate.id, { before: { kycStatus: merchant.kycStatus }, after: { kycStatus: merchantUpdate.kycStatus } }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
     return merchantUpdate;
   });
 
@@ -929,10 +996,11 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdatePaymentStatus
   if (!payment) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Payment not found'));
 
   const allowed = PAYMENT_STATUS_TRANSITIONS[payment.status] ?? [];
-  if (!allowed.includes(d.status)) {
+  if (!isValidTransition(PAYMENT_STATUS_TRANSITIONS, payment.status, d.status)) {
     return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid status transition', {
       from: payment.status,
       to: d.status,
+      allowedTransitions: allowed,
     }));
   }
 
@@ -945,6 +1013,67 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdatePaymentStatus
     return paymentUpdate;
   });
   return reply.send({ data: updated });
+});
+
+// Bulk-cancel initiated payments belonging to the authenticated merchant.
+fastify.post<{ Body: z.infer<typeof BulkCancelPaymentsBody> }>('/api/payments/bulk-cancel', {
+  preValidation: [fastify.authenticate],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const d = BulkCancelPaymentsBody.parse(request.body);
+  const merchantId = (request.user as any).merchantId as string;
+
+  // Deduplicate IDs
+  const uniqueIds = [...new Set(d.paymentIds)];
+
+  const payments = await prisma.payment.findMany({
+    where: { id: { in: uniqueIds } },
+  });
+
+  const paymentMap = new Map(payments.map(p => [p.id, p]));
+
+  const cancelledIds: string[] = [];
+  const skippedIds: string[] = [];
+  const errors: { id: string; reason: string }[] = [];
+
+  for (const id of uniqueIds) {
+    const payment = paymentMap.get(id);
+    if (!payment) {
+      skippedIds.push(id);
+      continue;
+    }
+    if (payment.merchantId !== merchantId) {
+      skippedIds.push(id);
+      continue;
+    }
+    if (payment.status !== 'initiated') {
+      skippedIds.push(id);
+      continue;
+    }
+    cancelledIds.push(id);
+  }
+
+  if (cancelledIds.length > 0) {
+    await prisma.$transaction(async (tx) => {
+      for (const id of cancelledIds) {
+        const before = paymentMap.get(id)!;
+        const updated = await tx.payment.update({
+          where: { id },
+          data: { status: 'cancelled' },
+        });
+        await logAuditEvent('payment.status.changed', 'payment', id, { before, after: updated }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+      }
+    });
+  }
+
+  return reply.code(200).send({
+    cancelled: cancelledIds.length,
+    skipped: skippedIds.length,
+    errors: errors.length,
+    cancelledIds,
+    skippedIds,
+  });
 });
 
 fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementStatusBody> }>('/api/settlements/:id/status', {
@@ -963,20 +1092,13 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementSta
   const settlement = await prisma.settlement.findUnique({ where: { id } });
   if (!settlement) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Settlement not found'));
 
-  const SETTLEMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
-    PENDING: ['PROCESSING', 'FAILED'],
-    PROCESSING: ['COMPLETED', 'FAILED'],
-    COMPLETED: [],
-    FAILED: []
-  };
-
   const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
-  if (!allowed.includes(d.status)) {
-    return reply.code(422).send({
-      error: 'Invalid status transition',
+  if (!isValidTransition(SETTLEMENT_STATUS_TRANSITIONS, settlement.status, d.status)) {
+    return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid status transition', {
       from: settlement.status,
       to: d.status,
-    });
+      allowedTransitions: allowed,
+    }));
   }
 
   const updated = await prisma.$transaction(async (tx) => {
@@ -1018,6 +1140,7 @@ fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: 
     ? requestedMerchantId
     : (request.user as { merchantId?: string } | undefined)?.merchantId;
 
+  const { merchantId, status, from, to, startDate, endDate, limit, offset, includeDeleted } = query as any;
   const where: any = {};
   if (scopedMerchantId) {
     where.merchantId = scopedMerchantId;
@@ -1025,14 +1148,22 @@ fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: 
   if (status) {
     where.status = status;
   }
-  if (from || to) {
+  const effectiveFrom = startDate ?? from;
+  const effectiveTo = endDate ?? to;
+  if (effectiveFrom || effectiveTo) {
     where.initiatedAt = {};
-    if (from) {
-      where.initiatedAt.gte = new Date(from);
+    if (effectiveFrom) {
+      where.initiatedAt.gte = new Date(effectiveFrom);
     }
-    if (to) {
-      where.initiatedAt.lte = new Date(to);
+    if (effectiveTo) {
+      where.initiatedAt.lte = new Date(effectiveTo);
     }
+  }
+
+  // When includeDeleted is false, exclude settlements belonging to soft-deleted merchants.
+  // Service-auth callers (preValidation: [fastify.serviceAuth]) always see everything.
+  if (!includeDeleted) {
+    where.merchant = { deletedAt: null };
   }
 
   const [records, total] = await Promise.all([
@@ -1072,6 +1203,21 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>('/api/settlements',
 
     // Normalize to items array (backward compatibility: single amount/asset becomes single-item batch)
     const items = d.items || (d.amount && d.asset ? [{ amount: d.amount, asset: d.asset }] : []);
+
+    // #319 — Validate each asset against SupportedAsset table
+    for (const item of items) {
+      const supportedAsset = await prisma.supportedAsset.findUnique({
+        where: { code: item.asset },
+      });
+
+      if (!supportedAsset || !supportedAsset.isActive) {
+        return reply.code(422).send(createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          `Asset ${item.asset} is not supported`,
+          { asset: item.asset }
+        ));
+      }
+    }
 
     // Validate each settlement item against merchant limits
     for (const item of items) {
@@ -1235,6 +1381,148 @@ async function proxyFxUpstream(
 
 fastify.get('/api/rates', async (request, reply) => proxyFxUpstream(request, reply, '/api/rates'));
 fastify.get('/api/currencies', async (request, reply) => proxyFxUpstream(request, reply, '/api/currencies'));
+
+// ============================================================================
+// SUPPORTED ASSETS (#319)
+// ============================================================================
+
+// GET /api/assets — list all supported assets
+fastify.get('/api/assets', async (request, reply) => {
+  try {
+    const assets = await prisma.supportedAsset.findMany({
+      where: { isActive: true },
+      select: {
+        code: true,
+        contractId: true,
+        decimals: true,
+        name: true,
+        isActive: true,
+      },
+    });
+
+    return { data: assets };
+  } catch (error) {
+    request.log.error({ error }, 'Failed to fetch supported assets');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
+// POST /api/admin/assets — admin endpoint to add new asset
+fastify.post('/api/admin/assets', {
+  preValidation: [fastify.serviceAuth],
+  schema: {
+    body: z.object({
+      code: z.string().min(1),
+      contractId: z.string().min(1),
+      decimals: z.number().int().min(0),
+      name: z.string().min(1),
+      isActive: z.boolean().default(true),
+    }),
+  },
+}, async (request, reply) => {
+  const body = request.body as z.infer<typeof CreateSupportedAssetBody>;
+
+  try {
+    const asset = await prisma.supportedAsset.create({
+      data: body,
+    });
+
+    await logAuditEvent({
+      action: 'CREATE_SUPPORTED_ASSET',
+      entityType: 'SupportedAsset',
+      entityId: asset.code,
+      actorId: 'admin',
+      actorType: 'SERVICE',
+      changes: { asset },
+      ipAddress: request.ip,
+    });
+
+    return reply.code(201).send({ data: asset });
+  } catch (error: any) {
+    if (error.code === 'P2002') {
+      return reply.code(409).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Asset code already exists'));
+    }
+    request.log.error({ error }, 'Failed to create supported asset');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
+// PATCH /api/admin/assets/:code — admin endpoint to update asset
+fastify.patch('/api/admin/assets/:code', {
+  preValidation: [fastify.serviceAuth],
+  schema: {
+    params: z.object({ code: z.string().min(1) }),
+    body: z.object({
+      contractId: z.string().min(1).optional(),
+      decimals: z.number().int().min(0).optional(),
+      name: z.string().min(1).optional(),
+      isActive: z.boolean().optional(),
+    }),
+  },
+}, async (request, reply) => {
+  const { code } = request.params as { code: string };
+  const body = request.body as z.infer<typeof UpdateSupportedAssetBody>;
+
+  try {
+    const asset = await prisma.supportedAsset.update({
+      where: { code },
+      data: body,
+    });
+
+    await logAuditEvent({
+      action: 'UPDATE_SUPPORTED_ASSET',
+      entityType: 'SupportedAsset',
+      entityId: asset.code,
+      actorId: 'admin',
+      actorType: 'SERVICE',
+      changes: { updates: body },
+      ipAddress: request.ip,
+    });
+
+    return { data: asset };
+  } catch (error: any) {
+    if (error.code === 'P2025') {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Asset not found'));
+    }
+    request.log.error({ error }, 'Failed to update supported asset');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
+// DELETE /api/admin/assets/:code — admin endpoint to delete asset
+fastify.delete('/api/admin/assets/:code', {
+  preValidation: [fastify.serviceAuth],
+  schema: {
+    params: z.object({ code: z.string().min(1) }),
+  },
+}, async (request, reply) => {
+  const { code } = request.params as { code: string };
+
+  try {
+    await prisma.supportedAsset.delete({
+      where: { code },
+    });
+
+    await logAuditEvent({
+      action: 'DELETE_SUPPORTED_ASSET',
+      entityType: 'SupportedAsset',
+      entityId: code,
+      actorId: 'admin',
+      actorType: 'SERVICE',
+      changes: {},
+      ipAddress: request.ip,
+    });
+
+    return reply.code(204).send();
+  } catch (error: any) {
+    if (error.code === 'P2025') {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Asset not found'));
+    }
+    request.log.error({ error }, 'Failed to delete supported asset');
+    return reply.code(500).send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Internal server error'));
+  }
+});
+
 fastify.get('/api/quote', async (request, reply) => {
   const query = new URLSearchParams(request.query as Record<string, string>).toString();
   const path = query ? `/api/quote?${query}` : '/api/quote';
@@ -1242,6 +1530,61 @@ fastify.get('/api/quote', async (request, reply) => {
 });
 
   return fastify;
+}
+
+// ─── Warmup ─────────────────────────────────────────────────────────────────
+
+interface DownstreamService {
+  name: string;
+  healthUrl: string;
+}
+
+function getDownstreamServices(env: ReturnType<typeof validateEnv>): DownstreamService[] {
+  return [
+    { name: 'fx-engine', healthUrl: `${env.FX_ENGINE_URL}/api/health` },
+    { name: 'indexer', healthUrl: `${env.INDEXER_URL}/api/health` },
+  ];
+}
+
+/**
+ * Make best-effort warmup requests to downstream services so their caches,
+ * connection pools, and health state are ready before the gateway accepts
+ * traffic. Each call carries a unique x-trace-id so operators can correlate
+ * startup events across services.
+ *
+ * Errors are logged but never thrown — a downstream that is still warming up
+ * should not prevent the gateway from starting.
+ */
+async function warmupDownstreamServices(
+  env: ReturnType<typeof validateEnv>,
+  logger: FastifyBaseLogger,
+): Promise<void> {
+  const services = getDownstreamServices(env);
+
+  await Promise.allSettled(
+    services.map(async (svc) => {
+      const traceId = crypto.randomUUID();
+      const startTime = Date.now();
+
+      try {
+        const response = await fetch(svc.healthUrl, {
+          headers: { 'x-trace-id': traceId },
+          signal: AbortSignal.timeout(5_000),
+        });
+        const durationMs = Date.now() - startTime;
+        logger.info(
+          { traceId, targetService: svc.name, statusCode: response.status, durationMs },
+          'Warmup completed',
+        );
+      } catch (err) {
+        const durationMs = Date.now() - startTime;
+        logger.warn(
+          { traceId, targetService: svc.name, durationMs, err },
+          'Warmup failed — downstream may not be ready',
+        );
+      }
+    }),
+  );
 }
 
 // Graceful shutdown
@@ -1283,11 +1626,15 @@ const start = async () => {
     await connectWithRetry(prisma, app.log);
     await waitForRedis(redis, app.log);
 
+    // #314 — warmup downstream services with unique trace IDs
+    await warmupDownstreamServices(env, app.log);
+
     // #387 — Redis memory monitoring
     startRedisMemoryMonitor(redis, app.log);
 
     if (process.env.NODE_ENV !== 'test') {
-      startAbandonedPaymentsCron(prisma, app.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24);
+      const webhookQueue = createWebhookQueue('gateway-expired-webhooks', { url: env.REDIS_URL });
+      startAbandonedPaymentsCron(prisma, app.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24, webhookQueue);
     }
     await app.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {
