@@ -91,6 +91,47 @@ export const EnvSchema = z.object({
   // Fees — default basis points applied when a merchant has no custom fee rule.
   FEES_DEFAULT_BPS: z.string().transform((s) => parseInt(s, 10)).default('100'),
 
+  // Volume-based fee discount tiers — optional JSON array of tier objects.
+  // Each tier defines a minimum monthly gross volume threshold (in USD/USDC)
+  // and a discount in basis points subtracted from the merchant's base feeBps.
+  // Tiers are evaluated in descending volumeUsd order; the highest-matching
+  // tier wins. The effective fee is clamped to [0, feeBps] (never negative).
+  //
+  // Example:
+  //   FEE_DISCOUNT_TIERS='[{"volumeUsd":10000,"discountBps":10},{"volumeUsd":50000,"discountBps":25}]'
+  //
+  // A merchant with $15 000 monthly volume and a 100 bps base fee would pay
+  // 90 bps effective fee (100 − 10 = 90).
+  FEE_DISCOUNT_TIERS: z
+    .string()
+    .optional()
+    .transform((s): Array<{ volumeUsd: number; discountBps: number }> => {
+      if (!s) return [];
+      try {
+        const parsed = JSON.parse(s);
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter(
+          (t): t is { volumeUsd: number; discountBps: number } =>
+            typeof t === 'object' &&
+            t !== null &&
+            typeof t.volumeUsd === 'number' &&
+            typeof t.discountBps === 'number' &&
+            t.volumeUsd >= 0 &&
+            t.discountBps >= 0,
+        );
+      } catch {
+        return [];
+      }
+    })
+    .pipe(
+      z.array(
+        z.object({
+          volumeUsd: z.number().nonnegative(),
+          discountBps: z.number().nonnegative(),
+        }),
+      ),
+    ),
+
   // Auth
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   JWT_EXPIRES_IN: z.string().default('24h'),
