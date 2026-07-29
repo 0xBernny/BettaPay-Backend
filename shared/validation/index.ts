@@ -351,6 +351,14 @@ export const EnvSchema = z.object({
     .string()
     .transform((s) => parseInt(s, 10))
     .default("2"),
+
+  // Settlement Engine — optional daily volume limit for pre-validation.
+  // When set, the settlement engine rejects settlement creation requests
+  // that would exceed this limit within a single day (UTC). Default: 100000.
+  DAILY_SETTLEMENT_VOLUME_LIMIT: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("100000"),
 });
 
 export type Env = Omit<

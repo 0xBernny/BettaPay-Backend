@@ -1,23 +1,24 @@
-Deduplicate webhook delivery for settlement completion events
+Pre-validate settlement requests before enqueuing to BullMQ
 Repo Avatar
 Betta-Pay/BettaPay-Backend
 Current behavior:
-Webhook may be sent twice if worker restarts before ack persists.
+Job enqueued immediately, merchant validation happens in worker (wastes queue capacity if invalid).
 
 Expected behavior:
-Generate unique eventId (UUID). Before dispatch, Redis SET webhook_sent:{eventId} NX EX 3600. If key exists, skip and log warning. If Redis is down, deliver anyway (fail-open).
+In HTTP handler, before enqueuing: check merchant exists (404), not deleted (422), not suspended (403), has fee config (422), and has not exceeded daily volume limit (429, optional).
 
 Files to modify:
 
-shared/webhook-delivery/index.ts — add Redis SET NX check
-services/settlement-engine/src/index.ts — generate eventId
-Test: shared/webhook-delivery/index.test.ts
+services/settlement-engine/src/index.ts — add pre-validation logic
+shared/validation/index.ts — add optional DAILY_SETTLEMENT_VOLUME_LIMIT
 Test requirements:
 
-Deliver webhook — eventId recorded in Redis.
-Deliver same webhook again — skipped, warning logged.
-Redis unavailable — delivered without dedup.
+Non-existent merchant — 404.
+Deleted merchant — 422.
+Suspended merchant — 403.
+No fee config — 422.
+Valid merchant — 201 + job enqueued.
 Acceptance criteria:
 
-Duplicate webhooks prevented within 1-hour window.
-Resilient to Redis outages
+Failed pre-validations return instantly, no queue consumed.
+Valid requests proceed to queue as before.
