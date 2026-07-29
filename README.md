@@ -63,7 +63,8 @@ pnpm indexer:dev
 
 | Method | Path                     | Description              |
 |--------|--------------------------|--------------------------|
-| GET    | /api/health              | Liveness probe           |
+| GET    | /api/health              | Dependency and upstream health probe |
+| GET    | /api/health/all          | Aggregated health across all services |
 | POST   | /api/merchants           | Register merchant        |
 | GET    | /api/merchants/:id       | Fetch merchant           |
 | POST   | /api/payments            | Initiate payment session |
@@ -90,3 +91,17 @@ import { validateEnv } from '../../shared/validation/index.js';
 ```
 
 No workspace aliases. Each service is independently workable.
+
+## Database Migrations
+
+Prisma is used for ORM and schema migrations.
+
+To apply migrations to a new or existing database:
+```bash
+npx prisma migrate deploy
+```
+
+To create a new migration during development:
+```bash
+npx prisma migrate dev --name <migration_name>
+```

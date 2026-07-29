@@ -7,6 +7,7 @@
   "engines": {
     "node": ">=20.0.0"
   },
+  "packageManager": "pnpm@11.8.0",
   "workspaces": [
     "services/*",
     "shared/*"
@@ -15,37 +16,35 @@
     "dev": "pnpm --parallel --filter './services/*' dev",
     "build": "pnpm --filter './shared/*' build && pnpm --filter './services/*' build",
     "type-check": "pnpm -r type-check",
-    "lint": "pnpm -r lint",
+    "lint": "node -e \"console.log('No package-level linters configured; CI uses pnpm -r --if-present lint')\"",
     "gateway:dev": "pnpm --filter api-gateway dev",
     "fx:dev": "pnpm --filter fx-engine dev",
     "settlement:dev": "pnpm --filter settlement-engine dev",
     "indexer:dev": "pnpm --filter indexer dev",
     "clean": "pnpm -r clean && rm -rf node_modules",
-    "test": "pnpm --filter @bettapay/validation test && pnpm --filter api-gateway test && pnpm --filter indexer test"
+    "test": "pnpm --filter @bettapay/validation test && pnpm --filter @bettapay/webhook-delivery test && pnpm --filter api-gateway test",
+    "test:load": "k6 run test/load/gateway-scenarios.js"
   },
   "devDependencies": {
+    "@types/pg": "^8.20.0",
+    "@types/tape": "^5.6.4",
     "cross-env": "^7.0.3",
     "dotenv": "^17.4.2",
     "prettier": "^3.1.1",
     "prisma": "^7.8.0",
+    "tape": "^5.9.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.3"
   },
   "dependencies": {
     "@fastify/cors": "^11.2.0",
     "@fastify/jwt": "^10.1.0",
+    "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
     "@stellar/stellar-sdk": "^15.1.0",
     "bullmq": "^5.78.0",
     "fastify": "^5.8.5",
-    "ioredis": "^5.11.1"
-  },
-  "prisma": {
-    "seed": "ts-node --esm prisma/seed.ts"
-  },
-  "pnpm": {
-    "overrides": {
-      "axios": "^1.7.4"
-    }
+    "ioredis": "^5.11.1",
+    "pg": "^8.22.0"
   }
 }

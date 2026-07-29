@@ -1,0 +1,266 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    types: [ opened, synchronize, reopened, ready_for_review ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm must be on PATH before setup-node when using cache: pnpm
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run lint
+        # Only packages that define a lint script are run (--if-present).
+        run: pnpm -r --if-present lint
+
+  type-check:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: Build packages
+        run: pnpm -r --if-present build
+
+      - name: Run type checking
+        run: pnpm -r --if-present type-check
+
+  test:
+    runs-on: ubuntu-latest
+    needs: type-check
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: bettapay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/bettapay_test?schema=public
+      REDIS_URL: redis://localhost:6379
+      ADMIN_ADDRESS: GA_TEST
+      ADMIN_SECRET: test-secret
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: Apply database schema
+        run: pnpm exec prisma db push --skip-generate
+
+      - name: Build project
+        run: pnpm build
+
+      # Tape/node test runners — do not pass Jest-style flags
+      - name: Run tests
+        run: pnpm test
+
+  migration-rollback-test:
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: bettapay_migration_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/bettapay_migration_test
+      # Only used by `prisma migrate diff` to materialize a migrations-directory
+      # state for comparison; never written to as application data.
+      SHADOW_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/bettapay_migration_test_shadow
+      ADMIN_ADDRESS: GROLLBACKTESTMERCHANTADDRESSFORCIONLY00000000
+      ADMIN_SECRET: rollback-test-secret
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Create shadow database
+        run: psql "$DATABASE_URL" -c "CREATE DATABASE bettapay_migration_test_shadow;"
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: Apply all migrations
+        run: pnpm exec prisma migrate deploy
+
+      - name: Seed test data
+        run: pnpm exec prisma db seed
+
+      - name: Determine latest migration
+        id: latest_migration
+        run: |
+          LATEST=$(ls -1 prisma/migrations | grep -v migration_lock.toml | sort | tail -1)
+          echo "name=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest migration: $LATEST"
+
+      - name: Build a migrations directory without the latest migration
+        run: |
+          rm -rf /tmp/migrations-before-latest
+          cp -r prisma/migrations /tmp/migrations-before-latest
+          rm -rf "/tmp/migrations-before-latest/${{ steps.latest_migration.outputs.name }}"
+
+      - name: Generate rollback script for the latest migration
+        run: |
+          pnpm exec prisma migrate diff \
+            --from-migrations prisma/migrations \
+            --to-migrations /tmp/migrations-before-latest \
+            --script > /tmp/rollback.sql
+          echo "Rollback script for ${{ steps.latest_migration.outputs.name }}:"
+          cat /tmp/rollback.sql
+
+      - name: Apply rollback
+        run: pnpm exec prisma db execute --file /tmp/rollback.sql
+
+      - name: Verify rollback succeeded (schema matches pre-migration state)
+        run: |
+          pnpm exec prisma migrate diff \
+            --from-config-datasource \
+            --to-migrations /tmp/migrations-before-latest \
+            --exit-code
+
+      - name: Verify seed data survived the rollback
+        run: |
+          COUNT=$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM \"Merchant\" WHERE id = '${ADMIN_ADDRESS}'")
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::Seed data missing after rollback (expected 1 Merchant row, found $COUNT)"
+            exit 1
+          fi
+          echo "Seed data intact after rollback ($COUNT row found)"
+
+      - name: Re-apply the latest migration
+        run: pnpm exec prisma migrate deploy
+
+      - name: Verify final schema matches the full migration history
+        run: |
+          pnpm exec prisma migrate diff \
+            --from-config-datasource \
+            --to-migrations prisma/migrations \
+            --exit-code
+
+      - name: Verify seed data still accessible after re-apply
+        run: |
+          COUNT=$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM \"Merchant\" WHERE id = '${ADMIN_ADDRESS}'")
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::Seed data missing after re-applying migration (expected 1 Merchant row, found $COUNT)"
+            exit 1
+          fi
+          echo "Seed data intact after re-apply ($COUNT row found)"
+
+  audit:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run dependency audit
+        run: pnpm audit --audit-level=high
+        # Advisory DB can fail independently of this PR; don't block merges on transient findings.
+        continue-on-error: true
+
+  pr-title:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Validate PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "PR title: $PR_TITLE"
+          if ! echo "$PR_TITLE" | grep -Ei '^(feat|fix|docs|refactor|test|chore|ci)(\(.+\))?[:/]\s?.+'; then
+            echo "::error::PR title must follow Conventional Commits: type(scope): description or type/description"
+            exit 1
+          fi
+
+# Branch protection guidance (documented in CONTRIBUTING.md):
+# - Require status checks: lint, type-check, test, audit, pr-title
+# - Require pull request reviews
+# - Restrict force pushes on main

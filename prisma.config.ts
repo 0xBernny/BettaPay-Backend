@@ -7,8 +7,15 @@ export default defineConfig({
   schema: "prisma/schema.prisma",
   migrations: {
     path: "prisma/migrations",
+    // Prisma 7 no longer reads the legacy `prisma.seed` field in package.json —
+    // `prisma db seed` is a no-op without this.
+    seed: "ts-node --esm prisma/seed.ts",
   },
   datasource: {
     url: process.env["DATABASE_URL"],
+    // Only needed by `prisma migrate diff` when diffing two migrations
+    // directories (used by the CI migration-rollback-test job) — unset in
+    // every other environment, where it's a no-op.
+    shadowDatabaseUrl: process.env["SHADOW_DATABASE_URL"],
   },
 });

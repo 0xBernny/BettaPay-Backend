@@ -5,6 +5,7 @@ import { FastifyRequest } from 'fastify';
 import { resolveAllowedOrigins } from './cors.js';
 
 export * from './schemas.js';
+export * from './currency.js';
 export * from './plugins.js';
 export * from './prisma.js';
 export * from './cors.js';
@@ -13,6 +14,12 @@ export * from './fastify-plugins.js';
 export * from './logger.js';
 export * from './envAwareSchema.js';
 export * from './webhookSchema.js';
+export * from './health.js';
+export * from './audit.js';
+export * from './redis.js';
+export * from './metrics-server.js';
+export * from './feature-flags.js';
+export * from './startup-checks.js';
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {
@@ -37,6 +44,8 @@ export const ErrorCodes = {
   UNSUPPORTED_CURRENCY_PAIR: 'UNSUPPORTED_CURRENCY_PAIR',
   INVALID_AMOUNT: 'INVALID_AMOUNT',
   INVALID_QUERY: 'INVALID_QUERY',
+  INVALID_ORIGIN: 'INVALID_ORIGIN',
+  CONCURRENCY_EXCEEDED: 'CONCURRENCY_EXCEEDED',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -63,6 +72,19 @@ export const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.string().transform((s) => parseInt(s, 10)).default('3000'),
 
+  // Feature flags — comma-separated list of enabled flag names, e.g.
+  // "new_settlement_flow,enhanced_fx_quotes". An absent or empty value means
+  // all flags are disabled. Flag names are matched case-insensitively.
+  FEATURE_FLAGS: z.string().optional(),
+
+  // Two-tier upstream timeouts.
+  // READ_TIMEOUT_MS caps idempotent GET calls (fx quotes, indexer events) so
+  // the gateway fails fast during upstream read outages. Default: 2 s.
+  // WRITE_TIMEOUT_MS caps mutation calls (POST settlements) where the
+  // downstream service may need longer to commit. Default: 30 s.
+  READ_TIMEOUT_MS: z.string().transform((s) => parseInt(s, 10)).default('2000'),
+  WRITE_TIMEOUT_MS: z.string().transform((s) => parseInt(s, 10)).default('30000'),
+
   // Logging — pino level for the shared logger config (#119).
   LOG_LEVEL: z
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
@@ -71,10 +93,58 @@ export const EnvSchema = z.object({
   // Fees — default basis points applied when a merchant has no custom fee rule.
   FEES_DEFAULT_BPS: z.string().transform((s) => parseInt(s, 10)).default('100'),
 
+  // Volume-based fee discount tiers — optional JSON array of tier objects.
+  // Each tier defines a minimum monthly gross volume threshold (in USD/USDC)
+  // and a discount in basis points subtracted from the merchant's base feeBps.
+  // Tiers are evaluated in descending volumeUsd order; the highest-matching
+  // tier wins. The effective fee is clamped to [0, feeBps] (never negative).
+  //
+  // Example:
+  //   FEE_DISCOUNT_TIERS='[{"volumeUsd":10000,"discountBps":10},{"volumeUsd":50000,"discountBps":25}]'
+  //
+  // A merchant with $15 000 monthly volume and a 100 bps base fee would pay
+  // 90 bps effective fee (100 − 10 = 90).
+  FEE_DISCOUNT_TIERS: z
+    .string()
+    .optional()
+    .transform((s): Array<{ volumeUsd: number; discountBps: number }> => {
+      if (!s) return [];
+      try {
+        const parsed = JSON.parse(s);
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter(
+          (t): t is { volumeUsd: number; discountBps: number } =>
+            typeof t === 'object' &&
+            t !== null &&
+            typeof t.volumeUsd === 'number' &&
+            typeof t.discountBps === 'number' &&
+            t.volumeUsd >= 0 &&
+            t.discountBps >= 0,
+        );
+      } catch {
+        return [];
+      }
+    })
+    .pipe(
+      z.array(
+        z.object({
+          volumeUsd: z.number().nonnegative(),
+          discountBps: z.number().nonnegative(),
+        }),
+      ),
+    ),
+
   // Auth
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   JWT_EXPIRES_IN: z.string().default('24h'),
-  AUTH_IP_THRESHOLD: z.string().transform((s) => parseInt(s, 10)).default('20'),
+  FIELD_ENCRYPTION_KEY: z.string().min(32, 'FIELD_ENCRYPTION_KEY must be at least 32 characters'),
+  // Admin API key for privileged endpoints (optional)
+  ADMIN_API_KEY: z.string().min(32, 'ADMIN_API_KEY must be at least 32 characters').optional(),
+  GOOGLE_CLIENT_ID: z.string().min(1, 'GOOGLE_CLIENT_ID is required'),
+
+  // Google OAuth — optional comma-separated list of allowed email domains.
+  // When set, only emails from these domains can authenticate.
+  ALLOWED_EMAIL_DOMAINS: z.string().optional(),
 
   // Inter-service auth — shared secret presented in the `x-service-token` header
   // on internal (service-to-service) calls. Required so services fail fast
@@ -103,6 +173,9 @@ export const EnvSchema = z.object({
   REDIS_URL: z.string().default('redis://localhost:6379'),
   REDIS_MAX_RETRIES: z.string().transform((s) => parseInt(s, 10)).default('3'),
 
+  // Per-merchant concurrent request limiting
+  MERCHANT_MAX_CONCURRENCY: z.string().transform((s) => parseInt(s, 10)).default('10'),
+
   // Stellar
   STELLAR_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
   STELLAR_NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),
@@ -113,6 +186,11 @@ export const EnvSchema = z.object({
   GOVERNANCE_CONTRACT_ID: z.string().min(1, 'GOVERNANCE_CONTRACT_ID is required'),
   ADMIN_ADDRESS: z.string().min(1, 'ADMIN_ADDRESS is required'),
   ADMIN_SECRET: z.string().min(1, 'ADMIN_SECRET is required'),
+
+  // Multi-contract indexing — comma-separated contract IDs; falls back to
+  // SETTLEMENT_CONTRACT_ID for backward compatibility.
+  CONTRACT_IDS: z.string().optional(),
+  CONTRACT_NAMES: z.string().optional(),
 
   // Service URLs (used by gateway to proxy requests)
   FX_ENGINE_URL: z.string().url().default('http://localhost:3002'),
@@ -132,11 +210,42 @@ export const EnvSchema = z.object({
 
   // Indexer — lag warning threshold (number of ledgers behind the Stellar tip)
   INDEXER_LAG_WARN_THRESHOLD: z.string().transform((s) => parseInt(s, 10)).default('10'),
+
+  // Indexer — smart startup ledger discovery (#352)
+  // When no indexed events exist, start from max(1, tip - INITIAL_BACKFILL_LEDGERS).
+  INITIAL_BACKFILL_LEDGERS: z.string().transform((s) => parseInt(s, 10)).default('1000'),
+  // Manual override: skip auto-discovery and start from this ledger.
+  INDEX_FROM_LEDGER: z.string().optional(),
+
+  // Indexer — Event retention policy
+  EVENT_RETENTION_DAYS: z.string().transform((s) => parseInt(s, 10)).default('30').refine(
+    (val) => process.env.NODE_ENV !== 'production' || val >= 1,
+    { message: 'EVENT_RETENTION_DAYS must be >= 1 in production' }
+  ),
+
+  // Settlement Batching — interval (seconds) for batch job and minimum count per batch
+  BATCH_INTERVAL_SECONDS: z.string().transform((s) => parseInt(s, 10)).default('300'),
+  BATCH_MIN_COUNT: z.string().transform((s) => parseInt(s, 10)).default('2'),
 });
 
-export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS'> & {
+export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS' | 'FEATURE_FLAGS' | 'ALLOWED_EMAIL_DOMAINS'> & {
   ALLOWED_ORIGINS: string[];
+  CONTRACT_IDS: string[];
+  ALLOWED_EMAIL_DOMAINS: string[];
+  FEATURE_FLAGS: string[];
 };
+
+// For string length issues, appends the received length (e.g. "(got 8)") rather
+// than the raw value itself, so secrets are never echoed into logs.
+function formatEnvIssue(issue: z.ZodIssue, env: Record<string, unknown>): string {
+  const path = issue.path.join('.');
+  const rawValue = env[path];
+  const detail =
+    (issue.code === 'too_small' || issue.code === 'too_big') && typeof rawValue === 'string'
+      ? ` (got ${rawValue.length})`
+      : '';
+  return `  ${path}: ${issue.message}${detail}`;
+}
 
 export function validateEnv(env: Record<string, unknown>): Env {
   const { origins, error: originsError } = resolveAllowedOrigins(env);
@@ -146,12 +255,47 @@ export function validateEnv(env: Record<string, unknown>): Env {
 
   try {
     const parsed = EnvSchema.parse(env);
-    return { ...parsed, ALLOWED_ORIGINS: origins };
+
+    const contractIds = (parsed.CONTRACT_IDS ?? parsed.SETTLEMENT_CONTRACT_ID)
+      .split(',')
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0);
+
+    if (contractIds.length === 0) {
+      throw new Error('\n[BettaPay] Invalid or missing environment variables:\n  CONTRACT_IDS: at least one contract ID must be provided\n');
+    }
+
+    return {
+      ...parsed,
+      ALLOWED_ORIGINS: origins,
+      CONTRACT_IDS: contractIds,
+      ALLOWED_EMAIL_DOMAINS: parsed.ALLOWED_EMAIL_DOMAINS
+        ? parsed.ALLOWED_EMAIL_DOMAINS.split(',').map(d => d.trim().toLowerCase()).filter(Boolean)
+        : [],
+      FEATURE_FLAGS: parsed.FEATURE_FLAGS
+        ? parsed.FEATURE_FLAGS.split(',').map(f => f.trim().toLowerCase()).filter(Boolean)
+        : [],
+    };
   } catch (error) {
     if (error instanceof z.ZodError) {
-      const message = error.errors.map((e) => `  ${e.path.join('.')}: ${e.message}`).join('\n');
+      const message = error.errors.map((e) => formatEnvIssue(e, env)).join('\n');
       throw new Error(`\n[BettaPay] Invalid or missing environment variables:\n${message}\n`);
     }
     throw error;
   }
 }
+
+// Wraps validateEnv() for use at service startup: logs a single clean,
+// human-readable message (no stack trace) and exits with code 1 on failure,
+// so misconfiguration is caught fast instead of surfacing later at runtime.
+export function validateEnvOrExit(env: Record<string, unknown>): Env {
+  try {
+    return validateEnv(env);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    return process.exit(1);
+  }
+}
+
+export * from './prisma-pool-metrics.js';
+export * from './encryption.js';

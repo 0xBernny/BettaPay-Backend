@@ -9,24 +9,30 @@
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-precision.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/genReqId-usage.test.ts"
+    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/worker-shutdown.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-precision.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-amounts.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-amounts.property.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/genReqId-usage.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/prisma-adapter.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-bulk.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-bulk-limits.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-bulk-concurrency.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-bulk-errors.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-bulk-e2e.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-bulk-extensive.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-bulk-stress.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-bulk-load.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-bulk-webhook.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/settlement-bulk-limits-custom.test.ts"
   },
   "dependencies": {
     "@bettapay/shared-types": "workspace:^",
     "@bettapay/validation": "workspace:*",
+    "@bettapay/webhook-delivery": "workspace:*",
     "@fastify/cors": "^11.2.0",
     "@fastify/helmet": "^12.0.0",
     "@fastify/rate-limit": "^10.0.0",
+    "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
     "bignumber.js": "^9.1.0",
     "bullmq": "^5.79.1",
     "fastify": "^5.8.5",
     "ioredis": "^5.11.1",
+    "pg": "^8.22.0",
+    "prom-client": "^15.1.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
+    "@types/pg": "^8.20.0",
     "@types/tape": "^5.6.4",
+    "fast-check": "^4.9.0",
     "tape": "^5.9.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.3"

@@ -1,6 +1,6 @@
 {
   "name": "fx-engine",
-  "version": "0.1.0",
+  "ver sion": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,16 +8,22 @@
     "build": "tsc --project tsconfig.json",
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
+    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/rate-refresh.test.ts",
     "clean": "rm -rf dist"
   },
   "dependencies": {
     "@fastify/rate-limit": "^10.0.0",
     "@bettapay/validation": "workspace:*",
     "ioredis": "^5.11.1",
+    "prom-client": "^15.1.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
+    "@types/tape": "^5.6.4",
+    "cross-env": "^7.0.3",
+    "tape": "^5.9.0",
+    "ts-node": "^10.9.2",
     "typescript": "^5.3.3"
   }
 }
