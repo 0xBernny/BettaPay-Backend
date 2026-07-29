@@ -212,11 +212,6 @@ export const eventSchemas = z.discriminatedUnion('type', [
   anchorSettledEvent
 ]);
 
-export const AmountString = z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string');
-export const PositiveAmountString = AmountString.refine((value) => parseFloat(value) > 0, {
-  message: 'Amount must be greater than zero',
-});
-
 // Export types inferred from schemas
 export type User = z.infer<typeof userSchema>;
 export type Merchant = z.infer<typeof merchantSchema>;
@@ -228,8 +223,6 @@ export type FXQuote = z.infer<typeof fxQuoteSchema>;
 export type BillPayment = z.infer<typeof billPaymentSchema>;
 export type AnchorTransfer = z.infer<typeof anchorTransferSchema>;
 export type EventPayloads = z.infer<typeof eventSchemas>;
-export type AmountString = z.infer<typeof AmountString>;
-export type PositiveAmountString = z.infer<typeof PositiveAmountString>;
 
 // Convenience parsers
 export function parseEvent(raw: unknown) {
@@ -371,14 +364,6 @@ export const AuthTokenBody = z.object({
 
 export const AuthIpScoreQuery = z.object({
   ip: z.string().min(1, 'ip is required'),
-});
-
-export const WalletVerifyBody = z.object({
-  address: StellarAddressSchema,
-  nonce: z.string().min(1, 'nonce is required').max(512, 'nonce is too long'),
-  signature: z.string().min(1, 'signature is required'),
-  challenge: z.string().min(1).optional(),
-  message: z.string().min(1).optional(),
 });
 
 export const WebhookTestStatus = z.enum(['success', 'failed']);
@@ -543,7 +528,6 @@ export type CreateSettlementBody = z.infer<typeof CreateSettlementBody>;
 export type BulkSettlementBody = z.infer<typeof BulkSettlementBody>;
 export type AuthTokenBody = z.infer<typeof AuthTokenBody>;
 export type AuthIpScoreQuery = z.infer<typeof AuthIpScoreQuery>;
-export type WalletVerifyBody = z.infer<typeof WalletVerifyBody>;
 export type WebhookTestStatus = z.infer<typeof WebhookTestStatus>;
 export type WebhookTestPayload = z.infer<typeof WebhookTestPayloadSchema>;
 export type WebhookTestResult = z.infer<typeof WebhookTestResultSchema>;
