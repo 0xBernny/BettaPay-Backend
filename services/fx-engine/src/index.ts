@@ -17,7 +17,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
 import * as promClient from 'prom-client';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomInt } from 'crypto';
 import { z } from 'zod';
 import type { Redis } from 'ioredis';
 import {
@@ -316,13 +316,30 @@ async function warmupCacheFromRedis(): Promise<void> {
 
 let fallbackWarningIntervalHandle: ReturnType<typeof setInterval> | null = null;
 
-function startRefreshLoop(): void {
-  if (refreshIntervalHandle !== null) return;
-  refreshIntervalHandle = setInterval(refreshTick, env.RATES_REFRESH_INTERVAL_MS);
-  // Don't keep the process alive solely for this interval.
+function scheduleNextRefresh(): void {
+  const base = env.RATES_REFRESH_INTERVAL_MS;
+  const halfRange = Math.round(base * 0.25);
+  const jitter = randomInt(-halfRange, halfRange + 1);
+  const delay = base + jitter;
+
+  fastify.log.info({ baseInterval: base, delay, jitter }, 'Scheduling next FX rate refresh');
+
+  refreshIntervalHandle = setTimeout(() => {
+    refreshTick().finally(() => {
+      if (refreshIntervalHandle !== null) {
+        scheduleNextRefresh();
+      }
+    });
+  }, delay);
+
   if (typeof refreshIntervalHandle.unref === 'function') {
     refreshIntervalHandle.unref();
   }
+}
+
+function startRefreshLoop(): void {
+  if (refreshIntervalHandle !== null) return;
+  scheduleNextRefresh();
   fastify.log.info(
     { intervalMs: env.RATES_REFRESH_INTERVAL_MS, url: env.RATES_API_URL },
     'FX rate refresh loop started',
@@ -732,7 +749,7 @@ async function shutdown(signal: string) {
 
   try {
     if (refreshIntervalHandle !== null) {
-      clearInterval(refreshIntervalHandle);
+      clearTimeout(refreshIntervalHandle);
       refreshIntervalHandle = null;
     }
     await fastify.close();

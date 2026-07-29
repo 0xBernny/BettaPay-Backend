@@ -11,6 +11,7 @@
  * not need to import the running Fastify app.
  */
 
+import { randomInt } from 'crypto';
 import test from 'tape';
 
 interface LastRefresh {
@@ -226,5 +227,63 @@ test('setInterval-driven loop: refetches at the configured interval', async (t) 
 
   t.ok(callCount >= 3, `fetch was called >= 3 times within ~90ms at ${INTERVAL_MS}ms interval (got ${callCount})`);
   t.equal(refresher.cache.rates.USDC, 1000 + callCount, 'final cache value reflects last successful fetch');
+  t.end();
+});
+
+test('jitter: delays are within ±25% range and mean approximates the base interval', (t) => {
+  const BASE_INTERVAL = 100;
+  const SAMPLES = 1000;
+  const delays: number[] = [];
+
+  for (let i = 0; i < SAMPLES; i++) {
+    const halfRange = Math.round(BASE_INTERVAL * 0.25);
+    const jitter = randomInt(-halfRange, halfRange + 1);
+    delays.push(BASE_INTERVAL + jitter);
+  }
+
+  const min = Math.min(...delays);
+  const max = Math.max(...delays);
+  const mean = delays.reduce((a, b) => a + b, 0) / delays.length;
+  const expectedMin = Math.round(BASE_INTERVAL * 0.75);
+  const expectedMax = Math.round(BASE_INTERVAL * 1.25);
+
+  t.ok(min >= expectedMin, `min delay ${min} >= ${expectedMin}`);
+  t.ok(max <= expectedMax, `max delay ${max} <= ${expectedMax}`);
+  t.ok(Math.abs(mean - BASE_INTERVAL) < 3, `mean ${mean} ≈ ${BASE_INTERVAL}`);
+  t.equal(delays.length, SAMPLES, `generated ${SAMPLES} delays`);
+  t.end();
+});
+
+test('jitter: cache TTL is based on fetch time not scheduled time', async (t) => {
+  let fetchResolve: (body: Record<string, Record<string, number>>) => void;
+  const fetchPromise = new Promise<Record<string, Record<string, number>>>((resolve) => {
+    fetchResolve = resolve;
+  });
+
+  const refresher = makeRefresher({
+    url: 'https://rates.test',
+    fetchImpl: async () => {
+      const body = await fetchPromise;
+      return jsonResponse(body);
+    },
+    initial: { USDC: 1545.5, EURT: 1680.2, NGN: 1.0 },
+  });
+
+  // Tick starts but fetch is blocked
+  const tickPromise = refresher.refreshTick();
+
+  // Simulate 500ms of scheduling jitter before fetch completes
+  await new Promise((r) => setTimeout(r, 500));
+  const fetchTime = Date.now();
+  fetchResolve!({ 'usd-coin': { ngn: 2000 } });
+
+  await tickPromise;
+
+  // cachedAt should be close to fetchTime, not the tick start time
+  t.ok(
+    Math.abs(refresher.cache.cachedAt - fetchTime) < 50,
+    `cache.cachedAt (${refresher.cache.cachedAt}) within 50ms of fetch time (${fetchTime})`,
+  );
+  t.equal(refresher.cache.rates.USDC, 2000, 'cache rates updated correctly');
   t.end();
 });
