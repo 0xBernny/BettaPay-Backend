@@ -606,6 +606,56 @@ fastify.get('/api/health', async (_request, reply) => {
     version: SERVICE_VERSION,
   });
 
+  // Per-pair rate feed freshness (TTL-based status)
+  const now = Date.now();
+  const ageMs = now - cache.cachedAt;
+  const FEED_TTL_MS = env.RATES_REFRESH_INTERVAL_MS;
+
+  const rateFeeds: Record<string, {
+    status: 'healthy' | 'stale' | 'down';
+    lastUpdated: string;
+    ageMs: number;
+  }> = {};
+
+  const rateKeys = Object.keys(cache.rates);
+  if (rateKeys.length === 0) {
+    for (const currency of Object.keys(FALLBACK_RATES)) {
+      rateFeeds[currency] = {
+        status: 'down',
+        lastUpdated: new Date(cache.cachedAt).toISOString(),
+        ageMs,
+      };
+    }
+  } else {
+    for (const currency of rateKeys) {
+      let status: 'healthy' | 'stale' | 'down';
+      if (ageMs >= 2 * FEED_TTL_MS) {
+        status = 'down';
+      } else if (ageMs >= FEED_TTL_MS) {
+        status = 'stale';
+      } else {
+        status = 'healthy';
+      }
+      rateFeeds[currency] = {
+        status,
+        lastUpdated: new Date(cache.cachedAt).toISOString(),
+        ageMs,
+      };
+    }
+  }
+
+  const feedValues = Object.values(rateFeeds);
+  const feedStatus: 'healthy' | 'degraded' | 'down' =
+    feedValues.some(f => f.status === 'down') ? 'down' :
+    feedValues.some(f => f.status === 'stale') ? 'degraded' :
+    'healthy';
+
+  if (feedStatus === 'down' && health.status !== 'unhealthy') {
+    health.status = 'unhealthy';
+  } else if (feedStatus === 'degraded' && health.status === 'healthy') {
+    health.status = 'degraded';
+  }
+
   // Degrade to degraded if fallback mode has been active for >1 hour (#236)
   const ONE_HOUR_MS = 60 * 60 * 1000;
   if (fallbackStartTime !== null && Date.now() - fallbackStartTime > ONE_HOUR_MS) {
@@ -622,7 +672,7 @@ fastify.get('/api/health', async (_request, reply) => {
   }
 
   const statusCode = health.status === 'unhealthy' ? 503 : 200;
-  return reply.code(statusCode).send(health);
+  return reply.code(statusCode).send({ ...health, feedStatus, rateFeeds });
 });
 
 fastify.get('/api/rates', async (_request, _reply) => {
