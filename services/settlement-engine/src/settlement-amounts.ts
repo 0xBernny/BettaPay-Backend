@@ -25,6 +25,17 @@ import type { Amount } from '@bettapay/shared-types';
 // Always round DOWN (conservative/banker-safe), never use scientific notation
 BigNumber.config({ ROUNDING_MODE: BigNumber.ROUND_DOWN, EXPONENTIAL_AT: [-20, 40] });
 
+/** Maximum allowed settlement amount (10^15). */
+export const MAX_SETTLEMENT_AMOUNT = "1000000000000000";
+
+/** Thrown when a settlement gross amount exceeds MAX_SETTLEMENT_AMOUNT. */
+export class SettlementAmountError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SettlementAmountError';
+  }
+}
+
 export interface DiscountTier {
   /** Minimum monthly gross volume (USD/USDC) that activates this tier. */
   volumeUsd: number;
@@ -122,6 +133,13 @@ export function computeSettlementAmounts(
   discountTiers: DiscountTier[] = [],
 ): SettlementAmounts {
   const gross = new BigNumber(grossAmountStr);
+
+  // Guard: reject amounts that exceed the maximum allowed settlement amount.
+  if (gross.isGreaterThan(MAX_SETTLEMENT_AMOUNT)) {
+    throw new SettlementAmountError(
+      `Settlement amount ${grossAmountStr} exceeds maximum allowed (${MAX_SETTLEMENT_AMOUNT})`,
+    );
+  }
 
   // Resolve volume-based discount and clamp to [0, feeBps]
   const discountBps = Math.min(resolveVolumeDiscount(monthlyVolume, discountTiers), feeBps);
