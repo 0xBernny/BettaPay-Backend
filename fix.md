@@ -1,18 +1,15 @@
 Current behavior:
-Single DATABASE_URL for all queries — reads contend with writes.
+CI runs Prisma generate but does not validate migration consistency.
 
 Expected behavior:
-Add DATABASE_READ_REPLICA_URL env var. If set, configure Prisma to route reads (findMany, findFirst, count, aggregate) to replica and writes (create, update, delete) to primary using @prisma/extension-read-replicas. Log warning if no replica configured.
+Add CI step: pnpm exec prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma and pnpm exec prisma validate. Fail CI if either fails.
 
 Files to modify:
 
-shared/validation/prisma.ts — configure read replicas
-.env.example — document new variable
+.github/workflows/ci.yml — add steps
 Test requirements:
+N/A — CI configuration change. Verify pipeline passes.
 
-With replica URL — reads go to replica, writes to primary.
-Without replica URL — all queries to primary, warning logged.
 Acceptance criteria:
 
-Read replica support with zero code changes to service handlers.
-Falls back to primary if no replica conf
+CI catches schema drift and invalid schema files.

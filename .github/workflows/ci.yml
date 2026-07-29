@@ -50,6 +50,12 @@ jobs:
       - name: Generate Prisma client
         run: pnpm exec prisma generate
 
+      - name: Validate Prisma schema
+        run: pnpm exec prisma validate
+
+      - name: Check migration consistency
+        run: pnpm exec prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma
+
       - name: Build packages
         run: pnpm -r --if-present build
 
