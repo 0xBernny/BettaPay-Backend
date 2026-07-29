@@ -19,6 +19,7 @@ import rateLimit from '@fastify/rate-limit';
 import * as promClient from 'prom-client';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
+import type { Redis } from 'ioredis';
 import {
   validateEnvOrExit,
   registerErrorHandler,
@@ -378,7 +379,7 @@ const fastify = Fastify({
 registerRequestId(fastify);
 // #386 — exponential backoff retry strategy
 redis = createRedisClient(env.REDIS_URL, fastify.log);
-redis.on('error', (err) => fastify.log.warn({ err: err.message }, 'Redis error in fx-engine'));
+redis.on('error', (err: any) => fastify.log.warn({ err: err.message }, 'Redis error in fx-engine'));
 fastify.addHook('onClose', async () => { await redis.quit().catch(() => {}); });
 
 fastify.register(cors, {

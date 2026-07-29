@@ -225,7 +225,7 @@ export const EnvSchema = z.object({
   BATCH_MIN_COUNT: z.string().transform((s) => parseInt(s, 10)).default('2'),
 });
 
-export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS' | 'FEATURE_FLAGS'> & {
+export type Env = Omit<z.infer<typeof EnvSchema>, 'ALLOWED_ORIGINS' | 'CONTRACT_IDS' | 'FEATURE_FLAGS' | 'ALLOWED_EMAIL_DOMAINS'> & {
   ALLOWED_ORIGINS: string[];
   CONTRACT_IDS: string[];
   ALLOWED_EMAIL_DOMAINS: string[];

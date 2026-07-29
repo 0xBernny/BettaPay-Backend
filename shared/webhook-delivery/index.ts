@@ -163,17 +163,18 @@ export function createWebhookQueue(
   } = opts;
 
   const removeOnFailCount = removeOnFailOpt ?? WEBHOOK_DEFAULTS.removeOnFailCount;
+  const removeOnFailVal = removeOnFailOpt === false ? false : (typeof removeOnFailCount === 'number' ? removeOnFailCount : WEBHOOK_DEFAULTS.removeOnFailCount);
 
-  return new Queue<WebhookJobData>(name, {
+  return new Queue(name, {
     connection,
     defaultJobOptions: {
       attempts,
       backoff: { type: 'exponential', delay: backoffDelay },
       removeOnComplete: { count: removeOnCompleteCount },
-      removeOnFail: removeOnFailOpt === false ? false : { count: removeOnFailCount },
+      removeOnFail: removeOnFailVal,
     },
     ...queueOptions,
-  });
+  }) as unknown as Queue<WebhookJobData>;
 }
 
 // ── Factory: Worker ───────────────────────────────────────────────────────────
