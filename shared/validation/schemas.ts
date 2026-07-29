@@ -535,6 +535,20 @@ export type WebhookSubscription = z.infer<typeof WebhookSubscriptionSchema>;
 export type UpdatePaymentStatusBody = z.infer<typeof UpdatePaymentStatusBody>;
 export type UpdateMerchantSettingsBody = z.infer<typeof UpdateMerchantSettingsBody>;
 
+// ─── Indexer cleanup query ─────────────────────────────────────────────────────
+
+export const CleanupQuery = z.object({
+  dryRun: z.coerce.boolean().default(false),
+});
+export type CleanupQuery = z.infer<typeof CleanupQuery>;
+
+export interface CleanupDryRunResult {
+  wouldDelete: number;
+  totalSizeBytes: number;
+  retentionDays: number;
+  oldestEventDate: string;
+}
+
 // ─── Indexer types ────────────────────────────────────────────────────────────
 
 export const EVENT_TYPES = [

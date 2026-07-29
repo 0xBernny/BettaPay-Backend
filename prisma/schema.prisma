@@ -98,16 +98,17 @@ model Settlement {
 }
 
 model IndexedEvent {
-  id             String   @id
-  stellarId      String?
-  contractId     String
-  contractName   String?
-  topics         String[]
-  type           String
-  rawValue       String
-  decodedPayload Json?
-  ledger         Int
-  indexedAt      DateTime @default(now())
+  id               String   @id
+  stellarId        String?
+  contractId       String
+  contractName     String?
+  topics           String[]
+  type             String
+  rawValue         String
+  decodedPayload   Json?
+  validationError  String?
+  ledger           Int
+  indexedAt        DateTime @default(now())
 
   @@unique([stellarId, contractId, ledger])
   @@index([ledger])
