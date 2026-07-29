@@ -221,6 +221,13 @@ export const EnvSchema = z.object({
     { message: 'EVENT_RETENTION_DAYS must be >= 1 in production' }
   ),
 
+  // FX Engine — Rate history retention (days).
+  // Snapshots older than this are purged by the daily rate-history-cleanup job.
+  RATE_HISTORY_RETENTION_DAYS: z.string().transform((s) => parseInt(s, 10)).default('7').refine(
+    (val) => val >= 1,
+    { message: 'RATE_HISTORY_RETENTION_DAYS must be >= 1' }
+  ),
+
   // Settlement Batching — interval (seconds) for batch job and minimum count per batch
   BATCH_INTERVAL_SECONDS: z.string().transform((s) => parseInt(s, 10)).default('300'),
   BATCH_MIN_COUNT: z.string().transform((s) => parseInt(s, 10)).default('2'),

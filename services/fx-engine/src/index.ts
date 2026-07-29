@@ -20,6 +20,7 @@ import * as promClient from 'prom-client';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import type { Redis } from 'ioredis';
+import { Queue, Worker } from 'bullmq';
 import {
   validateEnvOrExit,
   registerErrorHandler,
@@ -382,6 +383,76 @@ redis = createRedisClient(env.REDIS_URL, fastify.log);
 redis.on('error', (err: any) => fastify.log.warn({ err: err.message }, 'Redis error in fx-engine'));
 fastify.addHook('onClose', async () => { await redis.quit().catch(() => {}); });
 
+// ── Rate history cleanup job ──────────────────────────────────────────────
+// BullMQ repeatable job that runs daily to purge rate history snapshots
+// older than RATE_HISTORY_RETENTION_DAYS.  Re-reads the env var each run
+// so operators can tune retention without a restart.
+
+const redisConn = new URL(env.REDIS_URL);
+const bullMqConnection = {
+  host: redisConn.hostname,
+  port: parseInt(redisConn.port || '6379', 10),
+  maxRetriesPerRequest: 3,
+  retryStrategy: (times: number) => {
+    const delay = Math.min(Math.pow(2, times) * 100, 5_000);
+    fastify.log.warn({ attempt: times, delayMs: delay }, 'BullMQ Redis connection retry (cleanup)');
+    return delay;
+  },
+};
+
+/**
+ * Reads RATE_HISTORY_RETENTION_DAYS from the environment each invocation
+ * (no restart required when the value changes) and purges rate history
+ * snapshots older than the retention window from the Redis sorted set.
+ *
+ * @returns Number of entries removed.
+ */
+async function runRateHistoryCleanup(): Promise<number> {
+  const retentionDays = parseInt(
+    process.env.RATE_HISTORY_RETENTION_DAYS ?? '7',
+    10,
+  );
+  const effectiveDays = Number.isFinite(retentionDays) && retentionDays >= 1
+    ? retentionDays
+    : 7;
+  const cutoff = Date.now() - effectiveDays * 24 * 60 * 60 * 1000;
+
+  const purged = await redis.zremrangebyscore(SNAPSHOT_KEY, '-inf', cutoff);
+  fastify.log.info(
+    { purged, retentionDays: effectiveDays, cutoff: new Date(cutoff).toISOString() },
+    'Rate history cleanup completed',
+  );
+  return purged;
+}
+
+const cleanupQueue = new Queue('rate-history-cleanup', {
+  connection: bullMqConnection,
+  defaultJobOptions: {
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 50 },
+  },
+});
+
+const cleanupWorker = new Worker(
+  'rate-history-cleanup',
+  async (_job) => {
+    await runRateHistoryCleanup();
+  },
+  {
+    connection: bullMqConnection,
+    concurrency: 1,
+    autorun: true,
+  },
+);
+
+cleanupWorker.on('error', (err) => {
+  fastify.log.error({ err: err.message }, 'Rate history cleanup worker error');
+});
+
+cleanupQueue.on('error', (err) => {
+  fastify.log.error({ err: err.message }, 'Rate history cleanup queue error');
+});
+
 fastify.register(cors, {
   origin: env.ALLOWED_ORIGINS,
 });
@@ -735,6 +806,8 @@ async function shutdown(signal: string) {
       clearInterval(refreshIntervalHandle);
       refreshIntervalHandle = null;
     }
+    await cleanupWorker.close();
+    await cleanupQueue.close();
     await fastify.close();
     await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
     process.exit(0);
@@ -790,6 +863,19 @@ const start = async () => {
       intervalMs: 30_000,
       warnThresholdRatio: 0.8,
     });
+
+    // Schedule the daily rate history cleanup repeatable job.
+    // The job key is static so re-deployments don't duplicate the schedule.
+    await cleanupQueue.add(
+      'daily-cleanup',
+      {},
+      {
+        repeat: { pattern: '0 0 * * *' },
+        jobId: 'rate-history-cleanup-daily',
+      },
+    );
+    fastify.log.info('Rate history cleanup repeatable job scheduled (daily at midnight)');
+
     // Wire up gauge updates alongside the shared logger-based monitor
     setInterval(async () => {
       try {
