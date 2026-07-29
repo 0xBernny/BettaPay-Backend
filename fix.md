@@ -1,19 +1,18 @@
 Current behavior:
-Soft-deleting a merchant leaves their payments and settlements active.
+Single DATABASE_URL for all queries — reads contend with writes.
 
 Expected behavior:
-When merchant is soft-deleted, use a transaction to cancel initiated payments and fail pending settlements. Add audit log entries for each cascaded change. Best-effort — if cascade partially fails, log error but do not roll back the merchant deletion.
+Add DATABASE_READ_REPLICA_URL env var. If set, configure Prisma to route reads (findMany, findFirst, count, aggregate) to replica and writes (create, update, delete) to primary using @prisma/extension-read-replicas. Log warning if no replica configured.
 
 Files to modify:
 
-services/api-gateway/src/index.ts — DELETE merchant handler
+shared/validation/prisma.ts — configure read replicas
+.env.example — document new variable
 Test requirements:
 
-Delete merchant with initiated payment — payment cancelled.
-Delete merchant with pending settlement — settlement failed.
-Delete merchant with completed settlement — unchanged.
-Cascade partially fails — merchant still deleted, error logged.
+With replica URL — reads go to replica, writes to primary.
+Without replica URL — all queries to primary, warning logged.
 Acceptance criteria:
 
-Soft-deleting a merchant cascades to pending payments/settlements.
-Completed records are preserved.
+Read replica support with zero code changes to service handlers.
+Falls back to primary if no replica conf
