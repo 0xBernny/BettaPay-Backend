@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@bettapay/stellar-utils": "workspace:^",
+    "ioredis": "^5.11.1",
     "zod": "^3.22.4"
   }
 }

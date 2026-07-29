@@ -59,6 +59,41 @@ test('GET /api/health/all aggregates downstream health with graceful degradation
   await app.close();
 });
 
+test('HEAD /api/health includes security hardening headers', async () => {
+  const prisma = createMockPrisma() as any;
+
+  const app = buildApp({
+    prisma,
+    logger: false,
+    fetchImpl: (async () => jsonResponse(mockHealth('service', 'healthy'))) as any
+  });
+
+  const res = await app.inject({ method: 'HEAD', url: '/api/health' });
+
+  assert.equal(res.statusCode, 200);
+
+  assert.ok(res.headers['strict-transport-security']);
+  assert.ok(res.headers['x-content-type-options']);
+  assert.ok(res.headers['x-download-options']);
+  assert.ok(res.headers['x-frame-options']);
+  assert.ok(res.headers['x-permitted-cross-domain-policies']);
+  assert.ok(res.headers['x-xss-protection']);
+  assert.ok(res.headers['cross-origin-embedder-policy']);
+  assert.ok(res.headers['cross-origin-opener-policy']);
+  assert.ok(res.headers['cross-origin-resource-policy']);
+  assert.ok(res.headers['referrer-policy']);
+  assert.ok(res.headers['permissions-policy']);
+
+  assert.equal(res.headers['cross-origin-embedder-policy'], 'require-corp');
+  assert.equal(res.headers['cross-origin-opener-policy'], 'same-origin');
+  assert.equal(res.headers['cross-origin-resource-policy'], 'same-origin');
+  assert.equal(res.headers['referrer-policy'], 'strict-origin-when-cross-origin');
+  assert.equal(res.headers['permissions-policy'], 'geolocation=(), microphone=(), camera=()');
+  assert.ok((res.headers['strict-transport-security'] as string).includes('max-age=31536000'));
+
+  await app.close();
+});
+
 test('GET /api/health returns gateway dependency and upstream probes', async () => {
   const prisma = createMockPrisma() as any;
 
