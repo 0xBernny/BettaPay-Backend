@@ -400,7 +400,7 @@ fastify.get('/api/health', async (_request, reply) => {
 });
 
 fastify.get('/api/settlements', async (request, reply): Promise<PaginatedResponse<SettlementRecord>> => {
-  const { limit, offset, status, from, to, includeDeleted } = SettlementListQuery.parse(request.query ?? {});
+  const { page, limit, status, from, to, includeDeleted } = SettlementListQuery.parse(request.query ?? {});
   const where: any = {};
   if (status) where.status = status;
   if (from || to) {
@@ -508,7 +508,7 @@ fastify.post<{ Params: { id: string } }>(
         asset: original.asset,
         status: 'pending',
         webhookUrl: original.webhookUrl,
-        feeSnapshot: original.feeSnapshot,
+        feeSnapshot: (original.feeSnapshot ?? undefined) as any,
       },
     });
 
@@ -582,18 +582,13 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     if (from) url.searchParams.append('from', from);
     if (to) url.searchParams.append('to', to);
 
-    const jwtPayload = {
-      sub: 'settlement-engine-reconciler',
-      iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + 60, // 1 minute expiration
-    };
-    const token = signHS256(jwtPayload, env.JWT_SECRET);
+    const token = env.INTER_SERVICE_SECRET;
 
     let gatewayRecords: any[] = [];
     try {
       const response = await fetch(url.toString(), {
         headers: {
-          'Authorization': `Bearer ${token}`,
+          'x-service-token': token,
           'Content-Type': 'application/json',
         },
       });
@@ -613,7 +608,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
 
     // 3. Diff the two sets by settlement ID and compare records
     const localMap = new Map<string, SettlementRecord>();
-    for (const r of localRecords) {
+    for (const r of settlements) {
       localMap.set(r.id, r);
     }
 
@@ -657,6 +652,9 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       completed: 0,
       failed: 0,
     };
+
+    const merchants = await prisma.merchant.findMany({ select: { id: true } });
+    const existingMerchantIds = new Set(merchants.map(m => m.id));
 
     for (const settlement of settlements) {
       const gross = parseBN(settlement.grossAmount);
@@ -844,7 +842,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
         asset: d.asset,
         status: 'pending',
         webhookUrl,
-        feeSnapshot,
+        feeSnapshot: feeSnapshot as any,
         idempotencyKey: idempotencyKey ?? undefined,
         idempotencyKeyExpiresAt: idempotencyKey ? new Date(Date.now() + 86400_000) : undefined,
       },
@@ -1240,7 +1238,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
     // 2. Close BullMQ workers (drain and close gracefully, force-stop after 10s)
     fastify.log.info('Closing BullMQ workers...');
     await closeWorkerWithTimeout(worker, 'settlements', fastify.log, getActiveSettlementJob);
-    await closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => null);
+    await closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => undefined);
     fastify.log.info('BullMQ workers closed');
 
     // 3. Close BullMQ queues

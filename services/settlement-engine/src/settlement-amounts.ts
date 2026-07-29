@@ -121,12 +121,6 @@ export function computeSettlementAmounts(
   monthlyVolume = 0,
   discountTiers: DiscountTier[] = [],
 ): SettlementAmounts {
-  // Backward compatibility: accept plain number as feeBps
-  const config: FeeConfig = typeof feeConfig === 'number' 
-    ? { feeBps: feeConfig } 
-    : feeConfig;
-
-  const { feeBps, maxFeeBps, maxFeeThreshold } = config;
   const gross = new BigNumber(grossAmountStr);
 
   // Resolve volume-based discount and clamp to [0, feeBps]
@@ -138,7 +132,7 @@ export function computeSettlementAmounts(
 
   // Preserve the same decimal places as the original input string.
   const inputDecimals = (grossAmountStr.split('.')[1] ?? '').length;
-  const feeStr = finalFee.toFixed(inputDecimals, BigNumber.ROUND_DOWN);
+  const feeStr = fee.toFixed(inputDecimals, BigNumber.ROUND_DOWN);
   const netStr = gross.minus(feeStr).toFixed(inputDecimals);
 
   const feeSnapshot: FeeAuditSnapshot = {

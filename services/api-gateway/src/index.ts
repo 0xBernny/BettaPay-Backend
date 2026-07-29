@@ -30,7 +30,7 @@ import crypto from 'crypto';
 import zlib from 'zlib';
 import { Transform } from 'stream';
 import { z } from 'zod';
-import { validateEnvOrExit, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor, startMetricsServer, logFeatureFlags } from '@bettapay/validation';
+import { validateEnvOrExit, type Env, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor, startMetricsServer, logFeatureFlags } from '@bettapay/validation';
 import * as promClient from 'prom-client';
 import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient, type IndexerClient } from './clients/indexer-client.js';
@@ -1140,7 +1140,7 @@ fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: 
     ? requestedMerchantId
     : (request.user as { merchantId?: string } | undefined)?.merchantId;
 
-  const { merchantId, status, from, to, startDate, endDate, limit, offset, includeDeleted } = query as any;
+  const { startDate, endDate, includeDeleted } = query as any;
   const where: any = {};
   if (scopedMerchantId) {
     where.merchantId = scopedMerchantId;
@@ -1427,15 +1427,7 @@ fastify.post('/api/admin/assets', {
       data: body,
     });
 
-    await logAuditEvent({
-      action: 'CREATE_SUPPORTED_ASSET',
-      entityType: 'SupportedAsset',
-      entityId: asset.code,
-      actorId: 'admin',
-      actorType: 'SERVICE',
-      changes: { asset },
-      ipAddress: request.ip,
-    });
+    await logAuditEvent('asset.created', 'SupportedAsset', asset.code, { before: null, after: asset }, request);
 
     return reply.code(201).send({ data: asset });
   } catch (error: any) {
@@ -1469,15 +1461,7 @@ fastify.patch('/api/admin/assets/:code', {
       data: body,
     });
 
-    await logAuditEvent({
-      action: 'UPDATE_SUPPORTED_ASSET',
-      entityType: 'SupportedAsset',
-      entityId: asset.code,
-      actorId: 'admin',
-      actorType: 'SERVICE',
-      changes: { updates: body },
-      ipAddress: request.ip,
-    });
+    await logAuditEvent('asset.updated', 'SupportedAsset', asset.code, { before: null, after: asset }, request);
 
     return { data: asset };
   } catch (error: any) {
@@ -1503,15 +1487,7 @@ fastify.delete('/api/admin/assets/:code', {
       where: { code },
     });
 
-    await logAuditEvent({
-      action: 'DELETE_SUPPORTED_ASSET',
-      entityType: 'SupportedAsset',
-      entityId: code,
-      actorId: 'admin',
-      actorType: 'SERVICE',
-      changes: {},
-      ipAddress: request.ip,
-    });
+    await logAuditEvent('asset.deleted', 'SupportedAsset', code, { before: null, after: null }, request);
 
     return reply.code(204).send();
   } catch (error: any) {
@@ -1539,7 +1515,7 @@ interface DownstreamService {
   healthUrl: string;
 }
 
-function getDownstreamServices(env: ReturnType<typeof validateEnv>): DownstreamService[] {
+function getDownstreamServices(env: Env): DownstreamService[] {
   return [
     { name: 'fx-engine', healthUrl: `${env.FX_ENGINE_URL}/api/health` },
     { name: 'indexer', healthUrl: `${env.INDEXER_URL}/api/health` },
@@ -1556,7 +1532,7 @@ function getDownstreamServices(env: ReturnType<typeof validateEnv>): DownstreamS
  * should not prevent the gateway from starting.
  */
 async function warmupDownstreamServices(
-  env: ReturnType<typeof validateEnv>,
+  env: Env,
   logger: FastifyBaseLogger,
 ): Promise<void> {
   const services = getDownstreamServices(env);
