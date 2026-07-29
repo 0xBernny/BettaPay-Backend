@@ -137,6 +137,7 @@ export const fxQuoteSchema = z.object({
   fromCurrency: CurrencyCode,
   toCurrency: CurrencyCode,
   rate: z.string(),
+  slippageBps: z.number().int().min(0).optional(),
   expiresAt: isoDateString
 });
 
