@@ -211,6 +211,11 @@ export const EnvSchema = z.object({
   // Database — required; services crash fast if not provided
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
 
+  // Read-replica database — optional; if provided, Prisma routes read queries
+  // (findMany, findFirst, count, aggregate) to this URL while writes go to DATABASE_URL.
+  // When absent a warning is logged and all queries use the primary database.
+  DATABASE_READ_REPLICA_URL: z.string().optional(),
+
   // Connection pool — limits concurrent DB connections and prevents
   // connection exhaustion under burst traffic. Pool timeout ensures
   // a stalled query does not block the entire service indefinitely.
