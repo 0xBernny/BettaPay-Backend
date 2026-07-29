@@ -169,6 +169,102 @@ let fallbackStartTime: number | null = null;
 // Log every 5 minutes when in fallback mode
 const FALLBACK_WARNING_INTERVAL_MS = 5 * 60 * 1000;
 
+// ── Circuit breaker for CoinGecko API calls ────────────────────────────────
+//
+// States:
+//   CLOSED   — normal operation; failures are counted.
+//   OPEN     — tripped after CIRCUIT_BREAKER_FAILURE_THRESHOLD consecutive
+//              failures; fetches are skipped until the cooldown expires.
+//   HALF_OPEN — after the cooldown a single probe fetch is allowed.
+//              Success → CLOSED, failure → OPEN (resets cooldown).
+//
+// The threshold is hardcoded to 5 (spec requirement). The cooldown window is
+// driven by CIRCUIT_BREAKER_COOLDOWN_MS (env, default 5 min).
+
+export type CircuitBreakerState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+
+const CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5;
+
+interface CircuitBreaker {
+  state: CircuitBreakerState;
+  consecutiveFailures: number;
+  openedAt: number | null;   // Unix ms when state became OPEN
+  lastTransitionAt: number;  // Unix ms of last state change (for observability)
+}
+
+const circuitBreaker: CircuitBreaker = {
+  state: 'CLOSED',
+  consecutiveFailures: 0,
+  openedAt: null,
+  lastTransitionAt: Date.now(),
+};
+
+function transitionCircuitBreaker(
+  newState: CircuitBreakerState,
+  log: { info: (obj: object, msg: string) => void },
+): void {
+  const prev = circuitBreaker.state;
+  if (prev === newState) return;
+
+  circuitBreaker.state = newState;
+  circuitBreaker.lastTransitionAt = Date.now();
+
+  if (newState === 'OPEN') {
+    circuitBreaker.openedAt = Date.now();
+  } else if (newState === 'CLOSED') {
+    circuitBreaker.consecutiveFailures = 0;
+    circuitBreaker.openedAt = null;
+  }
+
+  log.info(
+    {
+      from: prev,
+      to: newState,
+      consecutiveFailures: circuitBreaker.consecutiveFailures,
+    },
+    `Circuit breaker transition: ${prev} → ${newState}`,
+  );
+}
+
+function recordCircuitBreakerSuccess(
+  log: { info: (obj: object, msg: string) => void },
+): void {
+  circuitBreaker.consecutiveFailures = 0;
+  if (circuitBreaker.state !== 'CLOSED') {
+    transitionCircuitBreaker('CLOSED', log);
+  }
+}
+
+function recordCircuitBreakerFailure(
+  log: { info: (obj: object, msg: string) => void },
+  cooldownMs: number,
+): void {
+  circuitBreaker.consecutiveFailures += 1;
+
+  if (
+    circuitBreaker.state === 'HALF_OPEN' ||
+    (circuitBreaker.state === 'CLOSED' &&
+      circuitBreaker.consecutiveFailures >= CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+  ) {
+    transitionCircuitBreaker('OPEN', log);
+  }
+}
+
+function getCircuitBreakerState(cooldownMs: number): CircuitBreakerState {
+  if (
+    circuitBreaker.state === 'OPEN' &&
+    circuitBreaker.openedAt !== null &&
+    Date.now() - circuitBreaker.openedAt >= cooldownMs
+  ) {
+    // Cooldown elapsed — advance to HALF_OPEN for the next probe.
+    // We do not call transitionCircuitBreaker here to avoid needing a logger
+    // reference; the probe in refreshTick will perform the actual transition.
+    circuitBreaker.state = 'HALF_OPEN';
+    circuitBreaker.lastTransitionAt = Date.now();
+  }
+  return circuitBreaker.state;
+}
+
 async function fetchBaseRates(): Promise<Record<string, number> | null> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), RATE_FETCH_TIMEOUT_MS);
@@ -240,6 +336,22 @@ async function releaseRateFetchLock(token: string): Promise<void> {
 
 async function refreshTick(): Promise<void> {
   try {
+    // ── Circuit breaker gate ────────────────────────────────────────────────
+    const cbState = getCircuitBreakerState(env.CIRCUIT_BREAKER_COOLDOWN_MS);
+
+    if (cbState === 'OPEN') {
+      // Still in cooldown — skip fetch entirely to avoid log noise.
+      return;
+    }
+
+    // HALF_OPEN: one probe is allowed; we log the intent so it is auditable.
+    if (cbState === 'HALF_OPEN') {
+      fastify.log.info(
+        { consecutiveFailures: circuitBreaker.consecutiveFailures },
+        'Circuit breaker HALF_OPEN: probing CoinGecko',
+      );
+    }
+
     // #388 — attempt to acquire the distributed fetch lock
     const lockToken = await acquireRateFetchLock().catch(() => null);
 
@@ -250,11 +362,13 @@ async function refreshTick(): Promise<void> {
         if (fetched) {
           const merged: Record<string, number> = { ...cache.rates, ...fetched };
           updateBaseRates(merged);
+          recordCircuitBreakerSuccess(fastify.log);
           fastify.log.info(
             { durationMs: lastRefresh?.durationMs, assets: Object.keys(fetched) },
             'FX rates refreshed',
           );
         } else {
+          recordCircuitBreakerFailure(fastify.log, env.CIRCUIT_BREAKER_COOLDOWN_MS);
           if (fallbackStartTime === null) {
             fallbackStartTime = Date.now();
             fastify.log.warn('Entering fallback FX rate mode');
@@ -284,9 +398,13 @@ async function refreshTick(): Promise<void> {
     const fetched = await fetchBaseRates();
     if (fetched) {
       updateBaseRates({ ...cache.rates, ...fetched });
-    } else if (fallbackStartTime === null) {
-      fallbackStartTime = Date.now();
-      fastify.log.warn('Entering fallback FX rate mode');
+      recordCircuitBreakerSuccess(fastify.log);
+    } else {
+      recordCircuitBreakerFailure(fastify.log, env.CIRCUIT_BREAKER_COOLDOWN_MS);
+      if (fallbackStartTime === null) {
+        fallbackStartTime = Date.now();
+        fastify.log.warn('Entering fallback FX rate mode');
+      }
     }
   } catch (err) {
     fastify.log.error({ err }, 'Unexpected error in refresh tick');
@@ -434,6 +552,7 @@ fastify.get('/api/currencies', async (_request, _reply) => {
 
 // ── GET /api/admin/rates/status (#236) ─────────────────────────────────
 // Admin endpoint showing rate fetch mode (live vs fallback), staleness, and duration.
+// Also exposes the CoinGecko circuit breaker state (#CB).
 
 fastify.get('/api/admin/rates/status', {
   preValidation: [fastify.serviceAuth],
@@ -442,11 +561,25 @@ fastify.get('/api/admin/rates/status', {
   const fallbackDurationMs = fallbackStartTime !== null ? Date.now() - fallbackStartTime : 0;
   const fallbackDurationMin = Math.round(fallbackDurationMs / 60000);
 
+  // Evaluate cooldown expiry without side-effects (read-only snapshot)
+  const cbSnapshot = {
+    state: circuitBreaker.state,
+    consecutiveFailures: circuitBreaker.consecutiveFailures,
+    openedAt: circuitBreaker.openedAt ? new Date(circuitBreaker.openedAt).toISOString() : null,
+    lastTransitionAt: new Date(circuitBreaker.lastTransitionAt).toISOString(),
+    cooldownMs: env.CIRCUIT_BREAKER_COOLDOWN_MS,
+    cooldownRemainingMs:
+      circuitBreaker.state === 'OPEN' && circuitBreaker.openedAt !== null
+        ? Math.max(0, env.CIRCUIT_BREAKER_COOLDOWN_MS - (Date.now() - circuitBreaker.openedAt))
+        : 0,
+  };
+
   return {
     mode: inFallback ? 'fallback' : 'live',
     lastSuccessfulFetch: lastSuccessfulFetch ? new Date(lastSuccessfulFetch).toISOString() : null,
     fallbackActiveDuration: inFallback ? `${fallbackDurationMin} minutes` : null,
     fallbackActiveDurationMs: fallbackDurationMs,
+    circuitBreaker: cbSnapshot,
     currentRates: cache.rates,
     updatedAt: new Date(cache.cachedAt).toISOString(),
   };

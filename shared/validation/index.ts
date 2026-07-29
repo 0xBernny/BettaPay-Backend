@@ -275,6 +275,13 @@ export const EnvSchema = z.object({
     .transform((s) => parseInt(s, 10))
     .default("60000"),
 
+  // FX Engine — circuit breaker cooldown before probing CoinGecko again
+  // after 5 consecutive failures. Default: 5 minutes.
+  CIRCUIT_BREAKER_COOLDOWN_MS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("300000"),
+
   // FX Engine — slippage tolerance (basis points; 100 bps = 1%)
   DEFAULT_SLIPPAGE_BPS: z
     .string()
