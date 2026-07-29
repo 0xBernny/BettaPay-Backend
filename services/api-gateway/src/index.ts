@@ -30,7 +30,7 @@ import crypto from 'crypto';
 import zlib from 'zlib';
 import { Transform } from 'stream';
 import { z } from 'zod';
-import { validateEnvOrExit, type Env, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor, startMetricsServer, logFeatureFlags, startPrismaPoolMetricsCollector } from '@bettapay/validation';
+import { validateEnvOrExit, type Env, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor, startMetricsServer, logFeatureFlags, startPrismaPoolMetricsCollector, encryptField, decryptField, encryptSensitiveFields, decryptSensitiveFields } from '@bettapay/validation';
 import * as promClient from 'prom-client';
 import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient, type IndexerClient } from './clients/indexer-client.js';
@@ -310,6 +310,11 @@ export function buildApp(opts: AppOptions = {}) {
     if (request.params && typeof request.params === 'object') {
       sanitizeParamsValue(request.params);
     }
+  });
+
+  // Transparent field-level decryption before sending API responses:
+  fastify.addHook('preSerialization', async (_request, _reply, payload) => {
+    return decryptSensitiveFields(payload);
   });
 
   // Guards against decompression bombs: Fastify's own bodyLimit only checks
@@ -781,7 +786,7 @@ fastify.post<{ Body: z.infer<typeof CreateMerchantBody> }>('/api/merchants', {
 }, async (request, reply) => {
     const d = CreateMerchantBody.parse(request.body);
     const secret = d.secret || crypto.randomBytes(24).toString('hex');
-    const secretHash = hashSecret(secret);
+    const secretHash = encryptField(hashSecret(secret));
     const merchant = await prisma.$transaction(async (tx) => {
       const created = await tx.merchant.create({
         data: {
