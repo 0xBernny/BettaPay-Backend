@@ -7,6 +7,7 @@ process.env.ADMIN_ADDRESS = 'GBJDHFU7XYDT4MMSTXTU4Z4VABMFR6SPLPNCZF656SIHPXT6LPW
 process.env.INTER_SERVICE_SECRET = 'test-secret-that-is-at-least-16-chars';
 process.env.GOOGLE_CLIENT_ID = 'test-google-client-id';
 process.env.ADMIN_SECRET = 'test-admin-secret';
+process.env.FIELD_ENCRYPTION_KEY = 'b'.repeat(32);
 
 import test from 'tape';
 

@@ -300,6 +300,9 @@ export const EnvSchema = z.object({
   // Manual override: skip auto-discovery and start from this ledger.
   INDEX_FROM_LEDGER: z.string().optional(),
 
+  // Indexer — Poll cycle timeout (ms). When a cycle exceeds this, it is aborted.
+  POLL_TIMEOUT_MS: z.string().transform((s) => parseInt(s, 10)).default('30000'),
+
   // Indexer — Event retention policy
   EVENT_RETENTION_DAYS: z
     .string()
