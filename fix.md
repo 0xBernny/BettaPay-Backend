@@ -1,15 +1,22 @@
 Current behavior:
-CI runs Prisma generate but does not validate migration consistency.
+Indexes on single columns — most common queries use sequential scans.
 
 Expected behavior:
-Add CI step: pnpm exec prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma and pnpm exec prisma validate. Fail CI if either fails.
+Add composite indexes:
 
+Payment(merchantId, status, createdAt DESC)
+Settlement(merchantId, status, initiatedAt DESC)
+IndexedEvent(contractId, ledger DESC)
+AuditLog(entityType, entityId, createdAt DESC)
+Use Prisma migration. Measure before/after with EXPLAIN ANALYZE.
 Files to modify:
 
-.github/workflows/ci.yml — add steps
+prisma/schema.prisma — add @@index directives
+New migration
 Test requirements:
-N/A — CI configuration change. Verify pipeline passes.
+Verify queries use the new indexes (via EXPLAIN ANALYZE in test output).
 
 Acceptance criteria:
 
-CI catches schema drift and invalid schema files.
+All four composite indexes created.
+Query plans show index scans instead of sequential scans.
