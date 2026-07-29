@@ -293,3 +293,5 @@ export function validateEnvOrExit(env: Record<string, unknown>): Env {
     return process.exit(1);
   }
 }
+
+export * from './prisma-pool-metrics.js';

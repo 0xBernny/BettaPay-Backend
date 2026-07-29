@@ -60,6 +60,7 @@ import {
   startRedisMemoryMonitor,
   startMetricsServer,
   runStartupChecks,
+  startPrismaPoolMetricsCollector,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
@@ -97,6 +98,7 @@ const fastify = Fastify({
 
 registerRequestId(fastify);
 setupPrismaQueryLogging(prisma, fastify.log);
+startPrismaPoolMetricsCollector(pool, promClient.register, 10000, fastify.log, promClient);
 
 // #386 — exponential backoff retry strategy
 const redis = createRedisClient(env.REDIS_URL, fastify.log);

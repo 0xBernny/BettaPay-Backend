@@ -47,6 +47,7 @@ import {
   waitForRedis,
   startRedisMemoryMonitor,
   startMetricsServer,
+  startPrismaPoolMetricsCollector,
 } from '@bettapay/validation';
 import { buildPaginationMeta } from '@bettapay/shared-types';
 import type { EventType } from '@bettapay/validation';
@@ -70,6 +71,7 @@ const pool = new pg.Pool({
 });
 const prismaAdapter = new PrismaPg(pool);
 export const prisma = new PrismaClient({ adapter: prismaAdapter, log: getPrismaLogLevels() });
+startPrismaPoolMetricsCollector(pool, promClient.register, 10000, fastify.log, promClient);
 setupPrismaQueryLogging(prisma, fastify.log);
 const logAuditEvent = createAuditLogger(prisma as unknown as Parameters<typeof createAuditLogger>[0], fastify.log);
 
