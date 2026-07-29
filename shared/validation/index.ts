@@ -374,6 +374,16 @@ export const EnvSchema = z.object({
     .string()
     .transform((s) => parseInt(s, 10))
     .default("2"),
+
+  // Settlement Engine — worker job timeout (ms). Jobs exceeding this duration
+  // are automatically failed by BullMQ. Default: 30000 (30 seconds).
+  SETTLEMENT_JOB_TIMEOUT_MS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("30000")
+    .refine((val) => Number.isFinite(val) && val > 0, {
+      message: "SETTLEMENT_JOB_TIMEOUT_MS must be a positive integer",
+    }),
 }).refine(
   (data) => data.QUOTE_MIN_AGE_MS < data.QUOTE_MAX_LIFETIME_MS,
   {
