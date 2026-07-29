@@ -7,6 +7,8 @@ import {
   DateRangeQuery,
   IdempotencyKeySchema,
   PaginationQuery,
+  AmountString,
+  PositiveAmountString,
   StellarAddressSchema,
   merchantSchema,
   paymentSchema,
@@ -148,7 +150,7 @@ test('PositiveAmountString validation', async (t) => {
 test('CreatePaymentBody validation', async (t) => {
   await t.test('Valid payment body passes', () => {
     const valid = {
-      merchantId: 'mer_123',
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
       amount: '100.50',
       asset: 'USDC',
     };
@@ -158,7 +160,7 @@ test('CreatePaymentBody validation', async (t) => {
 
   await t.test('Invalid amount in payment body fails', () => {
     assert.throws(() => CreatePaymentBody.parse({
-      merchantId: 'mer_123',
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
       amount: 'abc',
       asset: 'USDC',
     }), /amount must be a numeric string/);
@@ -168,7 +170,7 @@ test('CreatePaymentBody validation', async (t) => {
 test('CreateSettlementBody validation', async (t) => {
   await t.test('Valid single settlement passes', () => {
     const valid = {
-      merchantId: 'mer_123',
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
       amount: '500',
       asset: 'EURT',
     };
@@ -178,7 +180,7 @@ test('CreateSettlementBody validation', async (t) => {
 
   await t.test('Valid batch settlement passes', () => {
     const valid = {
-      merchantId: 'mer_123',
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
       items: [
         { amount: '100.50', asset: 'USDC' },
         { amount: '200', asset: 'EURT' },
@@ -190,7 +192,7 @@ test('CreateSettlementBody validation', async (t) => {
 
   await t.test('Invalid amount in single settlement fails', () => {
     assert.throws(() => CreateSettlementBody.parse({
-      merchantId: 'mer_123',
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
       amount: '-50',
       asset: 'EURT',
     }), /amount must be a numeric string/);
@@ -198,7 +200,7 @@ test('CreateSettlementBody validation', async (t) => {
 
   await t.test('Invalid amount in batch settlement items fails', () => {
     assert.throws(() => CreateSettlementBody.parse({
-      merchantId: 'mer_123',
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
       items: [
         { amount: '100.50', asset: 'USDC' },
         { amount: 'abc', asset: 'EURT' },

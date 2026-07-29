@@ -2,7 +2,7 @@
   "name": "bettapay-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "BettaPay backend services — API gateway, FX engine, settlement engine, indexer",
+  "description": "BettaPay backend services \u2014 API gateway, FX engine, settlement engine, indexer",
   "type": "module",
   "engines": {
     "node": ">=20.0.0"
@@ -21,7 +21,7 @@
     "settlement:dev": "pnpm --filter settlement-engine dev",
     "indexer:dev": "pnpm --filter indexer dev",
     "clean": "pnpm -r clean && rm -rf node_modules",
-    "test": "pnpm --filter @bettapay/validation test && pnpm --filter api-gateway test"
+    "test": "pnpm --filter @bettapay/validation test && pnpm --filter api-gateway test && pnpm --filter indexer test"
   },
   "devDependencies": {
     "cross-env": "^7.0.3",

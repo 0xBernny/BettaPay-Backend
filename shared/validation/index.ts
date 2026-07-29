@@ -26,9 +26,11 @@ export function genReqId(req: FastifyRequest | IncomingMessage): string {
 
 export const ErrorCodes = {
   UNAUTHORIZED: 'UNAUTHORIZED',
+  FORBIDDEN: 'FORBIDDEN',
   NOT_FOUND: 'NOT_FOUND',
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   INVALID_REQUEST: 'INVALID_REQUEST',
+  RATE_LIMITED: 'RATE_LIMITED',
   REQUEST_TIMEOUT: 'REQUEST_TIMEOUT',
   GATEWAY_TIMEOUT: 'GATEWAY_TIMEOUT',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
@@ -72,6 +74,7 @@ export const EnvSchema = z.object({
   // Auth
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   JWT_EXPIRES_IN: z.string().default('24h'),
+  AUTH_IP_THRESHOLD: z.string().transform((s) => parseInt(s, 10)).default('20'),
 
   // Inter-service auth — shared secret presented in the `x-service-token` header
   // on internal (service-to-service) calls. Required so services fail fast

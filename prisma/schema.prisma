@@ -83,7 +83,10 @@ model IndexedEvent {
 }
 
 model WebhookSubscription {
-  id        String   @id
-  url       String
-  createdAt DateTime @default(now())
+  id                 String    @id
+  url                String
+  createdAt          DateTime  @default(now())
+  lastTestedAt       DateTime?
+  lastTestStatus     String?
+  lastTestStatusCode Int?
 }

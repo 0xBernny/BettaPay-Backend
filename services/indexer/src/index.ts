@@ -18,7 +18,6 @@ import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
-import { Redis } from 'ioredis';
 import { Queue, Worker } from 'bullmq';
 import { PrismaClient } from '@prisma/client';
 import { rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
@@ -42,6 +41,7 @@ import {
   createWebhookUrlSchema,
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
+import { sendWebhookTest } from './webhook-test.js';
 
 const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3003');
@@ -59,6 +59,16 @@ setupPrismaQueryLogging(prisma, fastify.log);
 
 fastify.register(cors, { origin: env.ALLOWED_ORIGINS });
 fastify.register(helmet, { contentSecurityPolicy: false });
+fastify.register(rateLimit, {
+  max: 500,
+  timeWindow: '1 minute',
+  addHeaders: {
+    'x-ratelimit-limit': true,
+    'x-ratelimit-remaining': true,
+    'x-ratelimit-reset': true,
+    'retry-after': true,
+  },
+});
 registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
@@ -340,6 +350,38 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, 
   await prisma.webhookSubscription.delete({ where: { id } });
   return reply.code(204).send();
 });
+
+fastify.post<{ Params: { id: string } }>(
+  '/api/webhooks/:id/test',
+  { preValidation: [fastify.serviceAuth] },
+  async (request, reply) => {
+    const { id } = request.params;
+    const subscription = await prisma.webhookSubscription.findUnique({ where: { id } });
+
+    if (!subscription) {
+      return reply.code(404).send({
+        error: { code: 'NOT_FOUND', message: 'Webhook subscription ' + id + ' not found' },
+      });
+    }
+
+    const testedAt = new Date();
+    const result = await sendWebhookTest(
+      { id: subscription.id, url: subscription.url },
+      { now: testedAt }
+    );
+
+    await prisma.webhookSubscription.update({
+      where: { id },
+      data: {
+        lastTestedAt: testedAt,
+        lastTestStatus: result.success ? 'success' : 'failed',
+        lastTestStatusCode: result.statusCode ?? null,
+      } as any,
+    });
+
+    return reply.code(200).send(result);
+  }
+);
 
 // ── Stellar RPC polling loop ──────────────────────────────────────────────────
 

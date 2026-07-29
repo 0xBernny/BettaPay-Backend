@@ -27,6 +27,8 @@ import cors from '@fastify/cors';
 import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
+import { Redis } from 'ioredis';
+import { Keypair } from '@stellar/stellar-sdk';
 import { z } from 'zod';
 import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
 import { createFxClient } from './clients/fx-client.js';
@@ -40,6 +42,8 @@ import {
   CreatePaymentBody,
   CreateSettlementBody,
   AuthTokenBody,
+  AuthIpScoreQuery,
+  WalletVerifyBody,
   UpdatePaymentStatusBody,
   UpdateMerchantSettingsBody,
   createErrorResponse,
@@ -69,6 +73,21 @@ interface PaymentParams {
 interface AuthTokenRouteBody {
   merchantId?: unknown;
   secret?: unknown;
+}
+
+interface WalletVerifyRouteBody {
+  address?: unknown;
+  nonce?: unknown;
+  signature?: unknown;
+  challenge?: unknown;
+  message?: unknown;
+}
+
+interface MerchantJwtPayload {
+  merchantId?: string;
+  ownerId?: string;
+  jti?: string;
+  exp?: number;
 }
 
 interface CreateMerchantRouteBody {
@@ -115,6 +134,11 @@ const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
 
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const AUTH_IP_SCORE_WINDOW_SECONDS = 15 * 60;
+const AUTH_IP_RETRY_AFTER_SECONDS = 5 * 60;
+const USED_NONCE_TTL_SECONDS = 5 * 60;
+const REFRESH_RATE_LIMIT_SECONDS = 60;
+const REFRESH_RATE_LIMIT_MAX = 10;
 
 function readIdempotencyKey(request: FastifyRequest): string | null {
   const raw = request.headers['idempotency-key'];
@@ -177,6 +201,15 @@ const fxClient = createFxClient({
   baseUrl: env.FX_ENGINE_URL,
   serviceToken: env.INTER_SERVICE_SECRET,
   logger: fastify.log,
+});
+
+const redis = new Redis(env.REDIS_URL, {
+  maxRetriesPerRequest: env.REDIS_MAX_RETRIES,
+  lazyConnect: true,
+});
+
+redis.on('error', (err) => {
+  fastify.log.warn({ err: err.message }, 'Redis connection error');
 });
 
 // --- Response logging hooks -------------------------------------------------
@@ -294,6 +327,163 @@ function hashSecret(secret: string): string {
   return crypto.createHash('sha256').update(secret).digest('hex');
 }
 
+function signMerchantJwt(merchantId: string, ownerId: string): string {
+  return fastify.jwt.sign({ merchantId, ownerId, jti: crypto.randomUUID() });
+}
+
+function getRequestIp(request: FastifyRequest): string {
+  const forwarded = request.headers['x-forwarded-for'];
+  const forwardedValue = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  if (forwardedValue) return forwardedValue.split(',')[0].trim();
+  return request.ip;
+}
+
+function authIpScoreKey(ip: string): string {
+  return 'auth_ip_score:' + ip;
+}
+
+function revokedJtiKey(jti: string): string {
+  return 'revoked_jti:' + jti;
+}
+
+function usedNonceKey(nonce: string): string {
+  return 'used_nonce:' + nonce;
+}
+
+function refreshRateKey(merchantId: string): string {
+  return 'auth_refresh_rate:' + merchantId;
+}
+
+function toNonNegativeInt(value: unknown): number {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return Math.floor(parsed);
+}
+
+async function getAuthIpScore(ip: string): Promise<number> {
+  try {
+    return toNonNegativeInt(await redis.get(authIpScoreKey(ip)));
+  } catch (err) {
+    fastify.log.warn({ err, ip }, 'Unable to read auth IP score');
+    return 0;
+  }
+}
+
+async function updateAuthIpScore(ip: string, delta: number): Promise<number> {
+  const key = authIpScoreKey(ip);
+
+  try {
+    if (delta > 0) {
+      const score = await redis.incrby(key, delta);
+      await redis.expire(key, AUTH_IP_SCORE_WINDOW_SECONDS);
+      return toNonNegativeInt(score);
+    }
+
+    const current = toNonNegativeInt(await redis.get(key));
+    const next = Math.max(0, current + delta);
+    if (next === 0) {
+      await redis.del(key);
+    } else {
+      await redis.set(key, String(next), 'EX', AUTH_IP_SCORE_WINDOW_SECONDS);
+    }
+    return next;
+  } catch (err) {
+    fastify.log.warn({ err, ip, delta }, 'Unable to update auth IP score');
+    return 0;
+  }
+}
+
+async function enforceAuthIpReputation(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const ip = getRequestIp(request);
+  const score = await getAuthIpScore(ip);
+  if (score >= env.AUTH_IP_THRESHOLD) {
+    await reply
+      .header('Retry-After', String(AUTH_IP_RETRY_AFTER_SECONDS))
+      .code(429)
+      .send(createErrorResponse(ErrorCodes.RATE_LIMITED, 'Too many failed authentication attempts'));
+  }
+}
+
+async function recordAuthIpFailure(request: FastifyRequest): Promise<void> {
+  await updateAuthIpScore(getRequestIp(request), 1);
+}
+
+async function recordAuthIpSuccess(request: FastifyRequest): Promise<void> {
+  await updateAuthIpScore(getRequestIp(request), -1);
+}
+
+async function isJtiRevoked(jti: string): Promise<boolean> {
+  try {
+    return (await redis.exists(revokedJtiKey(jti))) === 1;
+  } catch (err) {
+    fastify.log.warn({ err, jti }, 'Unable to read JWT blocklist');
+    return false;
+  }
+}
+
+async function revokeJti(jti: string, ttlSeconds: number): Promise<void> {
+  if (ttlSeconds <= 0) return;
+  try {
+    await redis.set(revokedJtiKey(jti), '1', 'EX', ttlSeconds);
+  } catch (err) {
+    fastify.log.warn({ err, jti }, 'Unable to write JWT blocklist');
+  }
+}
+
+async function incrementRefreshRate(merchantId: string): Promise<number> {
+  try {
+    const key = refreshRateKey(merchantId);
+    const count = await redis.incr(key);
+    if (count === 1) await redis.expire(key, REFRESH_RATE_LIMIT_SECONDS);
+    return count;
+  } catch (err) {
+    fastify.log.warn({ err, merchantId }, 'Unable to update refresh rate limit');
+    return 1;
+  }
+}
+
+async function isNonceUsed(nonce: string): Promise<boolean> {
+  try {
+    return (await redis.exists(usedNonceKey(nonce))) === 1;
+  } catch (err) {
+    fastify.log.warn({ err }, 'Unable to read used nonce');
+    return true;
+  }
+}
+
+async function markNonceUsed(nonce: string): Promise<boolean> {
+  try {
+    const result = await redis.set(usedNonceKey(nonce), '1', 'EX', USED_NONCE_TTL_SECONDS, 'NX');
+    return result === 'OK';
+  } catch (err) {
+    fastify.log.warn({ err }, 'Unable to write used nonce');
+    return false;
+  }
+}
+
+function decodeWalletSignature(signature: string): Buffer {
+  const trimmed = signature.trim();
+  if (/^[0-9a-f]+$/i.test(trimmed) && trimmed.length % 2 === 0) {
+    return Buffer.from(trimmed, 'hex');
+  }
+  return Buffer.from(trimmed, 'base64');
+}
+
+function walletChallenge(body: { nonce: string; challenge?: string; message?: string }): string {
+  return body.challenge ?? body.message ?? body.nonce;
+}
+
+function verifyWalletSignature(address: string, challenge: string, signature: string): boolean {
+  try {
+    return Keypair.fromPublicKey(address).verify(
+      Buffer.from(challenge, 'utf8'),
+      decodeWalletSignature(signature)
+    );
+  } catch {
+    return false;
+  }
+}
+
 const pool = new pg.Pool({
   connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
   max: env.DATABASE_POOL_SIZE,
@@ -354,9 +544,13 @@ async function logRequestBody(request: FastifyRequest, reply: FastifyReply) {
 fastify.decorate('authenticate', async function (request: FastifyRequest, reply: FastifyReply) {
   try {
     await request.jwtVerify();
+    const payload = request.user as MerchantJwtPayload;
+    if (payload.jti && await isJtiRevoked(payload.jti)) {
+      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+    }
   } catch (err) {
     request.log.error(err);
-    reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 });
 
@@ -410,22 +604,138 @@ fastify.get('/api/health', async (request, reply) => {
   }
 });
 
-fastify.post<{ Body: AuthTokenRouteBody }>('/api/auth/token', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
-    const d = AuthTokenBody.parse(request.body);
+fastify.post<{ Body: AuthTokenRouteBody }>('/api/auth/token', {
+  preHandler: [enforceAuthIpReputation],
+  config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+    let d;
+    try {
+      d = AuthTokenBody.parse(request.body);
+    } catch (err) {
+      await recordAuthIpFailure(request);
+      throw err;
+    }
+
     const merchant = await prisma.merchant.findFirst({ where: { id: d.merchantId, deletedAt: null } });
 
     const storedHash = merchant?.secretHash || '0'.repeat(64);
     const inputHash = hashSecret(d.secret);
-    const hashBuffer = Buffer.from(storedHash, 'hex');
-    const inputBuffer = Buffer.from(inputHash, 'hex');
+    const isComparable = storedHash.length === inputHash.length;
+    const hashesMatch = isComparable && crypto.timingSafeEqual(
+      Buffer.from(storedHash, 'hex'),
+      Buffer.from(inputHash, 'hex')
+    );
 
-    const isValid = merchant && merchant.secretHash && crypto.timingSafeEqual(hashBuffer, inputBuffer);
-    if (!isValid) {
+    if (!merchant || !merchant.secretHash || !hashesMatch) {
+      await recordAuthIpFailure(request);
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
 
-    const token = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
+    await recordAuthIpSuccess(request);
+    const token = signMerchantJwt(merchant.id, merchant.ownerId);
     return reply.send({ token });
+});
+
+fastify.post('/api/auth/refresh', {
+  preHandler: [enforceAuthIpReputation]
+}, async (request, reply) => {
+  try {
+    await request.jwtVerify();
+  } catch (err) {
+    request.log.error(err);
+    await recordAuthIpFailure(request);
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
+
+  const payload = request.user as MerchantJwtPayload;
+  if (!payload.merchantId || !payload.ownerId || !payload.jti || !payload.exp) {
+    await recordAuthIpFailure(request);
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
+
+  if (await isJtiRevoked(payload.jti)) {
+    await recordAuthIpFailure(request);
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
+
+  const remainingLifetime = payload.exp - Math.floor(Date.now() / 1000);
+  if (remainingLifetime <= 0) {
+    await recordAuthIpFailure(request);
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
+
+  const refreshCount = await incrementRefreshRate(payload.merchantId);
+  if (refreshCount > REFRESH_RATE_LIMIT_MAX) {
+    return reply
+      .header('Retry-After', String(REFRESH_RATE_LIMIT_SECONDS))
+      .code(429)
+      .send(createErrorResponse(ErrorCodes.RATE_LIMITED, 'Too many token refresh requests'));
+  }
+
+  await revokeJti(payload.jti, remainingLifetime);
+  await recordAuthIpSuccess(request);
+
+  return reply.send({ token: signMerchantJwt(payload.merchantId, payload.ownerId) });
+});
+
+fastify.post<{ Body: WalletVerifyRouteBody }>('/api/auth/wallet/verify', {
+  preHandler: [enforceAuthIpReputation],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  let d;
+  try {
+    d = WalletVerifyBody.parse(request.body);
+  } catch (err) {
+    await recordAuthIpFailure(request);
+    throw err;
+  }
+
+  if (await isNonceUsed(d.nonce)) {
+    await recordAuthIpFailure(request);
+    return reply
+      .code(409)
+      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Nonce has already been used'));
+  }
+
+  if (!verifyWalletSignature(d.address, walletChallenge(d), d.signature)) {
+    await recordAuthIpFailure(request);
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid wallet signature'));
+  }
+
+  if (!await markNonceUsed(d.nonce)) {
+    await recordAuthIpFailure(request);
+    return reply
+      .code(409)
+      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Nonce has already been used'));
+  }
+
+  await recordAuthIpSuccess(request);
+
+  const merchant = await prisma.merchant.findFirst({
+    where: {
+      deletedAt: null,
+      OR: [{ id: d.address }, { ownerId: d.address }],
+    },
+  });
+
+  const response: Record<string, unknown> = { success: true, address: d.address };
+  if (merchant) {
+    response.token = signMerchantJwt(merchant.id, merchant.ownerId);
+  }
+
+  return reply.send(response);
+});
+
+fastify.get('/api/admin/auth/ip-score', {
+  preValidation: [fastify.authenticate]
+}, async (request, reply) => {
+  const payload = request.user as MerchantJwtPayload;
+  if (payload.merchantId !== env.ADMIN_ADDRESS) {
+    return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Forbidden'));
+  }
+
+  const { ip } = AuthIpScoreQuery.parse(request.query ?? {});
+  return { ip, score: await getAuthIpScore(ip) };
 });
 
 // Merchants
@@ -828,6 +1138,7 @@ async function shutdown(signal: string) {
 
   try {
     await fastify.close();
+    redis.disconnect();
     await prisma.$disconnect();
     process.exit(0);
   } catch (err) {

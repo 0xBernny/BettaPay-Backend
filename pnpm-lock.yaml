@@ -69,6 +69,12 @@ importers:
       '@prisma/client':
         specifier: ^7.8.0
         version: 7.8.0(prisma@7.8.0(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(typescript@5.9.3))(typescript@5.9.3)
+      '@stellar/stellar-sdk':
+        specifier: ^15.1.0
+        version: 15.1.0
+      ioredis:
+        specifier: ^5.11.1
+        version: 5.11.1
       pg:
         specifier: ^8.22.0
         version: 8.22.0
@@ -122,9 +128,15 @@ importers:
       '@fastify/cors':
         specifier: '*'
         version: 11.2.0
-      '@fastify/rate-limit':
+      '@fastify/helmet':
         specifier: '*'
+        version: 12.0.1
+      '@fastify/rate-limit':
+        specifier: ~11.0.0
         version: 11.0.0
+      '@prisma/adapter-pg':
+        specifier: ^7.8.0
+        version: 7.8.0
       '@prisma/client':
         specifier: '*'
         version: 7.8.0(prisma@7.8.0(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(typescript@5.9.3))(typescript@5.9.3)
@@ -140,6 +152,9 @@ importers:
       ioredis:
         specifier: '*'
         version: 5.11.1
+      pg:
+        specifier: ^8.22.0
+        version: 8.22.0
       zod:
         specifier: ^3.22.4
         version: 3.25.76
@@ -147,6 +162,9 @@ importers:
       '@types/node':
         specifier: ^20.10.0
         version: 20.19.43
+      '@types/pg':
+        specifier: ^8.20.0
+        version: 8.20.0
       '@types/tape':
         specifier: ^5.6.4
         version: 5.8.1
