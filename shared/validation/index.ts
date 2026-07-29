@@ -135,6 +135,7 @@ export const EnvSchema = z.object({
   // Auth
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   JWT_EXPIRES_IN: z.string().default('24h'),
+  FIELD_ENCRYPTION_KEY: z.string().min(32, 'FIELD_ENCRYPTION_KEY must be at least 32 characters'),
   // Admin API key for privileged endpoints (optional)
   ADMIN_API_KEY: z.string().min(32, 'ADMIN_API_KEY must be at least 32 characters').optional(),
   GOOGLE_CLIENT_ID: z.string().min(1, 'GOOGLE_CLIENT_ID is required'),
@@ -295,3 +296,4 @@ export function validateEnvOrExit(env: Record<string, unknown>): Env {
 }
 
 export * from './prisma-pool-metrics.js';
+export * from './encryption.js';
