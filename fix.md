@@ -1,26 +1,23 @@
-Add deviation guard to reject extreme rate changes from CoinGecko
+Deduplicate webhook delivery for settlement completion events
 Repo Avatar
 Betta-Pay/BettaPay-Backend
 Current behavior:
-All CoinGecko rates accepted unconditionally — flash crashes propagate instantly.
+Webhook may be sent twice if worker restarts before ack persists.
 
 Expected behavior:
-Add MAX_DEVIATION_BPS (default 2000 = 20%). Before updating cache, compare new rate to old rate. If deviation exceeds threshold, reject, log error, preserve old rate. Add admin override endpoint POST /api/admin/rates/override to bypass guard.
+Generate unique eventId (UUID). Before dispatch, Redis SET webhook_sent:{eventId} NX EX 3600. If key exists, skip and log warning. If Redis is down, deliver anyway (fail-open).
 
 Files to modify:
 
-services/fx-engine/src/index.ts — deviation check and override endpoint
-shared/validation/index.ts — add env var
-shared/validation/schemas.ts — override body schema
-Test: rate-refresh.test.ts
+shared/webhook-delivery/index.ts — add Redis SET NX check
+services/settlement-engine/src/index.ts — generate eventId
+Test: shared/webhook-delivery/index.test.ts
 Test requirements:
 
-10% deviation (max 20%) — accepted.
-30% deviation (max 20%) — rejected, old rate preserved.
-No old rate — accepted unconditionally.
-Admin override bypasses guard.
-Old rate is 0 — accepted (no division by zero).
+Deliver webhook — eventId recorded in Redis.
+Deliver same webhook again — skipped, warning logged.
+Redis unavailable — delivered without dedup.
 Acceptance criteria:
 
-Extreme rate changes rejected, previous valid rate served.
-Admin can override when change is legitimate.
+Duplicate webhooks prevented within 1-hour window.
+Resilient to Redis outages

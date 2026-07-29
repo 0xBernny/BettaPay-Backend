@@ -174,6 +174,7 @@ const webhookWorker = createWebhookWorker('settlement-webhooks', connectionParam
     warn: (obj, msg) => fastify.log.warn(obj, msg),
     error: (obj, msg) => fastify.log.error(obj, msg),
   },
+  redis,
 });
 const getActiveWebhookJob = trackActiveJob(webhookWorker);
 
@@ -321,6 +322,7 @@ const worker = new Worker('settlements', async job => {
     if (updatedSettlement.webhookUrl) {
       await webhookQueue.add('deliver', {
         url: updatedSettlement.webhookUrl,
+        eventId: crypto.randomUUID(),
         event: { event: 'settlement.completed', data: updatedSettlement as unknown as Record<string, unknown> },
       });
     }
@@ -336,6 +338,7 @@ const worker = new Worker('settlements', async job => {
       // Best-effort enqueue — don't let a queue error mask the original failure.
       await webhookQueue.add('deliver', {
         url: updatedSettlement.webhookUrl,
+        eventId: crypto.randomUUID(),
         event: { event: 'settlement.failed', data: updatedSettlement as unknown as Record<string, unknown> },
       }).catch((err: unknown) => {
         log.error({ err, settlementId }, 'Failed to enqueue failure webhook');
