@@ -33,7 +33,7 @@ import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import BigNumber from 'bignumber.js';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
-import { computeSettlementAmounts } from './settlement-amounts.js';
+import { computeSettlementAmounts, SettlementAmountError } from './settlement-amounts.js';
 import type { DiscountTier } from './settlement-amounts.js';
 import { acquireSemaphore, releaseSemaphore, getActiveCount } from './redis-semaphore.js';
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
@@ -788,12 +788,21 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     const monthlyVolume = await getMonthlyVolume(d.merchantId);
     const discountTiers: DiscountTier[] = env.FEE_DISCOUNT_TIERS ?? [];
 
-    const { grossAmount, feeAmount, netAmount, feeSnapshot } = computeSettlementAmounts(
-      d.amount,
-      feeBps,
-      monthlyVolume,
-      discountTiers,
-    );
+    let computeResult;
+    try {
+      computeResult = computeSettlementAmounts(
+        d.amount,
+        feeBps,
+        monthlyVolume,
+        discountTiers,
+      );
+    } catch (error) {
+      if (error instanceof SettlementAmountError) {
+        return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, error.message));
+      }
+      throw error;
+    }
+    const { grossAmount, feeAmount, netAmount, feeSnapshot } = computeResult;
 
     if (feeSnapshot.discountApplied > 0) {
       fastify.log.info({
@@ -966,7 +975,17 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         }
       }
 
-      const { grossAmount, feeAmount, netAmount } = computeSettlementAmounts(item.amount, feeBps, monthlyVolume, discountTiers);
+      let itemResult;
+      try {
+        itemResult = computeSettlementAmounts(item.amount, feeBps, monthlyVolume, discountTiers);
+      } catch (error) {
+        if (error instanceof SettlementAmountError) {
+          errors.push({ index: i, reason: error.message });
+          continue;
+        }
+        throw error;
+      }
+      const { grossAmount, feeAmount, netAmount } = itemResult;
       const settlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
 
       validItems.push({

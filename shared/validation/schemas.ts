@@ -17,6 +17,22 @@ export const PositiveAmountString = AmountString.refine(
   { message: 'Amount must be greater than zero' }
 );
 
+/** Settlement amounts must not exceed 10^15 (1,000,000,000,000,000). */
+export const SettlementAmountString = AmountString.refine(
+  (val) => {
+    const max = '1000000000000000';
+    const [intPart, decPart] = val.split('.');
+    if (intPart.length > max.length) return false;
+    if (intPart.length < max.length) return true;
+    // Same integer-part length — compare lexicographically (safe for same-length digit strings)
+    if (intPart > max) return false;
+    if (intPart < max) return true;
+    // Integer parts are identical — decimal part must be all zeros (or absent)
+    return !decPart || /^0+$/.test(decPart);
+  },
+  { message: 'Settlement amount exceeds maximum allowed (1,000,000,000,000,000)' },
+);
+
 export const StellarAddressSchema = z.string().refine(validateStellarAddress, {
   message: 'Invalid Stellar public key',
 });
@@ -324,10 +340,10 @@ export const CreatePaymentBody = z.object({
 
 export const CreateSettlementBody = z.object({
   merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
-  amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').optional(),
+  amount: SettlementAmountString.optional(),
   asset: CurrencyCode.optional(),
   items: z.array(z.object({
-    amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
+    amount: SettlementAmountString,
     asset: CurrencyCode,
   })).optional(),
   idempotencyKey: IdempotencyKeySchema.optional(),
@@ -343,7 +359,7 @@ export const CreateSettlementBody = z.object({
 export const BulkSettlementBody = z.object({
   merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
   settlements: z.array(z.object({
-    amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
+    amount: SettlementAmountString,
     asset: CurrencyCode,
   })),
 });
