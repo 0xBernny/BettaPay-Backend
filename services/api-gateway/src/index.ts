@@ -231,6 +231,34 @@ function sanitizeInput(value: unknown, seen = new WeakSet<object>()): unknown {
   return value;
 }
 
+export const QUERY_PARAM_CONTROL_CHARS_REGEX = /[\u0000-\u0008\u000A-\u001F\u007F]/g;
+
+export function sanitizeParamString(value: string): string {
+  return value.replace(QUERY_PARAM_CONTROL_CHARS_REGEX, '');
+}
+
+export function sanitizeParamsValue(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (typeof value === 'string') {
+    return sanitizeParamString(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeParamsValue(item, seen));
+  }
+
+  if (value && typeof value === 'object') {
+    if (seen.has(value)) return value;
+    seen.add(value);
+
+    const record = value as Record<string, unknown>;
+    for (const [key, nestedValue] of Object.entries(record)) {
+      record[key] = sanitizeParamsValue(nestedValue, seen);
+    }
+  }
+
+  return value;
+}
+
 function redactValue(value: any): any {
   if (value === null || value === undefined) return value;
   if (Array.isArray(value)) return value.map(redactValue);
@@ -270,6 +298,17 @@ export function buildApp(opts: AppOptions = {}) {
   registerErrorHandler(fastify);
   registerTracing(fastify);
   registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
+
+  // Centralized query and path parameter sanitization preHandler hook:
+  // Recursively strips unsafe ASCII control characters (0x00-0x1F except \t, 0x7F)
+  fastify.addHook('preHandler', async (request: FastifyRequest) => {
+    if (request.query && typeof request.query === 'object') {
+      sanitizeParamsValue(request.query);
+    }
+    if (request.params && typeof request.params === 'object') {
+      sanitizeParamsValue(request.params);
+    }
+  });
 
   // Guards against decompression bombs: Fastify's own bodyLimit only checks
   // the compressed (on-the-wire) size, so a small gzip payload could otherwise
