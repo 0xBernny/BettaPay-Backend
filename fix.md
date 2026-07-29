@@ -1,18 +1,22 @@
 Current behavior:
-Single DATABASE_URL for all queries — reads contend with writes.
+Indexes on single columns — most common queries use sequential scans.
 
 Expected behavior:
-Add DATABASE_READ_REPLICA_URL env var. If set, configure Prisma to route reads (findMany, findFirst, count, aggregate) to replica and writes (create, update, delete) to primary using @prisma/extension-read-replicas. Log warning if no replica configured.
+Add composite indexes:
 
+Payment(merchantId, status, createdAt DESC)
+Settlement(merchantId, status, initiatedAt DESC)
+IndexedEvent(contractId, ledger DESC)
+AuditLog(entityType, entityId, createdAt DESC)
+Use Prisma migration. Measure before/after with EXPLAIN ANALYZE.
 Files to modify:
 
-shared/validation/prisma.ts — configure read replicas
-.env.example — document new variable
+prisma/schema.prisma — add @@index directives
+New migration
 Test requirements:
+Verify queries use the new indexes (via EXPLAIN ANALYZE in test output).
 
-With replica URL — reads go to replica, writes to primary.
-Without replica URL — all queries to primary, warning logged.
 Acceptance criteria:
 
-Read replica support with zero code changes to service handlers.
-Falls back to primary if no replica conf
+All four composite indexes created.
+Query plans show index scans instead of sequential scans.
