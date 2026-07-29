@@ -48,9 +48,16 @@ import {
   startRedisMemoryMonitor,
   startMetricsServer,
   startPrismaPoolMetricsCollector,
+  CleanupQuery,
+  paymentInitiatedEvent,
+  paymentCompletedEvent,
+  settlementTriggeredEvent,
+  fxExecutedEvent,
+  billPaidEvent,
+  anchorSettledEvent,
 } from '@bettapay/validation';
 import { buildPaginationMeta } from '@bettapay/shared-types';
-import type { EventType } from '@bettapay/validation';
+import type { EventType, CleanupDryRunResult } from '@bettapay/validation';
 import * as promClient from 'prom-client';
 
 export const env = validateEnvOrExit(process.env);
@@ -92,6 +99,25 @@ fastify.register(rateLimit, {
 // application port — keeps the scrape endpoint unauthenticated without
 // exposing it alongside application traffic.
 promClient.collectDefaultMetrics();
+
+const pollDurationHistogram = new promClient.Histogram({
+  name: 'indexer_poll_duration_seconds',
+  help: 'Duration of poll cycles',
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
+});
+
+const eventsFetchedCounter = new promClient.Counter({
+  name: 'indexer_events_fetched_total',
+  help: 'Total events fetched per contract',
+  labelNames: ['contractId'] as const,
+});
+
+const pollCyclesCounter = new promClient.Counter({
+  name: 'indexer_poll_cycles_total',
+  help: 'Total poll cycles by status',
+  labelNames: ['status'] as const,
+});
+
 const metricsServer = startMetricsServer({
   appPort: PORT,
   contentType: promClient.register.contentType,
@@ -259,6 +285,7 @@ const replayWorker = new Worker(
             const resolvedContractId = evt.contractId ? evt.contractId.toString() : contractId;
             const contractName = getContractName(resolvedContractId);
             const stellarId = typeof evt.id === 'string' ? evt.id : null;
+            const validationError = validatePayload(topics[0], decodedPayload);
 
             if (stellarId) {
               if (existingStellarIds.has(stellarId)) continue;
@@ -280,6 +307,7 @@ const replayWorker = new Worker(
                   type: topics[0],
                   rawValue,
                   decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
+                  validationError: validationError ?? undefined,
                   ledger: evt.ledger,
                   indexedAt: new Date(),
                 },
@@ -396,6 +424,29 @@ function decodeScVal(evtValue: xdr.ScVal, topicHint: string): unknown {
   }
 }
 
+// ── Event payload validation ──────────────────────────────────────────────────
+
+const EVENT_SCHEMA_MAP: Record<string, z.ZodTypeAny> = {
+  PaymentInitiated: paymentInitiatedEvent,
+  PaymentCompleted: paymentCompletedEvent,
+  SettlementTriggered: settlementTriggeredEvent,
+  FXExecuted: fxExecutedEvent,
+  BillPaid: billPaidEvent,
+  AnchorSettled: anchorSettledEvent,
+};
+
+function validatePayload(type: string, payload: unknown): string | null {
+  const schema = EVENT_SCHEMA_MAP[type];
+  if (!schema) return null;
+  const result = schema.safeParse(payload);
+  if (!result.success) {
+    const msg = result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
+    fastify.log.warn({ type, validationError: msg }, '[Indexer] Event payload validation failed');
+    return msg;
+  }
+  return null;
+}
+
 // ── Event persistence ─────────────────────────────────────────────────────────
 
 export const cacheState: { subscriptions: { data: WebhookSubscription[]; cachedAt: number } | null } = { subscriptions: null };
@@ -408,7 +459,8 @@ export async function persistEvent(
   contractName: string,
   rawValue: string,
   decodedPayload: unknown,
-  ledger: number
+  ledger: number,
+  validationError?: string | null,
 ): Promise<Record<string, unknown> | null> {
   const id = 'evt_' + crypto.randomUUID().replace(/-/g, '');
 
@@ -424,6 +476,7 @@ export async function persistEvent(
         type,
         rawValue,
         decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
+        validationError: validationError ?? undefined,
         ledger,
         indexedAt: new Date(),
       },
@@ -577,6 +630,23 @@ fastify.get<{ Params: { jobId: string } }>(
   },
 );
 
+// Issue #346 — cleanup trigger with optional dry-run
+fastify.post(
+  '/api/events/cleanup',
+  {
+    preValidation: [fastify.serviceAuth],
+  },
+  async (request, reply) => {
+    const { dryRun } = CleanupQuery.parse(request.query ?? {});
+    if (dryRun) {
+      const dryResult = await cleanupOldEvents(true);
+      return reply.code(200).send(dryResult);
+    }
+    const deletedCount = await cleanupOldEvents();
+    return reply.code(200).send({ status: 'completed', deletedCount });
+  },
+);
+
 // Issue #70 — webhook subscription CRUD
 const WebhookBody = z.object({
   url: WebhookUrlSchema,
@@ -670,6 +740,9 @@ fastify.post<{ Params: { id: string } }>(
 // ── Stellar RPC polling loop ──────────────────────────────────────────────────
 
 async function pollEvents() {
+  const pollStart = Date.now();
+  let aborted = false;
+
   // On each poll, fetch the latest Stellar ledger to track lag
   try {
     const latest = await server.getLatestLedger();
@@ -686,6 +759,8 @@ async function pollEvents() {
 
     if (cursor === undefined) {
       currentBackoff = BASE_BACKOFF;
+      pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
+      pollCyclesCounter.inc({ status: 'success' });
       setTimeout(pollEvents, currentBackoff);
       return;
     }
@@ -700,8 +775,18 @@ async function pollEvents() {
       limit: 100,
     });
 
+    const timeoutMs = env.POLL_TIMEOUT_MS;
+
     if (response.events && response.events.length > 0) {
       for (const evt of response.events) {
+        if (aborted) break;
+        const elapsed = Date.now() - pollStart;
+        if (elapsed > timeoutMs) {
+          fastify.log.warn({ elapsed, timeoutMs }, '[Indexer] Poll cycle timeout exceeded — aborting');
+          aborted = true;
+          break;
+        }
+
         const topics = Array.isArray(evt.topic) ? evt.topic.map(String) : [String(evt.topic)];
         const rawValue = evt.value.toXDR('base64');
         const decodedPayload = decodeScVal(evt.value, topics[0]);
@@ -709,19 +794,25 @@ async function pollEvents() {
         const contractName = getContractName(resolvedContractId);
         const stellarId = typeof evt.id === 'string' ? evt.id : null;
 
-        const result = await persistEvent(stellarId, topics, topics[0], resolvedContractId, contractName, rawValue, decodedPayload, evt.ledger);
+        const validationError = validatePayload(topics[0], decodedPayload);
+
+        const result = await persistEvent(stellarId, topics, topics[0], resolvedContractId, contractName, rawValue, decodedPayload, evt.ledger, validationError);
         if (latestLedgerCursor !== undefined && result !== null) {
           latestLedgerCursor = Math.max(latestLedgerCursor, evt.ledger + 1);
         }
+
+        eventsFetchedCounter.inc({ contractId: resolvedContractId });
       }
     } else if (latestLedgerSequence !== undefined && latestLedgerCursor !== undefined) {
       latestLedgerCursor = Math.max(latestLedgerCursor, latestLedgerSequence);
     }
 
-    latestLedgerCursor = cursor;
+    if (!aborted) {
+      latestLedgerCursor = cursor;
+    }
 
     // Warn if the indexer is too far behind the network tip
-    if (latestLedgerSequence !== undefined) {
+    if (latestLedgerSequence !== undefined && !aborted) {
       const lag = latestLedgerSequence - cursor;
       if (lag > env.INDEXER_LAG_WARN_THRESHOLD) {
         fastify.log.warn({ lag, threshold: env.INDEXER_LAG_WARN_THRESHOLD }, '[Indexer] Indexer lag exceeds threshold');
@@ -729,9 +820,12 @@ async function pollEvents() {
     }
 
     currentBackoff = BASE_BACKOFF;
+    pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
+    pollCyclesCounter.inc({ status: 'success' });
     setTimeout(pollEvents, currentBackoff);
   } catch (err) {
     fastify.log.error(`[Indexer] Polling error: ${err}`);
+    pollCyclesCounter.inc({ status: 'error' });
     const jitter = currentBackoff * (0.75 + Math.random() * 0.5);
     fastify.log.info(`[Indexer] Retrying in ${Math.round(jitter)}ms (backoff: ${currentBackoff}ms)`);
     currentBackoff = Math.min(currentBackoff * 2, MAX_BACKOFF);
@@ -753,33 +847,67 @@ export function buildCleanupWhere(retentionDays: number, now: Date): { indexedAt
 
 /**
  * Deletes IndexedEvent rows from the database that are older than
- * `EVENT_RETENTION_DAYS`. Returns the number of rows deleted.
+ * `EVENT_RETENTION_DAYS`. Returns the number of rows deleted (or a dry-run result).
  *
  * When `EVENT_RETENTION_DAYS` is 0 (the default), cleanup is disabled and the
  * function returns 0 immediately.
  */
-export async function cleanupOldEvents(): Promise<number> {
+export async function cleanupOldEvents(dryRun?: boolean): Promise<number | CleanupDryRunResult> {
   const retentionDays = env.EVENT_RETENTION_DAYS;
   const where = buildCleanupWhere(retentionDays, new Date());
-  if (!where) return 0;
+  if (!where) {
+    if (dryRun) return { wouldDelete: 0, totalSizeBytes: 0, retentionDays: 0, oldestEventDate: '' };
+    return 0;
+  }
+
+  if (dryRun) {
+    const [count, oldest, sizeResult] = await Promise.all([
+      prisma.indexedEvent.count({ where }),
+      prisma.indexedEvent.findFirst({ where, orderBy: { indexedAt: 'asc' }, select: { indexedAt: true } }),
+      prisma.$queryRawUnsafe<Array<{ total_bytes: bigint }>>(
+        `SELECT COALESCE(SUM(pg_column_size(t.*)), 0) as total_bytes FROM "IndexedEvent" t WHERE t."indexedAt" < $1`,
+        where.indexedAt.lt,
+      ),
+    ]);
+    const totalSizeBytes = Number(sizeResult[0]?.total_bytes ?? 0);
+    return {
+      wouldDelete: count,
+      totalSizeBytes,
+      retentionDays,
+      oldestEventDate: oldest?.indexedAt.toISOString() ?? '',
+    };
+  }
 
   const { count } = await prisma.indexedEvent.deleteMany({ where });
   return count;
 }
 
-export async function runCleanupJob(): Promise<void> {
+export async function runCleanupJob(data?: { dryRun?: boolean }): Promise<void> {
+  const dryRun = data?.dryRun ?? false;
   try {
-    const deletedCount = await cleanupOldEvents();
-    fastify.log.info({
-      retentionDays: env.EVENT_RETENTION_DAYS,
-      deletedCount,
-      status: 'success'
-    }, `[Indexer] Event retention cleanup completed. Retention period: ${env.EVENT_RETENTION_DAYS} days. Deleted: ${deletedCount} events. Status: success`);
+    const result = await cleanupOldEvents(dryRun);
+    if (dryRun) {
+      const dryResult = result as CleanupDryRunResult;
+      fastify.log.info({
+        wouldDelete: dryResult.wouldDelete,
+        totalSizeBytes: dryResult.totalSizeBytes,
+        retentionDays: dryResult.retentionDays,
+        oldestEventDate: dryResult.oldestEventDate,
+        status: 'dry-run',
+      }, `[Indexer] Dry-run cleanup: would delete ${dryResult.wouldDelete} events (${dryResult.totalSizeBytes} bytes)`);
+    } else {
+      const deletedCount = result as number;
+      fastify.log.info({
+        retentionDays: env.EVENT_RETENTION_DAYS,
+        deletedCount,
+        status: 'success',
+      }, `[Indexer] Event retention cleanup completed. Retention period: ${env.EVENT_RETENTION_DAYS} days. Deleted: ${deletedCount} events. Status: success`);
+    }
   } catch (error: any) {
     fastify.log.error({
       retentionDays: env.EVENT_RETENTION_DAYS,
       error: error?.message || error,
-      status: 'failed'
+      status: 'failed',
     }, `[Indexer] Event retention cleanup failed. Retention period: ${env.EVENT_RETENTION_DAYS} days. Error: ${error}. Status: failed`);
   }
 }
