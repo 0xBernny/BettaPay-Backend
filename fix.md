@@ -1,22 +1,25 @@
+Add event filtering to the events listing endpoint
+Repo Avatar
+Betta-Pay/BettaPay-Backend
 Current behavior:
-Indexes on single columns — most common queries use sequential scans.
+GET /api/events has no filters — clients must fetch all pages and filter client-side.
 
 Expected behavior:
-Add composite indexes:
+Add optional query parameters: type (exact), topic (contains in topics array), contractId (exact), fromLedger, toLedger (range). ALL combinable (AND). Add database index on (contractId, ledger DESC).
 
-Payment(merchantId, status, createdAt DESC)
-Settlement(merchantId, status, initiatedAt DESC)
-IndexedEvent(contractId, ledger DESC)
-AuditLog(entityType, entityId, createdAt DESC)
-Use Prisma migration. Measure before/after with EXPLAIN ANALYZE.
 Files to modify:
 
-prisma/schema.prisma — add @@index directives
-New migration
+services/indexer/src/index.ts — modify event listing query
+shared/validation/schemas.ts
+prisma/schema.prisma — add index (new migration)
 Test requirements:
-Verify queries use the new indexes (via EXPLAIN ANALYZE in test output).
 
+Filter by type — only that type returned.
+Filter by topic — matching events returned.
+Filter by ledger range — events in range.
+All combined — AND logic.
+No matches — empty result.
 Acceptance criteria:
 
-All four composite indexes created.
-Query plans show index scans instead of sequential scans.
+Events filterable by type, topic, contract, and ledger range.
+Queries use index.

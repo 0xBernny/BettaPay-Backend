@@ -493,6 +493,23 @@ export const PaginationQuery = z.object({
 });
 export type PaginationQuery = z.infer<typeof PaginationQuery>;
 
+export const EventListQuery = PaginationQuery.extend({
+  type: z.string().optional(),
+  topic: z.string().optional(),
+  contractId: z.string().optional(),
+  fromLedger: z.coerce.number().int().min(1).optional(),
+  toLedger: z.coerce.number().int().min(1).optional(),
+}).refine(
+  (data) => {
+    if (data.fromLedger !== undefined && data.toLedger !== undefined) {
+      return data.fromLedger <= data.toLedger;
+    }
+    return true;
+  },
+  { message: "fromLedger must be <= toLedger" }
+);
+export type EventListQuery = z.infer<typeof EventListQuery>;
+
 export const SettlementListQuery = PaginationQuery.extend({
   status: z.enum(['pending', 'processing', 'completed', 'failed']).optional(),
   from: isoDateString.optional(),
