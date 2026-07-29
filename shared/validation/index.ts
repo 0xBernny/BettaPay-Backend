@@ -305,6 +305,17 @@ export const EnvSchema = z.object({
     .transform((s) => parseInt(s, 10))
     .default("300000"),
 
+  // FX Engine — staleness threshold (seconds). Rates older than this trigger
+  // structured WARN (live source) or ERROR (seed source) logs when served.
+  // Default: 300 (5 minutes).
+  MAX_STALE_SECONDS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("300")
+    .refine((val) => Number.isFinite(val) && val > 0, {
+      message: "MAX_STALE_SECONDS must be a positive integer",
+    }),
+
   // FX Engine — slippage tolerance (basis points; 100 bps = 1%)
   DEFAULT_SLIPPAGE_BPS: z
     .string()
