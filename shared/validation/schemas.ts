@@ -465,6 +465,11 @@ export const SupportedAssetSchema = z.object({
 });
 export type SupportedAsset = z.infer<typeof SupportedAssetSchema>;
 
+export const RateOverrideBody = z.object({
+  rates: z.record(z.string(), z.number().positive()),
+});
+export type RateOverrideBody = z.infer<typeof RateOverrideBody>;
+
 export const CreateSupportedAssetBody = z.object({
   code: z.string().min(1),
   contractId: z.string().min(1),

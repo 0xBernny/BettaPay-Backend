@@ -289,6 +289,15 @@ export const EnvSchema = z.object({
     .transform((s) => parseInt(s, 10))
     .default("300000"),
 
+  // FX Engine — maximum allowed deviation (in basis points) between the
+  // current cached rate and a newly fetched rate. When the deviation
+  // exceeds this threshold the new rate is rejected, the old rate is
+  // preserved, and a warning is logged. Default: 2000 bps = 20%.
+  MAX_DEVIATION_BPS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("2000"),
+
   // FX Engine — slippage tolerance (basis points; 100 bps = 1%)
   DEFAULT_SLIPPAGE_BPS: z
     .string()

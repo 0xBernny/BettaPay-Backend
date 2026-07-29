@@ -1,25 +1,26 @@
-Add event filtering to the events listing endpoint
+Add deviation guard to reject extreme rate changes from CoinGecko
 Repo Avatar
 Betta-Pay/BettaPay-Backend
 Current behavior:
-GET /api/events has no filters — clients must fetch all pages and filter client-side.
+All CoinGecko rates accepted unconditionally — flash crashes propagate instantly.
 
 Expected behavior:
-Add optional query parameters: type (exact), topic (contains in topics array), contractId (exact), fromLedger, toLedger (range). ALL combinable (AND). Add database index on (contractId, ledger DESC).
+Add MAX_DEVIATION_BPS (default 2000 = 20%). Before updating cache, compare new rate to old rate. If deviation exceeds threshold, reject, log error, preserve old rate. Add admin override endpoint POST /api/admin/rates/override to bypass guard.
 
 Files to modify:
 
-services/indexer/src/index.ts — modify event listing query
-shared/validation/schemas.ts
-prisma/schema.prisma — add index (new migration)
+services/fx-engine/src/index.ts — deviation check and override endpoint
+shared/validation/index.ts — add env var
+shared/validation/schemas.ts — override body schema
+Test: rate-refresh.test.ts
 Test requirements:
 
-Filter by type — only that type returned.
-Filter by topic — matching events returned.
-Filter by ledger range — events in range.
-All combined — AND logic.
-No matches — empty result.
+10% deviation (max 20%) — accepted.
+30% deviation (max 20%) — rejected, old rate preserved.
+No old rate — accepted unconditionally.
+Admin override bypasses guard.
+Old rate is 0 — accepted (no division by zero).
 Acceptance criteria:
 
-Events filterable by type, topic, contract, and ledger range.
-Queries use index.
+Extreme rate changes rejected, previous valid rate served.
+Admin can override when change is legitimate.
