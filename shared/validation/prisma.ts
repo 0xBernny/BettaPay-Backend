@@ -203,9 +203,13 @@ export async function connectWithRetryWithRotation(
 
 import { readReplicas } from "@prisma/extension-read-replicas";
 
+interface PrismaClientLike {
+  $extends: (extension: unknown) => any;
+}
+
 const REPLICA_WARNING_EMITTED = Symbol("replicaWarningEmitted");
 
-export function applyReadReplicas<T extends object>(
+export function applyReadReplicas<T extends PrismaClientLike>(
   client: T,
   replicaUrl?: string | null,
   logger?: { warn: (obj: object, msg?: string) => void },
