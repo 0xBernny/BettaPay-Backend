@@ -772,9 +772,18 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
 
     const stored      = JSON.parse(raw) as StoredQuote;
     const now         = Date.now();
-    const valid       = now <= stored.expiresAt;
     const currentRate = getOrComputeRate(stored.from, stored.to);
     const slippageBps = stored.slippageBps ?? env.DEFAULT_SLIPPAGE_BPS;
+    const quotedRate  = parseFloat(stored.rate);
+
+    // Fail-open: if market rate is unavailable (fallback mode), accept by expiry
+    let valid: boolean;
+    if (fallbackStartTime !== null) {
+      valid = now <= stored.expiresAt;
+    } else {
+      const deviation = Math.abs(currentRate - quotedRate) / quotedRate * 10000;
+      valid = now <= stored.expiresAt && deviation <= slippageBps;
+    }
 
     return {
       valid,
