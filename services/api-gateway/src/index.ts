@@ -30,7 +30,7 @@ import crypto from 'crypto';
 import zlib from 'zlib';
 import { Transform } from 'stream';
 import { z } from 'zod';
-import { validateEnvOrExit, type Env, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor, startMetricsServer, logFeatureFlags } from '@bettapay/validation';
+import { validateEnvOrExit, type Env, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor, startMetricsServer, logFeatureFlags, startPrismaPoolMetricsCollector } from '@bettapay/validation';
 import * as promClient from 'prom-client';
 import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient, type IndexerClient } from './clients/indexer-client.js';
@@ -180,15 +180,17 @@ export interface AppOptions {
 }
 
 let defaultPrisma: PrismaClient | null = null;
+let sharedPgPool: pg.Pool | null = null;
 export function getDefaultPrisma(): PrismaClient {
   if (!defaultPrisma) {
-    const pool = new pg.Pool({
+    sharedPgPool = new pg.Pool({
       connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
       max: env.DATABASE_POOL_SIZE,
       connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
     });
-    const adapter = new PrismaPg(pool);
+    const adapter = new PrismaPg(sharedPgPool);
     defaultPrisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
+    startPrismaPoolMetricsCollector(sharedPgPool, promClient.register, 10000, undefined, promClient);
   }
   return defaultPrisma;
 }
