@@ -75,6 +75,9 @@ importers:
       '@bettapay/validation':
         specifier: workspace:*
         version: link:../../shared/validation
+      '@bettapay/webhook-delivery':
+        specifier: workspace:*
+        version: link:../../shared/webhook-delivery
       '@fastify/helmet':
         specifier: ^12.0.0
         version: 12.0.1
@@ -90,6 +93,9 @@ importers:
       '@stellar/stellar-sdk':
         specifier: ^16.0.1
         version: 16.0.1
+      bullmq:
+        specifier: ^5.79.1
+        version: 5.80.10
       google-auth-library:
         specifier: ^10.9.0
         version: 10.9.0
@@ -315,6 +321,9 @@ importers:
       '@bettapay/stellar-utils':
         specifier: workspace:^
         version: link:../stellar-utils
+      ioredis:
+        specifier: ^5.11.1
+        version: 5.11.1
       zod:
         specifier: ^3.22.4
         version: 3.25.76

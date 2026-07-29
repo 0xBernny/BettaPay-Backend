@@ -315,7 +315,20 @@ export function buildApp(opts: AppOptions = {}) {
   const logAuditEvent = createAuditLogger(prisma as unknown as Parameters<typeof createAuditLogger>[0], fastify.log);
 
 // Setup plugins
-fastify.register(helmet, { contentSecurityPolicy: false, hsts: { maxAge: 31536000 }, referrerPolicy: { policy: 'no-referrer' } });
+fastify.register(helmet, {
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: { policy: 'require-corp' },
+  crossOriginOpenerPolicy: { policy: 'same-origin' },
+  crossOriginResourcePolicy: { policy: 'same-origin' },
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+  hsts: { maxAge: 31536000 },
+});
+
+fastify.addHook('onSend', async (_request, reply, _payload) => {
+  if (!reply.getHeader('permissions-policy')) {
+    reply.header('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  }
+});
 
 fastify.register(cors, {
   origin: env.ALLOWED_ORIGINS,
