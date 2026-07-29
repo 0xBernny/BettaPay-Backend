@@ -37,6 +37,7 @@ import {
   waitForRedis,
   startRedisMemoryMonitor,
   startMetricsServer,
+  RateOverrideBody,
 } from "@bettapay/validation";
 
 const env = validateEnvOrExit(process.env);
@@ -174,6 +175,7 @@ let lastRefresh: {
   error?: string;
 } | null = null;
 let lastSuccessfulFetch: number | null = null;
+let lastOverrideAt: number | null = null;
 let fallbackStartTime: number | null = null;
 
 // Log every 5 minutes when in fallback mode
@@ -393,13 +395,38 @@ async function refreshTick(): Promise<void> {
       try {
         const fetched = await fetchBaseRates();
         if (fetched) {
-          const merged: Record<string, number> = { ...cache.rates, ...fetched };
+          const maxDeviationBps = env.MAX_DEVIATION_BPS;
+          const merged: Record<string, number> = { ...cache.rates };
+          const rejected: string[] = [];
+          for (const [asset, newRate] of Object.entries(fetched)) {
+            const oldRate = cache.rates[asset];
+            if (oldRate === undefined || oldRate === 0) {
+              merged[asset] = newRate;
+              continue;
+            }
+            const deviationBps =
+              (Math.abs(newRate - oldRate) / oldRate) * 10000;
+            if (deviationBps > maxDeviationBps) {
+              rejected.push(
+                `${asset}: ${oldRate} → ${newRate} (${deviationBps.toFixed(0)} bps > ${maxDeviationBps} max)`,
+              );
+              continue;
+            }
+            merged[asset] = newRate;
+          }
+          if (rejected.length > 0) {
+            fastify.log.warn(
+              { rejected, maxDeviationBps },
+              "Rate deviation guard rejected rates; old rates preserved",
+            );
+          }
           updateBaseRates(merged);
           recordCircuitBreakerSuccess(fastify.log);
           fastify.log.info(
             {
               durationMs: lastRefresh?.durationMs,
               assets: Object.keys(fetched),
+              rejectedCount: rejected.length,
             },
             "FX rates refreshed",
           );
@@ -438,7 +465,32 @@ async function refreshTick(): Promise<void> {
     fastify.log.warn("Stampede poll timed out; falling back to direct fetch");
     const fetched = await fetchBaseRates();
     if (fetched) {
-      updateBaseRates({ ...cache.rates, ...fetched });
+      const maxDeviationBps = env.MAX_DEVIATION_BPS;
+      const merged: Record<string, number> = { ...cache.rates };
+      const rejected: string[] = [];
+      for (const [asset, newRate] of Object.entries(fetched)) {
+        const oldRate = cache.rates[asset];
+        if (oldRate === undefined || oldRate === 0) {
+          merged[asset] = newRate;
+          continue;
+        }
+        const deviationBps =
+          (Math.abs(newRate - oldRate) / oldRate) * 10000;
+        if (deviationBps > maxDeviationBps) {
+          rejected.push(
+            `${asset}: ${oldRate} → ${newRate} (${deviationBps.toFixed(0)} bps > ${maxDeviationBps} max)`,
+          );
+          continue;
+        }
+        merged[asset] = newRate;
+      }
+      if (rejected.length > 0) {
+        fastify.log.warn(
+          { rejected, maxDeviationBps },
+          "Rate deviation guard rejected rates (stampede fallback); old rates preserved",
+        );
+      }
+      updateBaseRates(merged);
       recordCircuitBreakerSuccess(fastify.log);
     } else {
       recordCircuitBreakerFailure(fastify.log, env.CIRCUIT_BREAKER_COOLDOWN_MS);
@@ -902,6 +954,48 @@ fastify.get(
       warmup: warmupStats,
       currentRates: cache.rates,
       updatedAt: new Date(cache.cachedAt).toISOString(),
+    };
+  },
+);
+
+// ── POST /api/admin/rates/override ───────────────────────────────────────
+// Admin override endpoint: bypasses the deviation guard and forces new rates
+// into the cache. Requires a valid x-service-token.
+
+fastify.post<{ Body: unknown }>(
+  "/api/admin/rates/override",
+  {
+    preValidation: [fastify.serviceAuth],
+  },
+  async (request, reply) => {
+    let body: z.infer<typeof RateOverrideBody>;
+    try {
+      body = RateOverrideBody.parse(request.body);
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return reply
+          .code(400)
+          .send(
+            createErrorResponse(
+              ErrorCodes.VALIDATION_ERROR,
+              "Invalid override body",
+              err.errors,
+            ),
+          );
+      }
+      throw err;
+    }
+
+    lastOverrideAt = Date.now();
+    updateBaseRates({ ...cache.rates, ...body.rates });
+    fastify.log.warn(
+      { rates: body.rates },
+      "Admin override: rate deviation guard bypassed",
+    );
+    return {
+      status: "ok",
+      overriddenAt: new Date(lastOverrideAt).toISOString(),
+      rates: body.rates,
     };
   },
 );

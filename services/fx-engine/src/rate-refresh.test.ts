@@ -31,6 +31,7 @@ function makeRefresher(opts: {
   url: string;
   fetchImpl: typeof fetch;
   initial: Record<string, number>;
+  maxDeviationBps?: number;
 }) {
   const cache: { rates: Record<string, number>; cachedAt: number } = {
     rates: { ...opts.initial },
@@ -92,7 +93,17 @@ function makeRefresher(opts: {
   async function refreshTick(): Promise<void> {
     const fetched = await fetchBaseRates();
     if (fetched) {
-      cache.rates = { ...cache.rates, ...fetched };
+      const maxDeviationBps = opts.maxDeviationBps ?? Infinity;
+      for (const [asset, newRate] of Object.entries(fetched)) {
+        const oldRate = cache.rates[asset];
+        if (oldRate === undefined || oldRate === 0) {
+          cache.rates[asset] = newRate;
+          continue;
+        }
+        const deviationBps = (Math.abs(newRate - oldRate) / oldRate) * 10000;
+        if (deviationBps > maxDeviationBps) continue;
+        cache.rates[asset] = newRate;
+      }
       cache.cachedAt = Date.now();
     }
   }
@@ -251,6 +262,107 @@ test('jitter: delays are within ±25% range and mean approximates the base inter
   t.ok(max <= expectedMax, `max delay ${max} <= ${expectedMax}`);
   t.ok(Math.abs(mean - BASE_INTERVAL) < 3, `mean ${mean} ≈ ${BASE_INTERVAL}`);
   t.equal(delays.length, SAMPLES, `generated ${SAMPLES} delays`);
+  t.end();
+});
+
+// ── Deviation guard tests ─────────────────────────────────────────────────
+
+test('refreshTick: 10% deviation (max 20%) is accepted', async (t) => {
+  const refresher = makeRefresher({
+    url: 'https://rates.test',
+    fetchImpl: async () =>
+      jsonResponse({ 'usd-coin': { ngn: 1700 } }),
+    initial: { USDC: 1545.5, EURT: 1680.2, NGN: 1.0 },
+    maxDeviationBps: 2000,
+  });
+
+  await refresher.refreshTick();
+
+  t.equal(refresher.cache.rates.USDC, 1700, 'USDC updated (10% deviation within 20% max)');
+  t.equal(refresher.cache.rates.EURT, 1680.2, 'EURT preserved (not in response)');
+  t.end();
+});
+
+test('refreshTick: 30% deviation (max 20%) is rejected, old rate preserved', async (t) => {
+  const refresher = makeRefresher({
+    url: 'https://rates.test',
+    fetchImpl: async () =>
+      jsonResponse({ 'usd-coin': { ngn: 2009.15 } }),
+    initial: { USDC: 1545.5, EURT: 1680.2, NGN: 1.0 },
+    maxDeviationBps: 2000,
+  });
+
+  await refresher.refreshTick();
+
+  t.equal(refresher.cache.rates.USDC, 1545.5, 'USDC unchanged (30% deviation exceeds 20% max)');
+  t.equal(refresher.cache.rates.EURT, 1680.2, 'EURT preserved');
+  t.end();
+});
+
+test('refreshTick: no old rate is accepted unconditionally', async (t) => {
+  const refresher = makeRefresher({
+    url: 'https://rates.test',
+    fetchImpl: async () =>
+      jsonResponse({ 'usd-coin': { ngn: 3000 }, 'tether-eurt': { ngn: 5000 } }),
+    initial: { USDC: 1545.5, NGN: 1.0 },
+    maxDeviationBps: 2000,
+  });
+
+  await refresher.refreshTick();
+
+  // USDC has old rate 1545.5, new 3000 = ~94% deviation, exceeds 20% max -> rejected
+  t.equal(refresher.cache.rates.USDC, 1545.5, 'USDC rejected (94% deviation exceeds 20% max)');
+  // EURT has no old rate -> accepted unconditionally
+  t.equal(refresher.cache.rates.EURT, 5000, 'EURT accepted unconditionally (no old rate)');
+  t.end();
+});
+
+test('refreshTick: old rate is 0 is accepted unconditionally (no division by zero)', async (t) => {
+  const refresher = makeRefresher({
+    url: 'https://rates.test',
+    fetchImpl: async () =>
+      jsonResponse({ 'usd-coin': { ngn: 1000 } }),
+    initial: { USDC: 0, EURT: 1680.2, NGN: 1.0 },
+    maxDeviationBps: 2000,
+  });
+
+  await refresher.refreshTick();
+
+  t.equal(refresher.cache.rates.USDC, 1000, 'USDC accepted (old rate was 0, bypasses deviation check)');
+  t.equal(refresher.cache.rates.EURT, 1680.2, 'EURT preserved');
+  t.end();
+});
+
+test('refreshTick: admin override bypasses deviation guard', async (t) => {
+  const refresher = makeRefresher({
+    url: 'https://rates.test',
+    fetchImpl: async () =>
+      jsonResponse({ 'usd-coin': { ngn: 5000 } }),
+    initial: { USDC: 1545.5, EURT: 1680.2, NGN: 1.0 },
+    maxDeviationBps: 2000,
+  });
+
+  // Simulate admin override: force rates directly into cache
+  refresher.cache.rates = { ...refresher.cache.rates, USDC: 5000 };
+  refresher.cache.cachedAt = Date.now();
+
+  // Normal refresh tick should NOT override the admin-forced rate
+  await refresher.refreshTick();
+
+  t.equal(refresher.cache.rates.USDC, 5000, 'USDC kept at admin-override value');
+
+  // Fetch a different asset; the override value should remain
+  const refresher2 = makeRefresher({
+    url: 'https://rates.test',
+    fetchImpl: async () =>
+      jsonResponse({ 'tether-eurt': { ngn: 2000 } }),
+    initial: { USDC: 5000, EURT: 1680.2, NGN: 1.0 },
+    maxDeviationBps: 2000,
+  });
+
+  await refresher2.refreshTick();
+  t.equal(refresher2.cache.rates.USDC, 5000, 'USDC still at admin-override value');
+  t.equal(refresher2.cache.rates.EURT, 2000, 'EURT updated normally');
   t.end();
 });
 
