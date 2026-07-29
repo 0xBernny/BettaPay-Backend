@@ -114,9 +114,9 @@ test('PaginationQuery validation', async (t) => {
     assert.strictEqual(result.limit, 50);
   });
 
-  await t.test('Default offset is 0', () => {
+  await t.test('Default page is 1', () => {
     const result = PaginationQuery.parse({});
-    assert.strictEqual(result.offset, 0);
+    assert.strictEqual(result.page, 1);
   });
 
   await t.test('Custom limit works', () => {
@@ -124,32 +124,32 @@ test('PaginationQuery validation', async (t) => {
     assert.strictEqual(result.limit, 100);
   });
 
-  await t.test('Custom offset works', () => {
-    const result = PaginationQuery.parse({ offset: 10 });
-    assert.strictEqual(result.offset, 10);
+  await t.test('Custom page works', () => {
+    const result = PaginationQuery.parse({ page: 3 });
+    assert.strictEqual(result.page, 3);
   });
 
-  await t.test('Limit above 200 fails', () => {
-    assert.throws(() => PaginationQuery.parse({ limit: 201 }), /Number must be less than or equal to 200/);
+  await t.test('Limit above 100 fails', () => {
+    assert.throws(() => PaginationQuery.parse({ limit: 101 }), /Number must be less than or equal to 100/);
   });
 
-  await t.test('Negative offset fails', () => {
-    assert.throws(() => PaginationQuery.parse({ offset: -1 }), /Number must be greater than or equal to 0/);
+  await t.test('Page below 1 fails', () => {
+    assert.throws(() => PaginationQuery.parse({ page: 0 }), /Number must be greater than or equal to 1/);
   });
 
   await t.test('Additional query parameters are accepted with passthrough', () => {
     const PassthroughQuery = PaginationQuery.passthrough();
-    const result = PassthroughQuery.parse({ limit: 10, offset: 5, sort: 'desc', filter: 'active' }) as any;
+    const result = PassthroughQuery.parse({ limit: 10, page: 2, sort: 'desc', filter: 'active' }) as any;
     assert.strictEqual(result.limit, 10);
-    assert.strictEqual(result.offset, 5);
+    assert.strictEqual(result.page, 2);
     assert.strictEqual(result.sort, 'desc');
     assert.strictEqual(result.filter, 'active');
   });
-  
+
   await t.test('Coerces string values to numbers', () => {
-    const result = PaginationQuery.parse({ limit: '25', offset: '5' });
+    const result = PaginationQuery.parse({ limit: '25', page: '5' });
     assert.strictEqual(result.limit, 25);
-    assert.strictEqual(result.offset, 5);
+    assert.strictEqual(result.page, 5);
   });
 });
 

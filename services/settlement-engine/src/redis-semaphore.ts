@@ -6,7 +6,7 @@
  * via INCR + TTL for lock safety (auto-releases on crash).
  */
 
-import type Redis from 'ioredis';
+import type { Redis } from 'ioredis';
 
 const DEFAULT_MAX_CONCURRENT = 3;
 const DEFAULT_TTL_SECONDS = 60;

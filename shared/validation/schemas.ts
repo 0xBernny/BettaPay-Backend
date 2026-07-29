@@ -17,6 +17,22 @@ export const PositiveAmountString = AmountString.refine(
   { message: 'Amount must be greater than zero' }
 );
 
+/** Settlement amounts must not exceed 10^15 (1,000,000,000,000,000). */
+export const SettlementAmountString = AmountString.refine(
+  (val) => {
+    const max = '1000000000000000';
+    const [intPart, decPart] = val.split('.');
+    if (intPart.length > max.length) return false;
+    if (intPart.length < max.length) return true;
+    // Same integer-part length — compare lexicographically (safe for same-length digit strings)
+    if (intPart > max) return false;
+    if (intPart < max) return true;
+    // Integer parts are identical — decimal part must be all zeros (or absent)
+    return !decPart || /^0+$/.test(decPart);
+  },
+  { message: 'Settlement amount exceeds maximum allowed (1,000,000,000,000,000)' },
+);
+
 export const StellarAddressSchema = z.string().refine(validateStellarAddress, {
   message: 'Invalid Stellar public key',
 });
@@ -121,6 +137,7 @@ export const fxQuoteSchema = z.object({
   fromCurrency: CurrencyCode,
   toCurrency: CurrencyCode,
   rate: z.string(),
+  slippageBps: z.number().int().min(0).optional(),
   expiresAt: isoDateString
 });
 
@@ -195,6 +212,11 @@ export const eventSchemas = z.discriminatedUnion('type', [
   billPaidEvent,
   anchorSettledEvent
 ]);
+
+export const AmountString = z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string');
+export const PositiveAmountString = AmountString.refine((value) => parseFloat(value) > 0, {
+  message: 'Amount must be greater than zero',
+});
 
 // Export types inferred from schemas
 export type User = z.infer<typeof userSchema>;
@@ -319,10 +341,10 @@ export const CreatePaymentBody = z.object({
 
 export const CreateSettlementBody = z.object({
   merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
-  amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').optional(),
+  amount: SettlementAmountString.optional(),
   asset: CurrencyCode.optional(),
   items: z.array(z.object({
-    amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
+    amount: SettlementAmountString,
     asset: CurrencyCode,
   })).optional(),
   idempotencyKey: IdempotencyKeySchema.optional(),
@@ -338,7 +360,7 @@ export const CreateSettlementBody = z.object({
 export const BulkSettlementBody = z.object({
   merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
   settlements: z.array(z.object({
-    amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
+    amount: SettlementAmountString,
     asset: CurrencyCode,
   })),
 });
@@ -346,6 +368,42 @@ export const BulkSettlementBody = z.object({
 export const AuthTokenBody = z.object({
   merchantId: StellarAddressSchema,
   secret: z.string().min(1, 'secret is required'),
+});
+
+export const AuthIpScoreQuery = z.object({
+  ip: z.string().min(1, 'ip is required'),
+});
+
+export const WalletVerifyBody = z.object({
+  address: StellarAddressSchema,
+  nonce: z.string().min(1, 'nonce is required').max(512, 'nonce is too long'),
+  signature: z.string().min(1, 'signature is required'),
+  challenge: z.string().min(1).optional(),
+  message: z.string().min(1).optional(),
+});
+
+export const WebhookTestStatus = z.enum(['success', 'failed']);
+
+export const WebhookTestPayloadSchema = z.object({
+  type: z.literal('test'),
+  timestamp: isoDateString,
+  subscriptionId: idSchema,
+  test: z.literal(true),
+});
+
+export const WebhookTestResultSchema = z.object({
+  success: z.boolean(),
+  statusCode: z.number().int().min(100).max(599).optional(),
+  error: z.string().optional(),
+});
+
+export const WebhookSubscriptionSchema = z.object({
+  id: idSchema,
+  url: z.string().url(),
+  createdAt: isoDateString,
+  lastTestedAt: isoDateString.nullable().optional(),
+  lastTestStatus: WebhookTestStatus.nullable().optional(),
+  lastTestStatusCode: z.number().int().min(100).max(599).nullable().optional(),
 });
 
 // A payment may only be moved into a terminal state. `initiated` is never an
@@ -445,8 +503,8 @@ export const BulkCancelPaymentsBody = z.object({
 export type BulkCancelPaymentsBody = z.infer<typeof BulkCancelPaymentsBody>;
 
 export const PaginationQuery = z.object({
-  limit: z.coerce.number().max(200).default(50),
-  offset: z.coerce.number().min(0).default(0),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 export type PaginationQuery = z.infer<typeof PaginationQuery>;
 
@@ -485,8 +543,28 @@ export type CreatePaymentBody = z.infer<typeof CreatePaymentBody>;
 export type CreateSettlementBody = z.infer<typeof CreateSettlementBody>;
 export type BulkSettlementBody = z.infer<typeof BulkSettlementBody>;
 export type AuthTokenBody = z.infer<typeof AuthTokenBody>;
+export type AuthIpScoreQuery = z.infer<typeof AuthIpScoreQuery>;
+export type WalletVerifyBody = z.infer<typeof WalletVerifyBody>;
+export type WebhookTestStatus = z.infer<typeof WebhookTestStatus>;
+export type WebhookTestPayload = z.infer<typeof WebhookTestPayloadSchema>;
+export type WebhookTestResult = z.infer<typeof WebhookTestResultSchema>;
+export type WebhookSubscription = z.infer<typeof WebhookSubscriptionSchema>;
 export type UpdatePaymentStatusBody = z.infer<typeof UpdatePaymentStatusBody>;
 export type UpdateMerchantSettingsBody = z.infer<typeof UpdateMerchantSettingsBody>;
+
+// ─── Indexer cleanup query ─────────────────────────────────────────────────────
+
+export const CleanupQuery = z.object({
+  dryRun: z.coerce.boolean().default(false),
+});
+export type CleanupQuery = z.infer<typeof CleanupQuery>;
+
+export interface CleanupDryRunResult {
+  wouldDelete: number;
+  totalSizeBytes: number;
+  retentionDays: number;
+  oldestEventDate: string;
+}
 
 // ─── Indexer types ────────────────────────────────────────────────────────────
 

@@ -89,13 +89,13 @@ export async function buildAggregatedHealthResponse(
 export function registerGatewayHealthRoutes(options: RegisterGatewayHealthRoutesOptions): void {
   const { fastify } = options;
 
-  fastify.get('/api/health', async (_request, reply) => {
+  fastify.get('/api/health', { config: { rateLimit: false } }, async (_request, reply) => {
     const health = await buildGatewayHealthResponse(options);
     const statusCode = health.status === 'unhealthy' ? 503 : 200;
     return reply.code(statusCode).send(health);
   });
 
-  fastify.get('/api/health/all', async (_request, reply) => {
+  fastify.get('/api/health/all', { config: { rateLimit: false } }, async (_request, reply) => {
     const health = await buildAggregatedHealthResponse(options);
     const statusCode = health.status === 'unhealthy' ? 503 : 200;
     return reply.code(statusCode).send(health);
