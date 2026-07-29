@@ -54,7 +54,7 @@ jobs:
         run: pnpm exec prisma validate
 
       - name: Check migration consistency
-        run: pnpm exec prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma
+        run: pnpm exec prisma migrate diff --from-empty --to-schema prisma/schema.prisma
 
       - name: Build packages
         run: pnpm -r --if-present build
