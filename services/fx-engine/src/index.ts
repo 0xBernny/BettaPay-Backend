@@ -66,11 +66,14 @@ const SUPPORTED_CURRENCIES = Object.keys(FALLBACK_RATES);
 
 interface RateCache {
   rates: Record<string, number>;
+  batchIds: Record<string, string>;
   cachedAt: number; // Unix ms timestamp
 }
 
+const initialBatchId = randomUUID();
 let cache: RateCache = {
   rates:    { ...FALLBACK_RATES },
+  batchIds: Object.fromEntries(Object.keys(FALLBACK_RATES).map((c) => [c, initialBatchId])),
   cachedAt: Date.now(),
 };
 
@@ -106,6 +109,23 @@ function getOrComputeRate(from: string, to: string): number {
     return entry.rate;
   }
 
+  const fromBatch = cache.batchIds[from];
+  const toBatch   = cache.batchIds[to];
+
+  if (!fromBatch) {
+    throw new Error(`No rate batch information for ${from}`);
+  }
+  if (!toBatch) {
+    throw new Error(`No rate batch information for ${to}`);
+  }
+
+  if (fromBatch !== toBatch) {
+    fastify.log.warn(
+      { from, to, fromBatch, toBatch },
+      'Cross-rate computed with rates from different fetch cycles',
+    );
+  }
+
   const rate = computeRate(from, to, cache.rates);
   computedRateCache.set(key, { rate, computedAt: now });
   return rate;
@@ -135,10 +155,14 @@ async function storeRateSnapshot(rates: Record<string, number>): Promise<void> {
     .exec();
 }
 
-function updateBaseRates(newRates: Record<string, number>): void {
-  cache = { rates: newRates, cachedAt: Date.now() };
+function updateBaseRates(updated: Record<string, number>, batchId: string): void {
+  for (const [currency, value] of Object.entries(updated)) {
+    cache.rates[currency] = value;
+    cache.batchIds[currency] = batchId;
+  }
+  cache.cachedAt = Date.now();
   computedRateCache.clear();
-  storeRateSnapshot(newRates).catch(() => {}); // Redis errors are non-fatal
+  storeRateSnapshot({ ...cache.rates }).catch(() => {}); // Redis errors are non-fatal
 }
 
 // ── Live rate refresh loop (issue #251) ────────────────────────────────────
@@ -249,10 +273,10 @@ async function refreshTick(): Promise<void> {
       try {
         const fetched = await fetchBaseRates();
         if (fetched) {
-          const merged: Record<string, number> = { ...cache.rates, ...fetched };
-          updateBaseRates(merged);
+          const batchId = randomUUID();
+          updateBaseRates(fetched, batchId);
           fastify.log.info(
-            { durationMs: lastRefresh?.durationMs, assets: Object.keys(fetched) },
+            { durationMs: lastRefresh?.durationMs, assets: Object.keys(fetched), rateBatchId: batchId },
             'FX rates refreshed',
           );
         } else {
@@ -284,7 +308,8 @@ async function refreshTick(): Promise<void> {
     fastify.log.warn('Stampede poll timed out; falling back to direct fetch');
     const fetched = await fetchBaseRates();
     if (fetched) {
-      updateBaseRates({ ...cache.rates, ...fetched });
+      const batchId = randomUUID();
+      updateBaseRates(fetched, batchId);
     } else if (fallbackStartTime === null) {
       fallbackStartTime = Date.now();
       fastify.log.warn('Entering fallback FX rate mode');
@@ -303,7 +328,7 @@ async function warmupCacheFromRedis(): Promise<void> {
     }
 
     const snapshot = JSON.parse(members[0]) as { ts: number; rates: Record<string, number> };
-    updateBaseRates(snapshot.rates);
+    updateBaseRates(snapshot.rates, randomUUID());
     computedRateCache.clear();
     fastify.log.info(
       { timestamp: new Date(snapshot.ts).toISOString(), rates: snapshot.rates },
@@ -371,6 +396,7 @@ interface StoredQuote {
   rate:        string;
   slippageBps: number;
   expiresAt:   number; // Unix ms — quote validity cutoff
+  rateBatchId: string;
 }
 
 const fastify = Fastify({
@@ -599,6 +625,7 @@ fastify.get(
     // Store quote so it can be verified later. If Redis is unavailable the
     // quote is still returned — clients just won't be able to call /verify.
     let quoteId: string | null = null;
+    const rateBatchId = cache.batchIds[from] ?? '';
     try {
       quoteId = randomUUID();
       const stored: StoredQuote = {
@@ -610,6 +637,7 @@ fastify.get(
         rate:        exchangeRate.toFixed(8),
         slippageBps: effectiveBps,
         expiresAt,
+        rateBatchId,
       };
       await redis.set(
         `${QUOTE_KEY_PREFIX}${quoteId}`,
@@ -633,6 +661,7 @@ fastify.get(
       slippageLimit,
       cachedAt:      new Date(cache.cachedAt).toISOString(),
       expiresAt:     new Date(expiresAt).toISOString(),
+      rateBatchId,
     };
   },
 );
@@ -775,6 +804,7 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
     const valid       = now <= stored.expiresAt;
     const currentRate = getOrComputeRate(stored.from, stored.to);
     const slippageBps = stored.slippageBps ?? env.DEFAULT_SLIPPAGE_BPS;
+    const rateBatchId = cache.batchIds[stored.from] ?? '';
 
     return {
       valid,
@@ -787,6 +817,7 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
       slippageBps,
       slippageLimit: (slippageBps / 10_000).toFixed(4),
       expiresAt:     new Date(stored.expiresAt).toISOString(),
+      rateBatchId,
     };
   },
 );

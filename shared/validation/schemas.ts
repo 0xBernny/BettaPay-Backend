@@ -137,7 +137,8 @@ export const fxQuoteSchema = z.object({
   fromCurrency: CurrencyCode,
   toCurrency: CurrencyCode,
   rate: z.string(),
-  expiresAt: isoDateString
+  expiresAt: isoDateString,
+  rateBatchId: z.string().uuid()
 });
 
 export const billPaymentSchema = z.object({
