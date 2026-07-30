@@ -465,6 +465,11 @@ export const SupportedAssetSchema = z.object({
 });
 export type SupportedAsset = z.infer<typeof SupportedAssetSchema>;
 
+export const RateOverrideBody = z.object({
+  rates: z.record(z.string(), z.number().positive()),
+});
+export type RateOverrideBody = z.infer<typeof RateOverrideBody>;
+
 export const CreateSupportedAssetBody = z.object({
   code: z.string().min(1),
   contractId: z.string().min(1),
@@ -492,6 +497,23 @@ export const PaginationQuery = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 export type PaginationQuery = z.infer<typeof PaginationQuery>;
+
+export const EventListQuery = PaginationQuery.extend({
+  type: z.string().optional(),
+  topic: z.string().optional(),
+  contractId: z.string().optional(),
+  fromLedger: z.coerce.number().int().min(1).optional(),
+  toLedger: z.coerce.number().int().min(1).optional(),
+}).refine(
+  (data) => {
+    if (data.fromLedger !== undefined && data.toLedger !== undefined) {
+      return data.fromLedger <= data.toLedger;
+    }
+    return true;
+  },
+  { message: "fromLedger must be <= toLedger" }
+);
+export type EventListQuery = z.infer<typeof EventListQuery>;
 
 export const SettlementListQuery = PaginationQuery.extend({
   status: z.enum(['pending', 'processing', 'completed', 'failed']).optional(),

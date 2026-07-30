@@ -1,22 +1,24 @@
+Pre-validate settlement requests before enqueuing to BullMQ
+Repo Avatar
+Betta-Pay/BettaPay-Backend
 Current behavior:
-Indexes on single columns — most common queries use sequential scans.
+Job enqueued immediately, merchant validation happens in worker (wastes queue capacity if invalid).
 
 Expected behavior:
-Add composite indexes:
+In HTTP handler, before enqueuing: check merchant exists (404), not deleted (422), not suspended (403), has fee config (422), and has not exceeded daily volume limit (429, optional).
 
-Payment(merchantId, status, createdAt DESC)
-Settlement(merchantId, status, initiatedAt DESC)
-IndexedEvent(contractId, ledger DESC)
-AuditLog(entityType, entityId, createdAt DESC)
-Use Prisma migration. Measure before/after with EXPLAIN ANALYZE.
 Files to modify:
 
-prisma/schema.prisma — add @@index directives
-New migration
+services/settlement-engine/src/index.ts — add pre-validation logic
+shared/validation/index.ts — add optional DAILY_SETTLEMENT_VOLUME_LIMIT
 Test requirements:
-Verify queries use the new indexes (via EXPLAIN ANALYZE in test output).
 
+Non-existent merchant — 404.
+Deleted merchant — 422.
+Suspended merchant — 403.
+No fee config — 422.
+Valid merchant — 201 + job enqueued.
 Acceptance criteria:
 
-All four composite indexes created.
-Query plans show index scans instead of sequential scans.
+Failed pre-validations return instantly, no queue consumed.
+Valid requests proceed to queue as before.
