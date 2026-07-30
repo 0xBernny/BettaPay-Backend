@@ -11,6 +11,8 @@
  *   GET    /api/merchants/:id        — fetch merchant (protected)
  *   DELETE /api/merchants/:id        — soft-delete merchant (protected)
  *   POST   /api/merchants/:id/restore — restore soft-deleted merchant (protected)
+ *   POST   /api/merchants/:id/suspend  — suspend merchant (service-auth, #317)
+ *   POST   /api/merchants/:id/unsuspend — unsuspend merchant (service-auth, #317)
  *   PATCH  /api/merchants/:id/settings — update merchant fee rules / settings (protected)
  *   POST   /api/payments             — initiate payment session (protected)
  *   GET    /api/payments/:id         — fetch payment session
@@ -1570,6 +1572,58 @@ fastify.delete<{ Params: { id: string } }>('/api/merchants/:id', {
           request,
           tx as unknown as Parameters<typeof logAuditEvent>[5],
         );
+
+        // Best-effort cascade: cancel initiated payments
+        try {
+          const initiatedPayments = await tx.payment.findMany({
+            where: { merchantId: id, status: "initiated" },
+          });
+          for (const payment of initiatedPayments) {
+            const cancelled = await tx.payment.update({
+              where: { id: payment.id },
+              data: { status: "cancelled" },
+            });
+            await logAuditEvent(
+              "payment.status.changed",
+              "payment",
+              payment.id,
+              { before: payment, after: cancelled },
+              request,
+              tx as unknown as Parameters<typeof logAuditEvent>[5],
+            );
+          }
+        } catch (err) {
+          request.log.error(
+            { err, merchantId: id },
+            "Failed to cancel initiated payments during merchant soft-delete",
+          );
+        }
+
+        // Best-effort cascade: fail pending settlements
+        try {
+          const pendingSettlements = await tx.settlement.findMany({
+            where: { merchantId: id, status: "pending" },
+          });
+          for (const settlement of pendingSettlements) {
+            const failed = await tx.settlement.update({
+              where: { id: settlement.id },
+              data: { status: "failed", completedAt: new Date() },
+            });
+            await logAuditEvent(
+              "settlement.status.changed",
+              "settlement",
+              settlement.id,
+              { before: settlement, after: failed },
+              request,
+              tx as unknown as Parameters<typeof logAuditEvent>[5],
+            );
+          }
+        } catch (err) {
+          request.log.error(
+            { err, merchantId: id },
+            "Failed to fail pending settlements during merchant soft-delete",
+          );
+        }
       });
 
       return reply.code(200).send({ success: true });

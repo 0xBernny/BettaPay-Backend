@@ -34,6 +34,7 @@ import {
   registerRequestId,
   registerServiceAuth,
   PaginationQuery,
+  EventListQuery,
   DateRangeQuery,
   EVENT_TYPES,
   WebhookUrlSchema,
@@ -108,12 +109,12 @@ fastify.register(cors, { origin: env.ALLOWED_ORIGINS });
 fastify.register(helmet, { contentSecurityPolicy: false });
 fastify.register(rateLimit, {
   max: 500,
-  timeWindow: '1 minute',
+  timeWindow: "1 minute",
   addHeaders: {
-    'x-ratelimit-limit': true,
-    'x-ratelimit-remaining': true,
-    'x-ratelimit-reset': true,
-    'retry-after': true,
+    "x-ratelimit-limit": true,
+    "x-ratelimit-remaining": true,
+    "x-ratelimit-reset": true,
+    "retry-after": true,
   },
 });
 registerErrorHandler(fastify);
@@ -133,21 +134,21 @@ fastify.register(rateLimit, {
 promClient.collectDefaultMetrics();
 
 const pollDurationHistogram = new promClient.Histogram({
-  name: 'indexer_poll_duration_seconds',
-  help: 'Duration of poll cycles',
+  name: "indexer_poll_duration_seconds",
+  help: "Duration of poll cycles",
   buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
 });
 
 const eventsFetchedCounter = new promClient.Counter({
-  name: 'indexer_events_fetched_total',
-  help: 'Total events fetched per contract',
-  labelNames: ['contractId'] as const,
+  name: "indexer_events_fetched_total",
+  help: "Total events fetched per contract",
+  labelNames: ["contractId"] as const,
 });
 
 const pollCyclesCounter = new promClient.Counter({
-  name: 'indexer_poll_cycles_total',
-  help: 'Total poll cycles by status',
-  labelNames: ['status'] as const,
+  name: "indexer_poll_cycles_total",
+  help: "Total poll cycles by status",
+  labelNames: ["status"] as const,
 });
 
 const metricsServer = startMetricsServer({
@@ -163,11 +164,35 @@ const BASE_BACKOFF = 1000;
 const MAX_BACKOFF = env.MAX_BACKOFF_INTERVAL_MS;
 let currentBackoff: number = BASE_BACKOFF;
 
+<<<<<<< HEAD
+// ── Shared Redis client ──────────────────────────────────────────────────────
+const sharedRedis = createRedisClient(env.REDIS_URL, fastify.log, { shared: true });
+fastify.addHook('onClose', async () => {
+  await sharedRedis.quit().catch(() => {});
+});
+=======
 const indexerPollBackoffGauge = new promClient.Gauge({
   name: "indexer_poll_backoff_ms",
   help: "Current indexer polling backoff interval in milliseconds",
 });
 indexerPollBackoffGauge.set(currentBackoff);
+
+// Issue #345 — Indexer lag metrics
+const indexerLagGauge = new promClient.Gauge({
+  name: "indexer_lag_ledgers",
+  help: "Number of ledgers the indexer is behind the network tip",
+  labelNames: ["contractId"] as const,
+});
+
+const indexerLastIndexedLedgerGauge = new promClient.Gauge({
+  name: "indexer_last_indexed_ledger",
+  help: "Last ledger sequence number indexed by the indexer",
+});
+
+const indexerNetworkTipLedgerGauge = new promClient.Gauge({
+  name: "indexer_network_tip_ledger",
+  help: "Current network tip ledger sequence number",
+});
 
 function parseRetryAfterMs(err: unknown): number | null {
   const status = (err as any)?.response?.status ?? (err as any)?.status;
@@ -221,12 +246,21 @@ const connectionParams = {
   port: parseInt(redisConn.port || "6379", 10),
   maxRetriesPerRequest: 3,
 };
+>>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
 
 // ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
 //
 // Queue name kept as 'indexer-webhooks' so any jobs already in Redis from the
 // previous inline implementation are picked up without data loss (migration
 // safety — see shared/webhook-delivery/index.ts for details).
+<<<<<<< HEAD
+export const webhookQueue = createWebhookQueue('indexer-webhooks', sharedRedis);
+const webhookWorker = createWebhookWorker('indexer-webhooks', sharedRedis, {
+  logger: {
+    info: (obj, msg) => fastify.log.info(obj, msg),
+    warn: (obj, msg) => fastify.log.warn(obj, msg),
+    error: (obj, msg) => fastify.log.error(obj, msg),
+=======
 export const webhookQueue = createWebhookQueue(
   "indexer-webhooks",
   connectionParams,
@@ -240,6 +274,7 @@ const webhookWorker = createWebhookWorker(
       warn: (obj, msg) => fastify.log.warn(obj, msg),
       error: (obj, msg) => fastify.log.error(obj, msg),
     },
+>>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
   },
 );
 const getActiveWebhookJob = trackActiveJob(webhookWorker);
@@ -247,7 +282,7 @@ const getActiveWebhookJob = trackActiveJob(webhookWorker);
 // ── Dead-letter queue (DLQ) for webhooks that exhaust all retries (#354) ─────
 const DLQ_QUEUE_NAME = "indexer-webhooks-dlq";
 const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
-  connection: connectionParams,
+  connection: sharedRedis,
   defaultJobOptions: {
     removeOnComplete: { count: 100 },
     removeOnFail: { count: 1000 },
@@ -281,6 +316,10 @@ webhookWorker.on("failed", async (job, err) => {
   }
 });
 
+<<<<<<< HEAD
+webhookWorker.on('error', (err) => {
+  fastify.log.error({ err: err.message }, '[Indexer] Webhook worker error');
+=======
 // #386 — exponential backoff retry strategy
 const redisHealth = createRedisClient(env.REDIS_URL, fastify.log);
 redisHealth.on("error", (err) =>
@@ -292,6 +331,7 @@ fastify.addHook("onClose", async () => {
 
 webhookWorker.on("error", (err) => {
   fastify.log.error({ err: err.message }, "[Indexer] Webhook worker error");
+>>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
 });
 webhookQueue.on("error", (err) => {
   fastify.log.error({ err: err.message }, "[Indexer] Webhook queue error");
@@ -299,8 +339,13 @@ webhookQueue.on("error", (err) => {
 
 // ── Replay queue & worker ─────────────────────────────────────────────────────
 
+<<<<<<< HEAD
+const replayQueue = new Queue('indexer-replays', {
+  connection: sharedRedis,
+=======
 const replayQueue = new Queue("indexer-replays", {
   connection: connectionParams,
+>>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
   defaultJobOptions: {
     attempts: 2,
     backoff: { type: "exponential", delay: 2000 },
@@ -309,6 +354,9 @@ const replayQueue = new Queue("indexer-replays", {
   },
 });
 
+<<<<<<< HEAD
+const PROGRESS_KEY_PREFIX = 'replay:progress:';
+=======
 // #386 — exponential backoff retry strategy
 const replayProgressRedis = createRedisClient(env.REDIS_URL, fastify.log);
 replayProgressRedis.on("error", (err) =>
@@ -319,6 +367,7 @@ replayProgressRedis.on("error", (err) =>
 );
 
 const PROGRESS_KEY_PREFIX = "replay:progress:";
+>>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
 
 async function updateReplayProgress(
   jobId: string,
@@ -330,7 +379,7 @@ async function updateReplayProgress(
   },
 ): Promise<void> {
   try {
-    await replayProgressRedis.set(
+    await sharedRedis.set(
       `${PROGRESS_KEY_PREFIX}${jobId}`,
       JSON.stringify(data),
       "EX",
@@ -344,8 +393,14 @@ async function updateReplayProgress(
 const replayWorker = new Worker(
   "indexer-replays",
   async (job) => {
-    type ReplayJobData = { fromLedger: number; toLedger: number };
-    const { fromLedger, toLedger } = job.data as ReplayJobData;
+    type ReplayJobData = {
+      fromLedger: number;
+      toLedger: number;
+      contractId?: string;
+      force?: boolean;
+    };
+    const { fromLedger, toLedger, contractId, force } =
+      job.data as ReplayJobData;
     const totalLedgers = toLedger - fromLedger + 1;
 
     await updateReplayProgress(job.id!, {
@@ -357,8 +412,28 @@ const replayWorker = new Worker(
     let processedLedgers = 0;
 
     try {
-      for (const contractId of CONTRACT_IDS) {
+      // If contractId is specified, only replay that contract; otherwise replay all
+      const contractsToReplay = contractId ? [contractId] : CONTRACT_IDS;
+
+      for (const targetContractId of contractsToReplay) {
         let cursor = fromLedger;
+
+        // If force=true, delete existing events in the range for this contract
+        if (force) {
+          await prisma.indexedEvent.deleteMany({
+            where: {
+              contractId: targetContractId,
+              ledger: {
+                gte: fromLedger,
+                lte: toLedger,
+              },
+            },
+          });
+          fastify.log.info(
+            { contractId: targetContractId, fromLedger, toLedger },
+            "[Indexer] Deleted existing events for forced replay",
+          );
+        }
 
         while (cursor <= toLedger) {
           const response = await server.getEvents({
@@ -366,7 +441,7 @@ const replayWorker = new Worker(
             filters: [
               {
                 type: "contract" as const,
-                contractIds: [contractId],
+                contractIds: [targetContractId],
                 topics: [],
               },
             ],
@@ -378,18 +453,22 @@ const replayWorker = new Worker(
           const stellarIds = response.events
             .map((evt) => (typeof evt.id === "string" ? evt.id : null))
             .filter((id): id is string => id !== null);
-          const existingStellarIds = new Set<string>(
-            stellarIds.length > 0
-              ? (
-                  await prisma.indexedEvent.findMany({
-                    where: { stellarId: { in: stellarIds } },
-                    select: { stellarId: true },
-                  })
-                )
-                  .map((e) => e.stellarId)
-                  .filter((id): id is string => id !== null)
-              : [],
-          );
+
+          // When force=false, check for existing events to skip
+          const existingStellarIds = force
+            ? new Set<string>()
+            : new Set<string>(
+                stellarIds.length > 0
+                  ? (
+                      await prisma.indexedEvent.findMany({
+                        where: { stellarId: { in: stellarIds } },
+                        select: { stellarId: true },
+                      })
+                    )
+                      .map((e) => e.stellarId)
+                      .filter((id): id is string => id !== null)
+                  : [],
+              );
 
           for (const evt of response.events) {
             if (evt.ledger > toLedger) break;
@@ -402,22 +481,25 @@ const replayWorker = new Worker(
             const decodedPayload = decodeScVal(evt.value, topics[0]);
             const resolvedContractId = evt.contractId
               ? evt.contractId.toString()
-              : contractId;
+              : targetContractId;
             const contractName = getContractName(resolvedContractId);
             const stellarId = typeof evt.id === "string" ? evt.id : null;
             const validationError = validatePayload(topics[0], decodedPayload);
 
-            if (stellarId) {
-              if (existingStellarIds.has(stellarId)) continue;
-            } else {
-              const existing = await prisma.indexedEvent.findFirst({
-                where: {
-                  ledger: evt.ledger,
-                  contractId: resolvedContractId,
-                  rawValue,
-                },
-              });
-              if (existing) continue;
+            // Skip if already indexed (when force=false)
+            if (!force) {
+              if (stellarId) {
+                if (existingStellarIds.has(stellarId)) continue;
+              } else {
+                const existing = await prisma.indexedEvent.findFirst({
+                  where: {
+                    ledger: evt.ledger,
+                    contractId: resolvedContractId,
+                    rawValue,
+                  },
+                });
+                if (existing) continue;
+              }
             }
 
             try {
@@ -495,7 +577,7 @@ const replayWorker = new Worker(
     }
   },
   {
-    connection: connectionParams,
+    connection: sharedRedis,
     concurrency: 1,
   },
 );
@@ -591,8 +673,13 @@ function validatePayload(type: string, payload: unknown): string | null {
   if (!schema) return null;
   const result = schema.safeParse(payload);
   if (!result.success) {
-    const msg = result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
-    fastify.log.warn({ type, validationError: msg }, '[Indexer] Event payload validation failed');
+    const msg = result.error.issues
+      .map((i) => `${i.path.join(".")}: ${i.message}`)
+      .join("; ");
+    fastify.log.warn(
+      { type, validationError: msg },
+      "[Indexer] Event payload validation failed",
+    );
     return msg;
   }
   return null;
@@ -682,7 +769,7 @@ export async function persistEvent(
 fastify.get("/api/health", async (_request, reply) => {
   const health = await buildIndexerHealthResponse({
     queryDatabase: () => prisma.$queryRaw`SELECT 1`,
-    pingRedis: () => redisHealth.ping(),
+    pingRedis: () => sharedRedis.ping(),
     getQueueJobCounts: () => webhookQueue.getJobCounts(),
     getQueueIsPaused: () => webhookQueue.isPaused(),
     getLatestLedger: () => server.getLatestLedger(),
@@ -703,18 +790,18 @@ fastify.get(
   "/api/events",
   { preValidation: [fastify.serviceAuth] },
   async (request) => {
-    const { limit, page } = PaginationQuery.parse(request.query ?? {});
-    const typeParam = (request.query as Record<string, unknown>)?.type as
-      | string
-      | undefined;
+    const { limit, page, type, topic, contractId, fromLedger, toLedger } =
+      EventListQuery.parse(request.query ?? {});
 
     const where: Record<string, unknown> = {};
-    if (typeParam) {
-      const requestedTypes = typeParam.split(",").map((t) => t.trim());
-      const validTypes = requestedTypes.filter((t): t is EventType =>
-        (EVENT_TYPES as readonly string[]).includes(t),
-      );
-      if (validTypes.length > 0) where.type = { in: validTypes };
+    if (type) where.type = type;
+    if (topic) where.topics = { has: topic };
+    if (contractId) where.contractId = contractId;
+    if (fromLedger !== undefined || toLedger !== undefined) {
+      const ledgerFilter: Record<string, number> = {};
+      if (fromLedger !== undefined) ledgerFilter.gte = fromLedger;
+      if (toLedger !== undefined) ledgerFilter.lte = toLedger;
+      where.ledger = ledgerFilter;
     }
 
     const [dbEvents, total] = await Promise.all([
@@ -744,6 +831,17 @@ const ReplayBody = z
   })
   .refine((d) => d.fromLedger <= d.toLedger, {
     message: "fromLedger must be <= toLedger",
+  });
+
+// Issue #343 — per-contract replay body
+const PerContractReplayBody = z
+  .object({
+    startLedger: z.number().int().min(1),
+    endLedger: z.number().int().min(1),
+    force: z.boolean().optional().default(false),
+  })
+  .refine((d) => d.startLedger <= d.endLedger, {
+    message: "startLedger must be <= endLedger",
   });
 
 fastify.post(
@@ -782,15 +880,82 @@ fastify.post(
   },
 );
 
+// Issue #343 — per-contract replay endpoint
+fastify.post<{ Params: { contractId: string }; Body: unknown }>(
+  "/api/events/replay/contract/:contractId",
+  {
+    config: {
+      rateLimit: {
+        max: 60,
+        timeWindow: "1 minute",
+      },
+    },
+  },
+  async (request, reply) => {
+    const { contractId } = request.params;
+
+    // Validate that the contract ID is in the monitored list
+    if (!CONTRACT_IDS.includes(contractId)) {
+      return reply.code(422).send({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: `Contract ID ${contractId} is not monitored by this indexer`,
+          details: { contractId, monitoredContracts: CONTRACT_IDS },
+        },
+      });
+    }
+
+    const { startLedger, endLedger, force } = PerContractReplayBody.parse(
+      request.body,
+    );
+
+    const range = endLedger - startLedger;
+    if (range > MAX_REPLAY_LEDGER_RANGE) {
+      return reply.code(400).send({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
+          details: {
+            startLedger,
+            endLedger,
+            maxRange: MAX_REPLAY_LEDGER_RANGE,
+          },
+        },
+      });
+    }
+
+    const job = await replayQueue.add("replay-contract", {
+      contractId,
+      fromLedger: startLedger,
+      toLedger: endLedger,
+      force,
+    });
+
+    return reply.code(202).send({
+      jobId: job.id,
+      status: "queued",
+      contractId,
+      startLedger,
+      endLedger,
+      force,
+      range,
+    });
+  },
+);
+
 // Issue #229 — replay job progress status
 fastify.get<{ Params: { jobId: string } }>(
   "/api/events/replay/:jobId/status",
   async (request, reply) => {
     const { jobId } = request.params;
     try {
+<<<<<<< HEAD
+      const raw = await sharedRedis.get(`${PROGRESS_KEY_PREFIX}${jobId}`);
+=======
       const raw = await replayProgressRedis.get(
         `${PROGRESS_KEY_PREFIX}${jobId}`,
       );
+>>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
       if (!raw) {
         return reply.code(404).send({
           error: {
@@ -818,7 +983,7 @@ fastify.get<{ Params: { jobId: string } }>(
 
 // Issue #346 — cleanup trigger with optional dry-run
 fastify.post(
-  '/api/events/cleanup',
+  "/api/events/cleanup",
   {
     preValidation: [fastify.serviceAuth],
   },
@@ -829,7 +994,7 @@ fastify.post(
       return reply.code(200).send(dryResult);
     }
     const deletedCount = await cleanupOldEvents();
-    return reply.code(200).send({ status: 'completed', deletedCount });
+    return reply.code(200).send({ status: "completed", deletedCount });
   },
 );
 
@@ -993,7 +1158,7 @@ async function pollEvents() {
     if (cursor === undefined) {
       currentBackoff = BASE_BACKOFF;
       pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
-      pollCyclesCounter.inc({ status: 'success' });
+      pollCyclesCounter.inc({ status: "success" });
       setTimeout(pollEvents, currentBackoff);
       return;
     }
@@ -1075,6 +1240,25 @@ async function pollEvents() {
       }
     }
 
+    // Issue #345 — Update lag metrics after each poll cycle
+    if (latestLedgerSequence !== undefined) {
+      indexerNetworkTipLedgerGauge.set(latestLedgerSequence);
+      const currentLag =
+        latestLedgerSequence - (latestLedgerCursor ?? latestLedgerSequence);
+      for (const contractId of CONTRACT_IDS) {
+        indexerLagGauge.set({ contractId }, currentLag);
+      }
+    } else {
+      // Network tip unavailable — set lag to -1
+      for (const contractId of CONTRACT_IDS) {
+        indexerLagGauge.set({ contractId }, -1);
+      }
+    }
+
+    if (latestLedgerCursor !== undefined) {
+      indexerLastIndexedLedgerGauge.set(latestLedgerCursor);
+    }
+
     calculateBackoffAfterSuccess();
     pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
     pollCyclesCounter.inc({ status: "success" });
@@ -1113,18 +1297,30 @@ export function buildCleanupWhere(
  * When `EVENT_RETENTION_DAYS` is 0 (the default), cleanup is disabled and the
  * function returns 0 immediately.
  */
-export async function cleanupOldEvents(dryRun?: boolean): Promise<number | CleanupDryRunResult> {
+export async function cleanupOldEvents(
+  dryRun?: boolean,
+): Promise<number | CleanupDryRunResult> {
   const retentionDays = env.EVENT_RETENTION_DAYS;
   const where = buildCleanupWhere(retentionDays, new Date());
   if (!where) {
-    if (dryRun) return { wouldDelete: 0, totalSizeBytes: 0, retentionDays: 0, oldestEventDate: '' };
+    if (dryRun)
+      return {
+        wouldDelete: 0,
+        totalSizeBytes: 0,
+        retentionDays: 0,
+        oldestEventDate: "",
+      };
     return 0;
   }
 
   if (dryRun) {
     const [count, oldest, sizeResult] = await Promise.all([
       prisma.indexedEvent.count({ where }),
-      prisma.indexedEvent.findFirst({ where, orderBy: { indexedAt: 'asc' }, select: { indexedAt: true } }),
+      prisma.indexedEvent.findFirst({
+        where,
+        orderBy: { indexedAt: "asc" },
+        select: { indexedAt: true },
+      }),
       prisma.$queryRawUnsafe<Array<{ total_bytes: bigint }>>(
         `SELECT COALESCE(SUM(pg_column_size(t.*)), 0) as total_bytes FROM "IndexedEvent" t WHERE t."indexedAt" < $1`,
         where.indexedAt.lt,
@@ -1135,7 +1331,7 @@ export async function cleanupOldEvents(dryRun?: boolean): Promise<number | Clean
       wouldDelete: count,
       totalSizeBytes,
       retentionDays,
-      oldestEventDate: oldest?.indexedAt.toISOString() ?? '',
+      oldestEventDate: oldest?.indexedAt.toISOString() ?? "",
     };
   }
 
@@ -1143,7 +1339,9 @@ export async function cleanupOldEvents(dryRun?: boolean): Promise<number | Clean
   return count;
 }
 
-export async function runCleanupJob(data?: { dryRun?: boolean }): Promise<void> {
+export async function runCleanupJob(data?: {
+  dryRun?: boolean;
+}): Promise<void> {
   const dryRun = data?.dryRun ?? false;
   try {
     const result = await cleanupOldEvents(dryRun);

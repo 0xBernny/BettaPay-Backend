@@ -18,6 +18,7 @@ export const MOCK_MERCHANT_ACTIVE = {
   name: 'BettaPay Active Merchant LLC',
   ownerId: 'owner-user-active-01',
   deletedAt: null,
+  status: 'active' as const,
   settings: {
     feeBps: 100,
     autoSettle: true,
@@ -34,6 +35,7 @@ export const MOCK_MERCHANT_DELETED = {
   name: 'BettaPay Soft-Deleted Merchant LLC',
   ownerId: 'owner-user-deleted-02',
   deletedAt: new Date('2026-01-01T00:00:00.000Z'),
+  status: 'active' as const,
   settings: {},
   secretHash: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
 };
@@ -44,6 +46,7 @@ export const MOCK_MERCHANT_ZERO_FEES = {
   name: 'Zero Fees Micro-Merchant',
   ownerId: 'owner-user-zero-fees-03',
   deletedAt: null,
+  status: 'active' as const,
   settings: {
     feeBps: 0,
     autoSettle: false,
@@ -61,6 +64,7 @@ export const MOCK_MERCHANT_HIGH_VOLUME = {
   name: 'High Volume Enterprise Corp',
   ownerId: 'owner-user-enterprise-04',
   deletedAt: null,
+  status: 'active' as const,
   settings: {
     feeBps: 500, // 5% fee
     autoSettle: true,
@@ -70,6 +74,13 @@ export const MOCK_MERCHANT_HIGH_VOLUME = {
     dailySettlementLimit: '500000.00',
   },
   secretHash: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+};
+
+// #317 — Merchant suspended via /api/merchants/:id/suspend. Existing data must
+// remain readable; only the `status: 'suspended'` flag blocks new transactions.
+export const MOCK_MERCHANT_SUSPENDED = {
+  ...MOCK_MERCHANT_ACTIVE,
+  status: 'suspended' as const,
 };
 
 export const MOCK_PAYMENT_INITIATED = {

@@ -100,11 +100,11 @@ registerRequestId(fastify);
 setupPrismaQueryLogging(prisma, fastify.log);
 startPrismaPoolMetricsCollector(pool, promClient.register, 10000, fastify.log, promClient);
 
-// #386 — exponential backoff retry strategy
-const redis = createRedisClient(env.REDIS_URL, fastify.log);
+// Shared Redis client (use createRedisClient factory with connection sharing)
+const redis = createRedisClient(env.REDIS_URL, fastify.log, { shared: true });
 
 fastify.addHook('onClose', async () => {
-  await redis.quit();
+  await redis.quit().catch(() => {});
 });
 
 fastify.register(cors, {
@@ -129,24 +129,10 @@ registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
 
-// #386 — BullMQ connection also uses exponential backoff
-const redisConnection = new URL(env.REDIS_URL);
-const connectionParams = {
-  host: redisConnection.hostname,
-  port: parseInt(redisConnection.port || '6379', 10),
-  maxRetriesPerRequest: env.REDIS_MAX_RETRIES,
-  enableReadyCheck: false,
-  retryStrategy: (attempt: number) => {
-    const delay = Math.min(Math.pow(2, attempt) * 100, 5_000);
-    fastify.log.warn({ attempt, delayMs: delay }, 'BullMQ Redis connection retry');
-    return delay;
-  },
-};
-
 // ── Settlement processing queue ────────────────────────────────────────────────
 
 const settlementQueue = new Queue('settlements', {
-  connection: connectionParams,
+  connection: redis,
   defaultJobOptions: {
     attempts: 3,
     backoff: { type: 'exponential', delay: 2000 },
@@ -154,7 +140,7 @@ const settlementQueue = new Queue('settlements', {
     removeOnFail: { count: 5000 },
   },
 });
-const settlementDLQ = new Queue('settlements-dlq', { connection: connectionParams });
+const settlementDLQ = new Queue('settlements-dlq', { connection: redis });
 
 // ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
 //
@@ -167,23 +153,18 @@ const settlementDLQ = new Queue('settlements-dlq', { connection: connectionParam
 // Migration note: the previous sendWebhookWithRetries had no persistence, so
 // there are no in-flight webhook jobs to migrate.  The queue name
 // 'settlement-webhooks' is fresh.
-const webhookQueue = createWebhookQueue('settlement-webhooks', connectionParams);
-const webhookWorker = createWebhookWorker('settlement-webhooks', connectionParams, {
+const webhookQueue = createWebhookQueue('settlement-webhooks', redis);
+const webhookWorker = createWebhookWorker('settlement-webhooks', redis, {
   logger: {
     info: (obj, msg) => fastify.log.info(obj, msg),
     warn: (obj, msg) => fastify.log.warn(obj, msg),
     error: (obj, msg) => fastify.log.error(obj, msg),
   },
+  redis,
 });
 const getActiveWebhookJob = trackActiveJob(webhookWorker);
 
 // ── Metrics ─────────────────────────────────────────────────────────────────
-const feeFallbackCounter = new promClient.Counter({
-  name: 'settlement_fee_fallback_total',
-  help: 'Total number of times fee resolution fell back to the default rate due to malformed settings',
-  labelNames: ['merchant_id'],
-});
-
 const settlementDelayCounter = new promClient.Counter({
   name: 'settlement_semaphore_delay_total',
   help: 'Total number of settlements delayed due to per-merchant concurrency limit',
@@ -321,6 +302,7 @@ const worker = new Worker('settlements', async job => {
     if (updatedSettlement.webhookUrl) {
       await webhookQueue.add('deliver', {
         url: updatedSettlement.webhookUrl,
+        eventId: crypto.randomUUID(),
         event: { event: 'settlement.completed', data: updatedSettlement as unknown as Record<string, unknown> },
       });
     }
@@ -336,6 +318,7 @@ const worker = new Worker('settlements', async job => {
       // Best-effort enqueue — don't let a queue error mask the original failure.
       await webhookQueue.add('deliver', {
         url: updatedSettlement.webhookUrl,
+        eventId: crypto.randomUUID(),
         event: { event: 'settlement.failed', data: updatedSettlement as unknown as Record<string, unknown> },
       }).catch((err: unknown) => {
         log.error({ err, settlementId }, 'Failed to enqueue failure webhook');
@@ -349,19 +332,27 @@ const worker = new Worker('settlements', async job => {
     }
   }
 }, {
-  connection: connectionParams,
+  connection: redis,
   concurrency: 5,
+  timeout: env.SETTLEMENT_JOB_TIMEOUT_MS,
 });
 
 const getActiveSettlementJob = trackActiveJob(worker);
 
 worker.on('failed', async (job, err) => {
   if (job) {
+    const processedOn = job.processedOn ? job.processedOn : undefined;
+    const durationMs = processedOn !== undefined ? Date.now() - processedOn : undefined;
+
     fastify.log.error({
       jobId: job.id,
       settlementId: job.data.id,
+      merchantId: job.data.merchantId,
+      durationMs,
       attempt: job.attemptsMade,
       error: err.message,
+      jobName: job.name,
+      queueName: 'settlements',
     }, 'Job failed after all retries, moving to DLQ');
 
     await settlementDLQ.add(job.name, job.data, {
@@ -763,24 +754,47 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     }
 
     const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
-    const parsedFeeRule = FeeRule.passthrough().safeParse(merchant?.settings);
-    let feeBps = env.FEES_DEFAULT_BPS;
-    let maxFeeBps: number | undefined;
-    let maxFeeThreshold: string | undefined;
-    
-    if (parsedFeeRule.success) {
-      feeBps = parsedFeeRule.data.feeBps;
-      const settings = parsedFeeRule.data as Record<string, unknown>;
-      maxFeeBps = settings.maxFeeBps as number | undefined;
-      maxFeeThreshold = settings.maxFeeThreshold as string | undefined;
-    } else {
-      feeFallbackCounter.inc({ merchant_id: d.merchantId });
-      fastify.log.warn({
-        merchantId: d.merchantId,
-        rawSettings: merchant?.settings,
-        issues: parsedFeeRule.error?.issues
-      }, '[Settlement] FeeRule parsing failed, falling back to FEES_DEFAULT_BPS');
+
+    // ── Pre-validation ──────────────────────────────────────────────────────
+    if (!merchant) {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     }
+    if (merchant.deletedAt) {
+      return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
+    }
+    if (merchant.kycStatus === 'rejected') {
+      return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Merchant is suspended'));
+    }
+
+    const parsedFeeRule = FeeRule.passthrough().safeParse(merchant.settings);
+    if (!parsedFeeRule.success) {
+      return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant has no fee configuration'));
+    }
+
+    // Optional daily volume limit check
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const volumeResult = await prisma.$queryRaw<[{ sum: string | null }]>`
+      SELECT COALESCE(SUM(CAST("totalAmount" AS DECIMAL)), 0)::text as sum
+      FROM "Settlement"
+      WHERE "merchantId" = ${d.merchantId}
+      AND "initiatedAt" >= ${todayStart}
+    `;
+    const currentDailyTotal = volumeResult?.[0]?.sum ? parseFloat(volumeResult[0].sum) : 0;
+    const requestAmount = parseFloat(d.amount);
+    const dailyLimit = env.DAILY_SETTLEMENT_VOLUME_LIMIT;
+    if (currentDailyTotal + requestAmount > dailyLimit) {
+      return reply.code(429).send(createErrorResponse(
+        ErrorCodes.RATE_LIMITED,
+        'Daily settlement volume limit exceeded',
+        { current: currentDailyTotal, requested: requestAmount, limit: dailyLimit },
+      ));
+    }
+
+    let feeBps = parsedFeeRule.data.feeBps;
+    const settings = parsedFeeRule.data as Record<string, unknown>;
+    const maxFeeBps = settings.maxFeeBps as number | undefined;
+    const maxFeeThreshold = settings.maxFeeThreshold as string | undefined;
     const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
 
     // Fetch monthly volume for volume-based fee discount (#323).
@@ -894,6 +908,12 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
     if (!merchant) {
       return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+    }
+    if (merchant.deletedAt) {
+      return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
+    }
+    if (merchant.kycStatus === 'rejected') {
+      return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Merchant is suspended'));
     }
 
     const settings = merchant.settings as {

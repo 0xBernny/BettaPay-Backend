@@ -46,18 +46,9 @@ export const ErrorCodes = {
   INVALID_QUERY: 'INVALID_QUERY',
   INVALID_ORIGIN: 'INVALID_ORIGIN',
   CONCURRENCY_EXCEEDED: 'CONCURRENCY_EXCEEDED',
-  UNAUTHORIZED: "UNAUTHORIZED",
-  NOT_FOUND: "NOT_FOUND",
-  VALIDATION_ERROR: "VALIDATION_ERROR",
-  INVALID_REQUEST: "INVALID_REQUEST",
-  REQUEST_TIMEOUT: "REQUEST_TIMEOUT",
-  GATEWAY_TIMEOUT: "GATEWAY_TIMEOUT",
-  INTERNAL_ERROR: "INTERNAL_ERROR",
-  UNSUPPORTED_CURRENCY_PAIR: "UNSUPPORTED_CURRENCY_PAIR",
-  INVALID_AMOUNT: "INVALID_AMOUNT",
-  INVALID_QUERY: "INVALID_QUERY",
-  INVALID_ORIGIN: "INVALID_ORIGIN",
-  CONCURRENCY_EXCEEDED: "CONCURRENCY_EXCEEDED",
+  // #317 — returned when a suspended merchant attempts to create a payment
+  // or settlement. Distinct from INVALID_REQUEST so clients can branch on it.
+  MERCHANT_SUSPENDED: 'MERCHANT_SUSPENDED',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -211,6 +202,11 @@ export const EnvSchema = z.object({
   // Database — required; services crash fast if not provided
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
 
+  // Read-replica database — optional; if provided, Prisma routes read queries
+  // (findMany, findFirst, count, aggregate) to this URL while writes go to DATABASE_URL.
+  // When absent a warning is logged and all queries use the primary database.
+  DATABASE_READ_REPLICA_URL: z.string().optional(),
+
   // Connection pool — limits concurrent DB connections and prevents
   // connection exhaustion under burst traffic. Pool timeout ensures
   // a stalled query does not block the entire service indefinitely.
@@ -289,6 +285,22 @@ export const EnvSchema = z.object({
     .transform((s) => parseInt(s, 10))
     .default("60000"),
 
+  // FX Engine — circuit breaker cooldown before probing CoinGecko again
+  // after 5 consecutive failures. Default: 5 minutes.
+  CIRCUIT_BREAKER_COOLDOWN_MS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("300000"),
+
+  // FX Engine — maximum allowed deviation (in basis points) between the
+  // current cached rate and a newly fetched rate. When the deviation
+  // exceeds this threshold the new rate is rejected, the old rate is
+  // preserved, and a warning is logged. Default: 2000 bps = 20%.
+  MAX_DEVIATION_BPS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("2000"),
+
   // FX Engine — slippage tolerance (basis points; 100 bps = 1%)
   DEFAULT_SLIPPAGE_BPS: z
     .string()
@@ -298,6 +310,22 @@ export const EnvSchema = z.object({
     .string()
     .transform((s) => parseInt(s, 10))
     .default("500"),
+
+  // FX Engine — quote age validation
+  QUOTE_MIN_AGE_MS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("1000")
+    .refine((val) => Number.isFinite(val) && val > 0, {
+      message: "QUOTE_MIN_AGE_MS must be a positive integer",
+    }),
+  QUOTE_MAX_LIFETIME_MS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("300000")
+    .refine((val) => Number.isFinite(val) && val > 0, {
+      message: "QUOTE_MAX_LIFETIME_MS must be a positive integer",
+    }),
 
   // Indexer — lag warning threshold (number of ledgers behind the Stellar tip)
   INDEXER_LAG_WARN_THRESHOLD: z
@@ -342,6 +370,14 @@ export const EnvSchema = z.object({
     .string()
     .transform((s) => parseInt(s, 10))
     .default("2"),
+
+  // Settlement Engine — optional daily volume limit for pre-validation.
+  // When set, the settlement engine rejects settlement creation requests
+  // that would exceed this limit within a single day (UTC). Default: 100000.
+  DAILY_SETTLEMENT_VOLUME_LIMIT: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("100000"),
 });
 
 export type Env = Omit<

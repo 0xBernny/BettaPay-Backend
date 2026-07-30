@@ -69,6 +69,9 @@ export const merchantSchema = z.object({
   ownerId: StellarAddressSchema,
   createdAt: isoDateString,
   deletedAt: isoDateString.optional(),
+  // #317 — suspension status; 'active' by default. Suspended merchants cannot
+  // create payments or settlements, but existing data remains readable.
+  status: z.enum(['active', 'suspended']).default('active'),
   settings: z.record(z.any()).optional()
 });
 
@@ -139,6 +142,8 @@ export const fxQuoteSchema = z.object({
   rate: z.string(),
   expiresAt: isoDateString,
   rateBatchId: z.string().uuid()
+  slippageBps: z.number().int().min(0).optional(),
+  expiresAt: isoDateString
 });
 
 export const billPaymentSchema = z.object({
@@ -213,11 +218,6 @@ export const eventSchemas = z.discriminatedUnion('type', [
   anchorSettledEvent
 ]);
 
-export const AmountString = z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string');
-export const PositiveAmountString = AmountString.refine((value) => parseFloat(value) > 0, {
-  message: 'Amount must be greater than zero',
-});
-
 // Export types inferred from schemas
 export type User = z.infer<typeof userSchema>;
 export type Merchant = z.infer<typeof merchantSchema>;
@@ -229,8 +229,6 @@ export type FXQuote = z.infer<typeof fxQuoteSchema>;
 export type BillPayment = z.infer<typeof billPaymentSchema>;
 export type AnchorTransfer = z.infer<typeof anchorTransferSchema>;
 export type EventPayloads = z.infer<typeof eventSchemas>;
-export type AmountString = z.infer<typeof AmountString>;
-export type PositiveAmountString = z.infer<typeof PositiveAmountString>;
 
 // Convenience parsers
 export function parseEvent(raw: unknown) {
@@ -374,14 +372,6 @@ export const AuthIpScoreQuery = z.object({
   ip: z.string().min(1, 'ip is required'),
 });
 
-export const WalletVerifyBody = z.object({
-  address: StellarAddressSchema,
-  nonce: z.string().min(1, 'nonce is required').max(512, 'nonce is too long'),
-  signature: z.string().min(1, 'signature is required'),
-  challenge: z.string().min(1).optional(),
-  message: z.string().min(1).optional(),
-});
-
 export const WebhookTestStatus = z.enum(['success', 'failed']);
 
 export const WebhookTestPayloadSchema = z.object({
@@ -480,6 +470,11 @@ export const SupportedAssetSchema = z.object({
 });
 export type SupportedAsset = z.infer<typeof SupportedAssetSchema>;
 
+export const RateOverrideBody = z.object({
+  rates: z.record(z.string(), z.number().positive()),
+});
+export type RateOverrideBody = z.infer<typeof RateOverrideBody>;
+
 export const CreateSupportedAssetBody = z.object({
   code: z.string().min(1),
   contractId: z.string().min(1),
@@ -507,6 +502,23 @@ export const PaginationQuery = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 export type PaginationQuery = z.infer<typeof PaginationQuery>;
+
+export const EventListQuery = PaginationQuery.extend({
+  type: z.string().optional(),
+  topic: z.string().optional(),
+  contractId: z.string().optional(),
+  fromLedger: z.coerce.number().int().min(1).optional(),
+  toLedger: z.coerce.number().int().min(1).optional(),
+}).refine(
+  (data) => {
+    if (data.fromLedger !== undefined && data.toLedger !== undefined) {
+      return data.fromLedger <= data.toLedger;
+    }
+    return true;
+  },
+  { message: "fromLedger must be <= toLedger" }
+);
+export type EventListQuery = z.infer<typeof EventListQuery>;
 
 export const SettlementListQuery = PaginationQuery.extend({
   status: z.enum(['pending', 'processing', 'completed', 'failed']).optional(),
@@ -544,7 +556,6 @@ export type CreateSettlementBody = z.infer<typeof CreateSettlementBody>;
 export type BulkSettlementBody = z.infer<typeof BulkSettlementBody>;
 export type AuthTokenBody = z.infer<typeof AuthTokenBody>;
 export type AuthIpScoreQuery = z.infer<typeof AuthIpScoreQuery>;
-export type WalletVerifyBody = z.infer<typeof WalletVerifyBody>;
 export type WebhookTestStatus = z.infer<typeof WebhookTestStatus>;
 export type WebhookTestPayload = z.infer<typeof WebhookTestPayloadSchema>;
 export type WebhookTestResult = z.infer<typeof WebhookTestResultSchema>;

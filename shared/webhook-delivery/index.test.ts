@@ -27,6 +27,7 @@ import {
   WEBHOOK_DEFAULTS,
   type WebhookJobData,
   type WebhookLogger,
+  type DedupRedis,
 } from './index.js';
 import { Queue, Worker } from 'bullmq';
 
@@ -180,6 +181,7 @@ test('createWebhookQueue — default job options use exponential back-off', (t) 
 function extractProcessor(
   fetchImpl: typeof fetch,
   loggerOverride?: WebhookLogger,
+  redisOverride?: DedupRedis,
 ): ((job: FakeJob) => Promise<void>) | null {
   let captured: ((job: FakeJob) => Promise<void>) | null = null;
 
@@ -216,6 +218,7 @@ function extractProcessor(
       fetchImpl,
       logger: loggerOverride,
       concurrency: 1,
+      redis: redisOverride,
     });
 
     // BullMQ Worker stores the processor internally — access it via cast.
@@ -576,7 +579,124 @@ test('worker processor — no X-BettaPay-Signature when signingSecret absent', a
   t.end();
 });
 
-// ── Part 7: DLQ support (removeOnFail: false) ───────────────────────────────
+// ── Part 7: Webhook deduplication (Redis SET NX) ──────────────────────────
+
+test('worker processor — deliver webhook records eventId in Redis', async (t) => {
+  let redisKey = '';
+  let redisValue = '';
+  let redisMode = '';
+  let redisDuration = '';
+  let redisFlag = '';
+
+  const mockRedis: DedupRedis = {
+    set: async (key, value, mode, duration, flag) => {
+      redisKey = key;
+      redisValue = value;
+      redisMode = mode;
+      redisDuration = duration;
+      redisFlag = flag;
+      return 'OK';
+    },
+  };
+
+  const mockFetch: typeof fetch = async () => ({ ok: true, status: 200 } as Response);
+
+  const processor = extractProcessor(mockFetch, undefined, mockRedis);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — dedup test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    eventId: 'evt_123',
+  });
+
+  await processor(job as any);
+
+  t.equal(redisKey, 'webhook_sent:evt_123', 'uses webhook_sent:{eventId} key');
+  t.equal(redisValue, '1', 'sets value to 1');
+  t.equal(redisMode, 'PX', 'uses PX mode');
+  t.equal(redisDuration, '3600000', 'TTL is 3600000 ms (1 hour)');
+  t.equal(redisFlag, 'NX', 'uses NX flag');
+  t.end();
+});
+
+test('worker processor — duplicate eventId is skipped and warning logged', async (t) => {
+  const logs: Array<{ level: string; obj: Record<string, unknown>; msg: string }> = [];
+  const logger: WebhookLogger = {
+    info: (obj, msg) => logs.push({ level: 'info', obj, msg }),
+    warn: (obj, msg) => logs.push({ level: 'warn', obj, msg }),
+    error: (obj, msg) => logs.push({ level: 'error', obj, msg }),
+  };
+
+  let callCount = 0;
+  const mockRedis: DedupRedis = {
+    set: async () => {
+      callCount++;
+      return null; // NX fails — key already exists
+    },
+  };
+
+  const mockFetch: typeof fetch = async () => {
+    throw new Error('should not be called');
+  };
+
+  const processor = extractProcessor(mockFetch, logger, mockRedis);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — dedup skip test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    eventId: 'evt_dup',
+  });
+
+  await processor(job as any);
+
+  t.equal(callCount, 1, 'Redis set was called once');
+  const warnLogs = logs.filter((l) => l.level === 'warn');
+  t.ok(warnLogs.length >= 1, 'warning log emitted');
+  t.ok(warnLogs.some((l) => l.msg.includes('Duplicate')), 'warning mentions duplicate');
+  t.end();
+});
+
+test('worker processor — Redis unavailable delivers anyway (fail-open)', async (t) => {
+  let delivered = false;
+  const mockRedis: DedupRedis = {
+    set: async () => { throw new Error('ECONNREFUSED'); },
+  };
+
+  const mockFetch: typeof fetch = async () => {
+    delivered = true;
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch, undefined, mockRedis);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — fail-open test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    eventId: 'evt_failopen',
+  });
+
+  await processor(job as any);
+
+  t.ok(delivered, 'webhook was delivered despite Redis being down');
+  t.end();
+});
+
+// ── Part 8: DLQ support (removeOnFail: false) ───────────────────────────────
 
 test('createWebhookQueue — removeOnFail: false keeps all failed jobs', (t) => {
   let threw = false;
