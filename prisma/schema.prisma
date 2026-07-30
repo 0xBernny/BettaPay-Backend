@@ -20,12 +20,11 @@ enum SettlementStatus {
   failed
 }
 
-// #317 — intermediate suspended state without data deletion. New merchants
-// default to 'active'; suspending flips to 'suspended' and blocks creation
-// of new payments and settlements while keeping existing data readable.
-enum MerchantStatus {
-  active
-  suspended
+enum KycStatus {
+  unverified
+  pending
+  verified
+  rejected
 }
 
 model Merchant {
@@ -39,6 +38,7 @@ model Merchant {
   status      MerchantStatus  @default(active)
   settings    Json?
   secretHash  String?
+  kycStatus   KycStatus    @default(unverified)
   payments    Payment[]
   settlements Settlement[]
 
@@ -67,6 +67,8 @@ model Payment {
   fxRate                  String?
   fxQuoteId               String?
   fxQuoteExpiresAt        DateTime?
+
+  @@index([merchantId, status, createdAt(sort: Desc)])
 }
 
 model Settlement {
@@ -91,26 +93,35 @@ model Settlement {
   // Fee audit snapshot — records the exact fee parameters used at settlement
   // time for forensic analysis of historical fees (#330).
   feeSnapshot             Json?
+  // Retry mechanism (#322) — links to the new settlement that supersedes this one
+  supersededById          String?
+  supersededBy            Settlement?      @relation("SettlementRetry", fields: [supersededById], references: [id], onDelete: SetNull)
+  supersedes              Settlement[]     @relation("SettlementRetry")
 
   @@index([initiatedAt(sort: Desc)])
   @@index([merchantId, initiatedAt(sort: Desc)])
+  @@index([merchantId, status, initiatedAt(sort: Desc)])
+  @@index([supersededById])
 }
 
 model IndexedEvent {
-  id             String   @id
-  stellarId      String?  @unique
-  contractId     String
-  contractName   String?
-  topics         String[]
-  type           String
-  rawValue       String
-  decodedPayload Json?
-  ledger         Int
-  indexedAt      DateTime @default(now())
+  id               String   @id
+  stellarId        String?
+  contractId       String
+  contractName     String?
+  topics           String[]
+  type             String
+  rawValue         String
+  decodedPayload   Json?
+  validationError  String?
+  ledger           Int
+  indexedAt        DateTime @default(now())
 
+  @@unique([stellarId, contractId, ledger])
   @@index([ledger])
   @@index([type])
   @@index([contractId])
+  @@index([contractId, ledger(sort: Desc)])
   @@index([indexedAt])
 }
 
@@ -134,6 +145,7 @@ model AuditLog {
   createdAt  DateTime @default(now())
 
   @@index([entityType])
+  @@index([entityType, entityId, createdAt(sort: Desc)])
   @@index([action])
   @@index([createdAt])
   @@index([entityId])

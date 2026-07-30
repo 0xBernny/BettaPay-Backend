@@ -222,7 +222,7 @@ test('valid credentials return JWT', async (t) => {
 
     const payload = app.jwt.decode(body.token) as any;
     t.equal(payload.merchantId, merchantId, 'JWT contains correct merchant ID');
-    t.equal(payload.ownerId, 'user-1', 'JWT contains correct owner ID');
+    t.equal(payload.ownerId, ownerId, 'JWT contains correct owner ID');
   } catch (err: any) {
     t.fail(err);
   } finally {
