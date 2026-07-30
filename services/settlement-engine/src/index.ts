@@ -334,17 +334,25 @@ const worker = new Worker('settlements', async job => {
 }, {
   connection: redis,
   concurrency: 5,
+  timeout: env.SETTLEMENT_JOB_TIMEOUT_MS,
 });
 
 const getActiveSettlementJob = trackActiveJob(worker);
 
 worker.on('failed', async (job, err) => {
   if (job) {
+    const processedOn = job.processedOn ? job.processedOn : undefined;
+    const durationMs = processedOn !== undefined ? Date.now() - processedOn : undefined;
+
     fastify.log.error({
       jobId: job.id,
       settlementId: job.data.id,
+      merchantId: job.data.merchantId,
+      durationMs,
       attempt: job.attemptsMade,
       error: err.message,
+      jobName: job.name,
+      queueName: 'settlements',
     }, 'Job failed after all retries, moving to DLQ');
 
     await settlementDLQ.add(job.name, job.data, {
