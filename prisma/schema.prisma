@@ -28,11 +28,14 @@ enum KycStatus {
 }
 
 model Merchant {
-  id          String       @id
+  id          String          @id
   name        String
   ownerId     String
-  createdAt   DateTime     @default(now())
+  createdAt   DateTime        @default(now())
   deletedAt   DateTime?
+  // #317 — Merchant suspension status. Existing rows are backfilled to
+  // 'active' by the add_merchant_status migration.
+  status      MerchantStatus  @default(active)
   settings    Json?
   secretHash  String?
   kycStatus   KycStatus    @default(unverified)
@@ -40,6 +43,7 @@ model Merchant {
   settlements Settlement[]
 
   @@unique([ownerId])
+  @@index([status])
 }
 
 model Payment {

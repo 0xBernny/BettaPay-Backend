@@ -1335,6 +1335,21 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
 
     const stored = JSON.parse(raw) as StoredQuote;
     const now = Date.now();
+
+    // Quote age validation
+    const createdAt = stored.expiresAt - QUOTE_TTL_MS;
+    const quoteAge = now - createdAt;
+    if (quoteAge < env.QUOTE_MIN_AGE_MS) {
+      return reply
+        .code(400)
+        .send(createErrorResponse(ErrorCodes.QUOTE_TOO_YOUNG, "Quote too young"));
+    }
+    if (quoteAge > env.QUOTE_MAX_LIFETIME_MS) {
+      return reply
+        .code(400)
+        .send(createErrorResponse(ErrorCodes.QUOTE_TOO_OLD, "Quote too old"));
+    }
+
     const currentRate = getOrComputeRate(stored.from, stored.to);
     const slippageBps = stored.slippageBps ?? env.DEFAULT_SLIPPAGE_BPS;
     const quotedRate = parseFloat(stored.rate);

@@ -46,6 +46,9 @@ export const ErrorCodes = {
   INVALID_QUERY: 'INVALID_QUERY',
   INVALID_ORIGIN: 'INVALID_ORIGIN',
   CONCURRENCY_EXCEEDED: 'CONCURRENCY_EXCEEDED',
+  // #317 — returned when a suspended merchant attempts to create a payment
+  // or settlement. Distinct from INVALID_REQUEST so clients can branch on it.
+  MERCHANT_SUSPENDED: 'MERCHANT_SUSPENDED',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -307,6 +310,22 @@ export const EnvSchema = z.object({
     .string()
     .transform((s) => parseInt(s, 10))
     .default("500"),
+
+  // FX Engine — quote age validation
+  QUOTE_MIN_AGE_MS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("1000")
+    .refine((val) => Number.isFinite(val) && val > 0, {
+      message: "QUOTE_MIN_AGE_MS must be a positive integer",
+    }),
+  QUOTE_MAX_LIFETIME_MS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("300000")
+    .refine((val) => Number.isFinite(val) && val > 0, {
+      message: "QUOTE_MAX_LIFETIME_MS must be a positive integer",
+    }),
 
   // Indexer — lag warning threshold (number of ledgers behind the Stellar tip)
   INDEXER_LAG_WARN_THRESHOLD: z

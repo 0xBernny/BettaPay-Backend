@@ -100,11 +100,11 @@ registerRequestId(fastify);
 setupPrismaQueryLogging(prisma, fastify.log);
 startPrismaPoolMetricsCollector(pool, promClient.register, 10000, fastify.log, promClient);
 
-// #386 — exponential backoff retry strategy
-const redis = createRedisClient(env.REDIS_URL, fastify.log);
+// Shared Redis client (use createRedisClient factory with connection sharing)
+const redis = createRedisClient(env.REDIS_URL, fastify.log, { shared: true });
 
 fastify.addHook('onClose', async () => {
-  await redis.quit();
+  await redis.quit().catch(() => {});
 });
 
 fastify.register(cors, {
@@ -129,24 +129,10 @@ registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
 
-// #386 — BullMQ connection also uses exponential backoff
-const redisConnection = new URL(env.REDIS_URL);
-const connectionParams = {
-  host: redisConnection.hostname,
-  port: parseInt(redisConnection.port || '6379', 10),
-  maxRetriesPerRequest: env.REDIS_MAX_RETRIES,
-  enableReadyCheck: false,
-  retryStrategy: (attempt: number) => {
-    const delay = Math.min(Math.pow(2, attempt) * 100, 5_000);
-    fastify.log.warn({ attempt, delayMs: delay }, 'BullMQ Redis connection retry');
-    return delay;
-  },
-};
-
 // ── Settlement processing queue ────────────────────────────────────────────────
 
 const settlementQueue = new Queue('settlements', {
-  connection: connectionParams,
+  connection: redis,
   defaultJobOptions: {
     attempts: 3,
     backoff: { type: 'exponential', delay: 2000 },
@@ -154,7 +140,7 @@ const settlementQueue = new Queue('settlements', {
     removeOnFail: { count: 5000 },
   },
 });
-const settlementDLQ = new Queue('settlements-dlq', { connection: connectionParams });
+const settlementDLQ = new Queue('settlements-dlq', { connection: redis });
 
 // ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
 //
@@ -167,8 +153,8 @@ const settlementDLQ = new Queue('settlements-dlq', { connection: connectionParam
 // Migration note: the previous sendWebhookWithRetries had no persistence, so
 // there are no in-flight webhook jobs to migrate.  The queue name
 // 'settlement-webhooks' is fresh.
-const webhookQueue = createWebhookQueue('settlement-webhooks', connectionParams);
-const webhookWorker = createWebhookWorker('settlement-webhooks', connectionParams, {
+const webhookQueue = createWebhookQueue('settlement-webhooks', redis);
+const webhookWorker = createWebhookWorker('settlement-webhooks', redis, {
   logger: {
     info: (obj, msg) => fastify.log.info(obj, msg),
     warn: (obj, msg) => fastify.log.warn(obj, msg),
@@ -346,19 +332,27 @@ const worker = new Worker('settlements', async job => {
     }
   }
 }, {
-  connection: connectionParams,
+  connection: redis,
   concurrency: 5,
+  timeout: env.SETTLEMENT_JOB_TIMEOUT_MS,
 });
 
 const getActiveSettlementJob = trackActiveJob(worker);
 
 worker.on('failed', async (job, err) => {
   if (job) {
+    const processedOn = job.processedOn ? job.processedOn : undefined;
+    const durationMs = processedOn !== undefined ? Date.now() - processedOn : undefined;
+
     fastify.log.error({
       jobId: job.id,
       settlementId: job.data.id,
+      merchantId: job.data.merchantId,
+      durationMs,
       attempt: job.attemptsMade,
       error: err.message,
+      jobName: job.name,
+      queueName: 'settlements',
     }, 'Job failed after all retries, moving to DLQ');
 
     await settlementDLQ.add(job.name, job.data, {

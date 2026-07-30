@@ -69,6 +69,9 @@ export const merchantSchema = z.object({
   ownerId: StellarAddressSchema,
   createdAt: isoDateString,
   deletedAt: isoDateString.optional(),
+  // #317 — suspension status; 'active' by default. Suspended merchants cannot
+  // create payments or settlements, but existing data remains readable.
+  status: z.enum(['active', 'suspended']).default('active'),
   settings: z.record(z.any()).optional()
 });
 
