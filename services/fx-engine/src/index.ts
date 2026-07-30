@@ -804,6 +804,46 @@ registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
 
+// ── Rate staleness helpers ───────────────────────────────────────────────────
+
+function getRateSource(): "live" | "seed" {
+  return lastSuccessfulFetch !== null ? "live" : "seed";
+}
+
+function logRateStalenessIfStale(
+  log: { warn: (obj: object, msg: string) => void; error: (obj: object, msg: string) => void },
+  pair?: string,
+): void {
+  const now = Date.now();
+  const stalenessSeconds = Math.floor((now - cache.cachedAt) / 1000);
+  if (stalenessSeconds <= env.MAX_STALE_SECONDS) return;
+
+  const source = getRateSource();
+  const baseFields = {
+    source,
+    rateTimestamp: new Date(cache.cachedAt).toISOString(),
+    stalenessSeconds,
+    threshold: env.MAX_STALE_SECONDS,
+  };
+  const pairFields = pair ? { ...baseFields, currencyPair: pair } : baseFields;
+
+  if (source === "live") {
+    log.warn(
+      pairFields,
+      pair
+        ? `Stale rate served for ${pair} (${stalenessSeconds}s old, source: live)`
+        : `Stale rates served (${stalenessSeconds}s old, source: live)`,
+    );
+  } else {
+    log.error(
+      pairFields,
+      pair
+        ? `Stale rate served for ${pair} (${stalenessSeconds}s old, source: seed)`
+        : `Stale rates served (${stalenessSeconds}s old, source: seed)`,
+    );
+  }
+}
+
 fastify.get("/api/health", async (_request, reply) => {
   const health = await buildFxEngineHealthResponse({
     pingRedis: () => redis.ping(),
@@ -892,6 +932,7 @@ fastify.get("/api/health", async (_request, reply) => {
 });
 
 fastify.get("/api/rates", async (_request, _reply) => {
+  logRateStalenessIfStale(fastify.log);
   return {
     rates: cache.rates,
     updatedAt: new Date(cache.cachedAt).toISOString(),
@@ -941,6 +982,23 @@ fastify.get(
           : 0,
     };
 
+    // Per-pair rate staleness
+    const now = Date.now();
+    const stalenessSeconds = Math.floor((now - cache.cachedAt) / 1000);
+    const source = getRateSource();
+    const rateStaleness: Record<
+      string,
+      { source: "live" | "seed"; lastUpdated: string; stalenessSeconds: number; stale: boolean }
+    > = {};
+    for (const currency of Object.keys(cache.rates)) {
+      rateStaleness[currency] = {
+        source,
+        lastUpdated: new Date(cache.cachedAt).toISOString(),
+        stalenessSeconds,
+        stale: stalenessSeconds > env.MAX_STALE_SECONDS,
+      };
+    }
+
     return {
       mode: inFallback ? "fallback" : "live",
       lastSuccessfulFetch: lastSuccessfulFetch
@@ -954,6 +1012,7 @@ fastify.get(
       warmup: warmupStats,
       currentRates: cache.rates,
       updatedAt: new Date(cache.cachedAt).toISOString(),
+      rateStaleness,
     };
   },
 );
@@ -1107,6 +1166,7 @@ fastify.get(
       Date.now() - cachedRate.computedAt < RATE_TTL_MS;
 
     const exchangeRate = getOrComputeRate(from, to);
+    logRateStalenessIfStale(fastify.log, `${from}_${to}`);
     const targetAmount = amount * exchangeRate;
     const expiresAt = Date.now() + QUOTE_TTL_MS;
 
