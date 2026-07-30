@@ -46,6 +46,9 @@ export const ErrorCodes = {
   INVALID_QUERY: 'INVALID_QUERY',
   INVALID_ORIGIN: 'INVALID_ORIGIN',
   CONCURRENCY_EXCEEDED: 'CONCURRENCY_EXCEEDED',
+  // #317 — returned when a suspended merchant attempts to create a payment
+  // or settlement. Distinct from INVALID_REQUEST so clients can branch on it.
+  MERCHANT_SUSPENDED: 'MERCHANT_SUSPENDED',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];

@@ -11,6 +11,8 @@
  *   GET    /api/merchants/:id        — fetch merchant (protected)
  *   DELETE /api/merchants/:id        — soft-delete merchant (protected)
  *   POST   /api/merchants/:id/restore — restore soft-deleted merchant (protected)
+ *   POST   /api/merchants/:id/suspend  — suspend merchant (service-auth, #317)
+ *   POST   /api/merchants/:id/unsuspend — unsuspend merchant (service-auth, #317)
  *   PATCH  /api/merchants/:id/settings — update merchant fee rules / settings (protected)
  *   POST   /api/payments             — initiate payment session (protected)
  *   GET    /api/payments/:id         — fetch payment session
