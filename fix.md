@@ -1,18 +1,24 @@
+Pre-validate settlement requests before enqueuing to BullMQ
+Repo Avatar
+Betta-Pay/BettaPay-Backend
 Current behavior:
-Single DATABASE_URL for all queries — reads contend with writes.
+Job enqueued immediately, merchant validation happens in worker (wastes queue capacity if invalid).
 
 Expected behavior:
-Add DATABASE_READ_REPLICA_URL env var. If set, configure Prisma to route reads (findMany, findFirst, count, aggregate) to replica and writes (create, update, delete) to primary using @prisma/extension-read-replicas. Log warning if no replica configured.
+In HTTP handler, before enqueuing: check merchant exists (404), not deleted (422), not suspended (403), has fee config (422), and has not exceeded daily volume limit (429, optional).
 
 Files to modify:
 
-shared/validation/prisma.ts — configure read replicas
-.env.example — document new variable
+services/settlement-engine/src/index.ts — add pre-validation logic
+shared/validation/index.ts — add optional DAILY_SETTLEMENT_VOLUME_LIMIT
 Test requirements:
 
-With replica URL — reads go to replica, writes to primary.
-Without replica URL — all queries to primary, warning logged.
+Non-existent merchant — 404.
+Deleted merchant — 422.
+Suspended merchant — 403.
+No fee config — 422.
+Valid merchant — 201 + job enqueued.
 Acceptance criteria:
 
-Read replica support with zero code changes to service handlers.
-Falls back to primary if no replica conf
+Failed pre-validations return instantly, no queue consumed.
+Valid requests proceed to queue as before.

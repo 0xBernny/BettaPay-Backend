@@ -34,6 +34,7 @@ import {
   registerRequestId,
   registerServiceAuth,
   PaginationQuery,
+  EventListQuery,
   DateRangeQuery,
   EVENT_TYPES,
   WebhookUrlSchema,
@@ -758,18 +759,18 @@ fastify.get(
   "/api/events",
   { preValidation: [fastify.serviceAuth] },
   async (request) => {
-    const { limit, page } = PaginationQuery.parse(request.query ?? {});
-    const typeParam = (request.query as Record<string, unknown>)?.type as
-      | string
-      | undefined;
+    const { limit, page, type, topic, contractId, fromLedger, toLedger } =
+      EventListQuery.parse(request.query ?? {});
 
     const where: Record<string, unknown> = {};
-    if (typeParam) {
-      const requestedTypes = typeParam.split(",").map((t) => t.trim());
-      const validTypes = requestedTypes.filter((t): t is EventType =>
-        (EVENT_TYPES as readonly string[]).includes(t),
-      );
-      if (validTypes.length > 0) where.type = { in: validTypes };
+    if (type) where.type = type;
+    if (topic) where.topics = { has: topic };
+    if (contractId) where.contractId = contractId;
+    if (fromLedger !== undefined || toLedger !== undefined) {
+      const ledgerFilter: Record<string, number> = {};
+      if (fromLedger !== undefined) ledgerFilter.gte = fromLedger;
+      if (toLedger !== undefined) ledgerFilter.lte = toLedger;
+      where.ledger = ledgerFilter;
     }
 
     const [dbEvents, total] = await Promise.all([

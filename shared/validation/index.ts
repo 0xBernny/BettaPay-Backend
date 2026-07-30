@@ -46,22 +46,6 @@ export const ErrorCodes = {
   INVALID_QUERY: 'INVALID_QUERY',
   INVALID_ORIGIN: 'INVALID_ORIGIN',
   CONCURRENCY_EXCEEDED: 'CONCURRENCY_EXCEEDED',
-  QUOTE_TOO_YOUNG: 'QUOTE_TOO_YOUNG',
-  QUOTE_TOO_OLD: 'QUOTE_TOO_OLD',
-  UNAUTHORIZED: "UNAUTHORIZED",
-  NOT_FOUND: "NOT_FOUND",
-  VALIDATION_ERROR: "VALIDATION_ERROR",
-  INVALID_REQUEST: "INVALID_REQUEST",
-  REQUEST_TIMEOUT: "REQUEST_TIMEOUT",
-  GATEWAY_TIMEOUT: "GATEWAY_TIMEOUT",
-  INTERNAL_ERROR: "INTERNAL_ERROR",
-  UNSUPPORTED_CURRENCY_PAIR: "UNSUPPORTED_CURRENCY_PAIR",
-  INVALID_AMOUNT: "INVALID_AMOUNT",
-  INVALID_QUERY: "INVALID_QUERY",
-  INVALID_ORIGIN: "INVALID_ORIGIN",
-  CONCURRENCY_EXCEEDED: "CONCURRENCY_EXCEEDED",
-  QUOTE_TOO_YOUNG: "QUOTE_TOO_YOUNG",
-  QUOTE_TOO_OLD: "QUOTE_TOO_OLD",
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -305,6 +289,15 @@ export const EnvSchema = z.object({
     .transform((s) => parseInt(s, 10))
     .default("300000"),
 
+  // FX Engine — maximum allowed deviation (in basis points) between the
+  // current cached rate and a newly fetched rate. When the deviation
+  // exceeds this threshold the new rate is rejected, the old rate is
+  // preserved, and a warning is logged. Default: 2000 bps = 20%.
+  MAX_DEVIATION_BPS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("2000"),
+
   // FX Engine — slippage tolerance (basis points; 100 bps = 1%)
   DEFAULT_SLIPPAGE_BPS: z
     .string()
@@ -375,22 +368,14 @@ export const EnvSchema = z.object({
     .transform((s) => parseInt(s, 10))
     .default("2"),
 
-  // Settlement Engine — worker job timeout (ms). Jobs exceeding this duration
-  // are automatically failed by BullMQ. Default: 30000 (30 seconds).
-  SETTLEMENT_JOB_TIMEOUT_MS: z
+  // Settlement Engine — optional daily volume limit for pre-validation.
+  // When set, the settlement engine rejects settlement creation requests
+  // that would exceed this limit within a single day (UTC). Default: 100000.
+  DAILY_SETTLEMENT_VOLUME_LIMIT: z
     .string()
     .transform((s) => parseInt(s, 10))
-    .default("30000")
-    .refine((val) => Number.isFinite(val) && val > 0, {
-      message: "SETTLEMENT_JOB_TIMEOUT_MS must be a positive integer",
-    }),
-}).refine(
-  (data) => data.QUOTE_MIN_AGE_MS < data.QUOTE_MAX_LIFETIME_MS,
-  {
-    message: "QUOTE_MIN_AGE_MS must be less than QUOTE_MAX_LIFETIME_MS",
-    path: ["QUOTE_MIN_AGE_MS"],
-  },
-);
+    .default("100000"),
+});
 
 export type Env = Omit<
   z.infer<typeof EnvSchema>,
