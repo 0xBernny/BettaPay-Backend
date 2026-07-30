@@ -311,6 +311,22 @@ export const EnvSchema = z.object({
     .transform((s) => parseInt(s, 10))
     .default("500"),
 
+  // FX Engine — quote age validation
+  QUOTE_MIN_AGE_MS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("1000")
+    .refine((val) => Number.isFinite(val) && val > 0, {
+      message: "QUOTE_MIN_AGE_MS must be a positive integer",
+    }),
+  QUOTE_MAX_LIFETIME_MS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("300000")
+    .refine((val) => Number.isFinite(val) && val > 0, {
+      message: "QUOTE_MAX_LIFETIME_MS must be a positive integer",
+    }),
+
   // Indexer — lag warning threshold (number of ledgers behind the Stellar tip)
   INDEXER_LAG_WARN_THRESHOLD: z
     .string()
