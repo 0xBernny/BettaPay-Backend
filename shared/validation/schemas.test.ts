@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert';
+import fc from 'fast-check';
 import {
   AmountString,
   CreateMerchantBody,
@@ -14,6 +15,9 @@ import {
   merchantSchema,
   paymentSchema,
   walletSchema,
+  PAYMENT_STATUS_TRANSITIONS,
+  SETTLEMENT_STATUS_TRANSITIONS,
+  isValidTransition,
 } from './schemas.js';
 
 const VALID_STELLAR_PUBLIC_KEY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
@@ -44,6 +48,64 @@ test('UpdateMerchantSettingsBody webhookUrl validation', async (t) => {
     const result = UpdateMerchantSettingsBody.safeParse({ webhookUrl: long });
     assert.strictEqual(result.success, false);
   });
+});
+
+// ─── Property-based tests for state machine transitions ─────────────────────
+test('property: payment status transitions are valid and terminal states are absorbing', async () => {
+  const paymentStates = Object.keys(PAYMENT_STATUS_TRANSITIONS);
+
+  fc.assert(
+    fc.property(
+      fc.constantFrom(...paymentStates),
+      fc.array(fc.constantFrom(...paymentStates), { maxLength: 20 }),
+      (start, seq) => {
+        let cur = start;
+        for (const target of seq) {
+          const allowed = PAYMENT_STATUS_TRANSITIONS[cur] ?? [];
+          const valid = isValidTransition(PAYMENT_STATUS_TRANSITIONS, cur, target);
+          if (valid !== allowed.includes(target)) return false;
+          if (valid) cur = target;
+          // If current is terminal, ensure no transitions are accepted
+          const curAllowed = PAYMENT_STATUS_TRANSITIONS[cur] ?? [];
+          if (curAllowed.length === 0) {
+            for (const s of paymentStates) {
+              if (isValidTransition(PAYMENT_STATUS_TRANSITIONS, cur, s)) return false;
+            }
+          }
+        }
+        return true;
+      }
+    ),
+    { numRuns: 1000 }
+  );
+});
+
+test('property: settlement status transitions are valid and terminal states are absorbing', async () => {
+  const settlementStates = Object.keys(SETTLEMENT_STATUS_TRANSITIONS);
+
+  fc.assert(
+    fc.property(
+      fc.constantFrom(...settlementStates),
+      fc.array(fc.constantFrom(...settlementStates), { maxLength: 20 }),
+      (start, seq) => {
+        let cur = start;
+        for (const target of seq) {
+          const allowed = SETTLEMENT_STATUS_TRANSITIONS[cur] ?? [];
+          const valid = isValidTransition(SETTLEMENT_STATUS_TRANSITIONS, cur, target);
+          if (valid !== allowed.includes(target)) return false;
+          if (valid) cur = target;
+          const curAllowed = SETTLEMENT_STATUS_TRANSITIONS[cur] ?? [];
+          if (curAllowed.length === 0) {
+            for (const s of settlementStates) {
+              if (isValidTransition(SETTLEMENT_STATUS_TRANSITIONS, cur, s)) return false;
+            }
+          }
+        }
+        return true;
+      }
+    ),
+    { numRuns: 1000 }
+  );
 });
 
 test('PaginationQuery validation', async (t) => {
