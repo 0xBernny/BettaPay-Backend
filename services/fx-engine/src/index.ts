@@ -67,10 +67,14 @@ const SUPPORTED_CURRENCIES = Object.keys(FALLBACK_RATES);
 
 interface RateCache {
   rates: Record<string, number>;
+  batchIds: Record<string, string>;
   cachedAt: number; // Unix ms timestamp
 }
 
+const initialBatchId = randomUUID();
 let cache: RateCache = {
+  rates:    { ...FALLBACK_RATES },
+  batchIds: Object.fromEntries(Object.keys(FALLBACK_RATES).map((c) => [c, initialBatchId])),
   rates: { ...FALLBACK_RATES },
   cachedAt: Date.now(),
 };
@@ -111,6 +115,23 @@ function getOrComputeRate(from: string, to: string): number {
     return entry.rate;
   }
 
+  const fromBatch = cache.batchIds[from];
+  const toBatch   = cache.batchIds[to];
+
+  if (!fromBatch) {
+    throw new Error(`No rate batch information for ${from}`);
+  }
+  if (!toBatch) {
+    throw new Error(`No rate batch information for ${to}`);
+  }
+
+  if (fromBatch !== toBatch) {
+    fastify.log.warn(
+      { from, to, fromBatch, toBatch },
+      'Cross-rate computed with rates from different fetch cycles',
+    );
+  }
+
   const rate = computeRate(from, to, cache.rates);
   computedRateCache.set(key, { rate, computedAt: now });
   return rate;
@@ -140,10 +161,14 @@ async function storeRateSnapshot(rates: Record<string, number>): Promise<void> {
     .exec();
 }
 
-function updateBaseRates(newRates: Record<string, number>): void {
-  cache = { rates: newRates, cachedAt: Date.now() };
+function updateBaseRates(updated: Record<string, number>, batchId: string): void {
+  for (const [currency, value] of Object.entries(updated)) {
+    cache.rates[currency] = value;
+    cache.batchIds[currency] = batchId;
+  }
+  cache.cachedAt = Date.now();
   computedRateCache.clear();
-  storeRateSnapshot(newRates).catch(() => {}); // Redis errors are non-fatal
+  storeRateSnapshot({ ...cache.rates }).catch(() => {}); // Redis errors are non-fatal
 }
 
 // ── Live rate refresh loop (issue #251) ────────────────────────────────────
@@ -395,6 +420,11 @@ async function refreshTick(): Promise<void> {
       try {
         const fetched = await fetchBaseRates();
         if (fetched) {
+          const batchId = randomUUID();
+          updateBaseRates(fetched, batchId);
+          fastify.log.info(
+            { durationMs: lastRefresh?.durationMs, assets: Object.keys(fetched), rateBatchId: batchId },
+            'FX rates refreshed',
           const maxDeviationBps = env.MAX_DEVIATION_BPS;
           const merged: Record<string, number> = { ...cache.rates };
           const rejected: string[] = [];
@@ -465,6 +495,11 @@ async function refreshTick(): Promise<void> {
     fastify.log.warn("Stampede poll timed out; falling back to direct fetch");
     const fetched = await fetchBaseRates();
     if (fetched) {
+      const batchId = randomUUID();
+      updateBaseRates(fetched, batchId);
+    } else if (fallbackStartTime === null) {
+      fallbackStartTime = Date.now();
+      fastify.log.warn('Entering fallback FX rate mode');
       const maxDeviationBps = env.MAX_DEVIATION_BPS;
       const merged: Record<string, number> = { ...cache.rates };
       const rejected: string[] = [];
@@ -575,6 +610,8 @@ async function warmupCacheFromRedis(): Promise<void> {
       return;
     }
 
+    const snapshot = JSON.parse(members[0]) as { ts: number; rates: Record<string, number> };
+    updateBaseRates(snapshot.rates, randomUUID());
     // If all rates for all currencies were discarded, trigger immediate fetch
     if (Object.keys(validatedRates).length === 0) {
       fastify.log.warn(
@@ -702,6 +739,8 @@ interface StoredQuote {
   result: string;
   rate: string;
   slippageBps: number;
+  expiresAt:   number; // Unix ms — quote validity cutoff
+  rateBatchId: string;
   expiresAt: number; // Unix ms — quote validity cutoff
 }
 
@@ -804,6 +843,46 @@ registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
 
+// ── Rate staleness helpers ───────────────────────────────────────────────────
+
+function getRateSource(): "live" | "seed" {
+  return lastSuccessfulFetch !== null ? "live" : "seed";
+}
+
+function logRateStalenessIfStale(
+  log: { warn: (obj: object, msg: string) => void; error: (obj: object, msg: string) => void },
+  pair?: string,
+): void {
+  const now = Date.now();
+  const stalenessSeconds = Math.floor((now - cache.cachedAt) / 1000);
+  if (stalenessSeconds <= env.MAX_STALE_SECONDS) return;
+
+  const source = getRateSource();
+  const baseFields = {
+    source,
+    rateTimestamp: new Date(cache.cachedAt).toISOString(),
+    stalenessSeconds,
+    threshold: env.MAX_STALE_SECONDS,
+  };
+  const pairFields = pair ? { ...baseFields, currencyPair: pair } : baseFields;
+
+  if (source === "live") {
+    log.warn(
+      pairFields,
+      pair
+        ? `Stale rate served for ${pair} (${stalenessSeconds}s old, source: live)`
+        : `Stale rates served (${stalenessSeconds}s old, source: live)`,
+    );
+  } else {
+    log.error(
+      pairFields,
+      pair
+        ? `Stale rate served for ${pair} (${stalenessSeconds}s old, source: seed)`
+        : `Stale rates served (${stalenessSeconds}s old, source: seed)`,
+    );
+  }
+}
+
 fastify.get("/api/health", async (_request, reply) => {
   const health = await buildFxEngineHealthResponse({
     pingRedis: () => redis.ping(),
@@ -892,6 +971,7 @@ fastify.get("/api/health", async (_request, reply) => {
 });
 
 fastify.get("/api/rates", async (_request, _reply) => {
+  logRateStalenessIfStale(fastify.log);
   return {
     rates: cache.rates,
     updatedAt: new Date(cache.cachedAt).toISOString(),
@@ -941,6 +1021,23 @@ fastify.get(
           : 0,
     };
 
+    // Per-pair rate staleness
+    const now = Date.now();
+    const stalenessSeconds = Math.floor((now - cache.cachedAt) / 1000);
+    const source = getRateSource();
+    const rateStaleness: Record<
+      string,
+      { source: "live" | "seed"; lastUpdated: string; stalenessSeconds: number; stale: boolean }
+    > = {};
+    for (const currency of Object.keys(cache.rates)) {
+      rateStaleness[currency] = {
+        source,
+        lastUpdated: new Date(cache.cachedAt).toISOString(),
+        stalenessSeconds,
+        stale: stalenessSeconds > env.MAX_STALE_SECONDS,
+      };
+    }
+
     return {
       mode: inFallback ? "fallback" : "live",
       lastSuccessfulFetch: lastSuccessfulFetch
@@ -954,6 +1051,7 @@ fastify.get(
       warmup: warmupStats,
       currentRates: cache.rates,
       updatedAt: new Date(cache.cachedAt).toISOString(),
+      rateStaleness,
     };
   },
 );
@@ -1107,12 +1205,14 @@ fastify.get(
       Date.now() - cachedRate.computedAt < RATE_TTL_MS;
 
     const exchangeRate = getOrComputeRate(from, to);
+    logRateStalenessIfStale(fastify.log, `${from}_${to}`);
     const targetAmount = amount * exchangeRate;
     const expiresAt = Date.now() + QUOTE_TTL_MS;
 
     // Store quote so it can be verified later. If Redis is unavailable the
     // quote is still returned — clients just won't be able to call /verify.
     let quoteId: string | null = null;
+    const rateBatchId = cache.batchIds[from] ?? '';
     try {
       quoteId = randomUUID();
       const stored: StoredQuote = {
@@ -1124,6 +1224,7 @@ fastify.get(
         rate: exchangeRate.toFixed(8),
         slippageBps: effectiveBps,
         expiresAt,
+        rateBatchId,
       };
       await redis.set(
         `${QUOTE_KEY_PREFIX}${quoteId}`,
@@ -1155,6 +1256,9 @@ fastify.get(
       rate: exchangeRate.toFixed(8),
       slippageBps: effectiveBps,
       slippageLimit,
+      cachedAt:      new Date(cache.cachedAt).toISOString(),
+      expiresAt:     new Date(expiresAt).toISOString(),
+      rateBatchId,
       cachedAt: new Date(cache.cachedAt).toISOString(),
       expiresAt: new Date(expiresAt).toISOString(),
     };
@@ -1352,6 +1456,7 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
 
     const currentRate = getOrComputeRate(stored.from, stored.to);
     const slippageBps = stored.slippageBps ?? env.DEFAULT_SLIPPAGE_BPS;
+    const rateBatchId = cache.batchIds[stored.from] ?? '';
     const quotedRate = parseFloat(stored.rate);
 
     // Fail-open: if market rate is unavailable (fallback mode), accept by expiry
@@ -1374,6 +1479,8 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
       currentRate: currentRate.toFixed(8),
       slippageBps,
       slippageLimit: (slippageBps / 10_000).toFixed(4),
+      expiresAt:     new Date(stored.expiresAt).toISOString(),
+      rateBatchId,
       expiresAt: new Date(stored.expiresAt).toISOString(),
     };
   },
