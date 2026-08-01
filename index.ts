@@ -72,6 +72,7 @@ const PORT = Number(process.env.PORT ?? '3001');
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
+
 const pool = new pg.Pool({
   connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
   max: env.DATABASE_POOL_SIZE,
@@ -87,6 +88,7 @@ type SettlementJobData = {
   asset: string;
   traceId?: string;
 };
+
 
 type SettlementRecord = NonNullable<Awaited<ReturnType<typeof prisma.settlement.findUnique>>>;
 
@@ -124,6 +126,7 @@ fastify.register(rateLimit, {
     },
   }),
 });
+
 
 registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
