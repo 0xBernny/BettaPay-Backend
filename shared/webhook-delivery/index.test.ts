@@ -263,7 +263,7 @@ test('worker processor — delivers successfully on 2xx response', async (t) => 
 
   t.notOk(threw, 'processor should not throw on 2xx response');
   t.equal(calledUrl, 'https://merchant.example/hook', 'POSTs to the correct URL');
-  t.same(calledBody, { event: { type: 'settlement.completed' } }, 'sends event wrapped in { event }');
+  t.same(calledBody, { version: '1.0', event: { type: 'settlement.completed' } }, 'sends event wrapped with version');
   t.end();
 });
 
@@ -463,7 +463,7 @@ import crypto from 'crypto';
 
 test('signPayload — returns correctly formatted header', (t) => {
   const secret = 'test-secret-123';
-  const body = '{"event":{"type":"payment.completed"}}';
+  const body = '{"version":"1.0","event":{"type":"payment.completed"}}';
   const sig = signPayload(body, secret);
 
   // Format: t={unix_ts},s={hex_hmac}
@@ -488,7 +488,7 @@ test('signPayload — returns correctly formatted header', (t) => {
 
 test('signPayload — recomputable by consumer (same body + secret + timestamp = same HMAC)', (t) => {
   const secret = 'merchant-signing-key';
-  const body = '{"event":{"id":"evt_1"}}';
+  const body = '{"version":"1.0","event":{"id":"evt_1"}}';
 
   const sig1 = signPayload(body, secret);
   // Extract the timestamp from sig1
@@ -502,7 +502,7 @@ test('signPayload — recomputable by consumer (same body + secret + timestamp =
 });
 
 test('signPayload — different secrets produce different signatures', (t) => {
-  const body = '{"event":{}}';
+  const body = '{"version":"1.0","event":{}}';
   const sig1 = signPayload(body, 'secret-a');
   const sig2 = signPayload(body, 'secret-b');
 

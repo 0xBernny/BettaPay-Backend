@@ -116,3 +116,15 @@ export function createWebhookUrlSchema(nodeEnv?: string) {
 export const WebhookUrlSchema = createWebhookUrlSchema();
 
 export type WebhookUrl = z.infer<typeof WebhookUrlSchema>;
+
+/**
+ * Event payloads delivered to webhook consumers carry a semantic version string.
+ * Consumers should branch their logic based on this version field to ensure
+ * backwards compatibility when payload shapes change in the future.
+ */
+export const WebhookPayloadSchema = z.object({
+  version: z.string().min(1, 'version is required').describe('Event payload version, e.g. "1.0"'),
+  event: z.record(z.unknown()).describe('The indexed event data'),
+});
+
+export type WebhookPayload = z.infer<typeof WebhookPayloadSchema>;

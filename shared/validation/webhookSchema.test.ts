@@ -10,6 +10,7 @@ import {
   clearDnsCache,
   validateWebhookUrl,
   WEBHOOK_VALIDATE_RATE_LIMIT,
+  WebhookPayloadSchema,
 } from './webhookSchema.js';
 
 test('createWebhookUrlSchema - format & length rules apply in every environment', async (t) => {
@@ -221,5 +222,35 @@ test('validateWebhookUrl', async (t) => {
     assert.strictEqual(result.statusCode, 500);
 
     mockDns.mock.restore();
+  });
+});
+
+test('WebhookPayloadSchema', async (t) => {
+  await t.test('accepts valid payload with version', () => {
+    const payload = {
+      version: '1.0',
+      event: { id: 'evt_123', type: 'PaymentInitiated' },
+    };
+    const result = WebhookPayloadSchema.safeParse(payload);
+    assert.strictEqual(result.success, true);
+  });
+
+  await t.test('rejects payload missing version', () => {
+    const payload = {
+      event: { id: 'evt_123', type: 'PaymentInitiated' },
+    };
+    const result = WebhookPayloadSchema.safeParse(payload);
+    assert.strictEqual(result.success, false);
+    if (!result.success) {
+      assert.match(result.error.issues[0].message, /Required|version/i);
+    }
+  });
+
+  await t.test('rejects payload missing event', () => {
+    const payload = {
+      version: '1.0',
+    };
+    const result = WebhookPayloadSchema.safeParse(payload);
+    assert.strictEqual(result.success, false);
   });
 });
