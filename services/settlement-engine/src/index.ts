@@ -901,6 +901,31 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
   async (request, reply) => {
     const d = BulkSettlementBody.parse(request.body);
 
+    const rawIdempotencyKey = request.headers['idempotency-key'];
+    const idempotencyKey = Array.isArray(rawIdempotencyKey) ? rawIdempotencyKey[0] : rawIdempotencyKey;
+    const payloadHash = idempotencyKey ? crypto.createHash('sha256').update(JSON.stringify(d)).digest('hex') : null;
+
+    if (idempotencyKey && payloadHash) {
+      try {
+        const claimed = await redis.set(`idempotency:bulk:${idempotencyKey}`, payloadHash, 'EX', 86400, 'NX');
+        if (claimed === null) {
+          const existingHash = await redis.get(`idempotency:bulk:${idempotencyKey}`);
+          if (existingHash && existingHash !== payloadHash) {
+            return reply.code(409).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Idempotency key already used with a different payload'));
+          }
+
+          const existingResponse = await redis.get(`idempotency:bulk_res:${idempotencyKey}`);
+          if (existingResponse) {
+            return reply.code(200).send(JSON.parse(existingResponse));
+          }
+          // If still processing, just fall through or return 409
+          return reply.code(409).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Bulk settlement for this idempotency key is currently processing'));
+        }
+      } catch (err) {
+        request.log.error({ err }, 'Redis error during bulk idempotency check');
+      }
+    }
+
     if (d.settlements.length > 100) {
       return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch size exceeds maximum limit of 100 settlements'));
     }
@@ -1056,14 +1081,22 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       }
     }
 
-    return reply.code(201).send({
+    const responsePayload = {
       data: {
         batchId,
         total: d.settlements.length,
         created: validItems.length,
         errors,
       },
-    });
+    };
+
+    if (idempotencyKey) {
+      await redis.set(`idempotency:bulk_res:${idempotencyKey}`, JSON.stringify(responsePayload), 'EX', 86400).catch(err => {
+        request.log.error({ err }, 'Redis error saving bulk idempotency response');
+      });
+    }
+
+    return reply.code(201).send(responsePayload);
   }
 );
 
