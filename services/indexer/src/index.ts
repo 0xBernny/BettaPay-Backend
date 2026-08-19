@@ -757,6 +757,7 @@ export async function persistEvent(
     await webhookQueue.add("deliver", {
       url: sub.url,
       event: record as Record<string, unknown>,
+      version: "1.0",
       signingSecret: sub.signingSecret ?? undefined,
     });
   }

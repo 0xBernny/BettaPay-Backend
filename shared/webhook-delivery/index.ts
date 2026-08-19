@@ -76,6 +76,8 @@ export interface WebhookJobData {
    *  attempt a SET NX with 1-hour TTL before dispatch.  If the key already
    *  exists the delivery is skipped (duplicate detected). */
   eventId?: string;
+  /** Semantic version of the event payload structure. */
+  version?: string;
 }
 
 /** Subset of a logger that the worker uses for structured output. */
@@ -222,7 +224,7 @@ export function createWebhookWorker(
   const worker = new Worker<WebhookJobData>(
     queueName,
     async (job) => {
-      const { url, event, signingSecret, eventId } = job.data;
+      const { url, event, signingSecret, eventId, version = '1.0' } = job.data;
       const attempt = job.attemptsMade + 1; // attemptsMade is 0-indexed
 
       // ── Deduplication check ─────────────────────────────────────────────
@@ -247,7 +249,7 @@ export function createWebhookWorker(
 
       logger?.info({ url, jobId: job.id, attempt }, '[webhook-delivery] Delivering webhook');
 
-      const body = JSON.stringify({ event });
+      const body = JSON.stringify({ version, event });
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
 
       if (signingSecret) {
