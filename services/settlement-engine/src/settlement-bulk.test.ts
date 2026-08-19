@@ -1,5 +1,5 @@
 import test from 'tape';
-import { fastify, prisma, settlementQueue } from './index.js';
+import { fastify, prisma, settlementQueue, redis } from './index.js';
 import {
   MOCK_MERCHANT_STANDARD,
   MOCK_MERCHANT_TIGHT_LIMITS,
@@ -21,6 +21,8 @@ function resetMocks() {
   prisma.settlement.create = async (args: any) => args.data;
   prisma.settlement.findMany = async () => [];
   settlementQueue.add = async () => ({} as any);
+  redis.set = async () => 'OK' as any;
+  redis.get = async () => null as any;
 }
 
 test('POST /api/settlements/bulk: rejects batch size > 100', async (t) => {
@@ -264,3 +266,77 @@ test('GET /api/settlements/batch/:batchId/status: returns 404 for unknown batch'
   t.equal(res.statusCode, 404, 'returns 404 Not Found');
   t.end();
 });
+
+test('POST /api/settlements/bulk: idempotency successfully returns cached response', async (t) => {
+  resetMocks();
+
+  const cachedResponse = {
+    data: {
+      batchId: 'batch_cached123',
+      total: 3,
+      created: 3,
+      errors: []
+    }
+  };
+
+  const payload = {
+    merchantId: MOCK_MERCHANT_STANDARD.id,
+    settlements: BATCH_VALID_STANDARD,
+  };
+
+  import crypto from 'node:crypto';
+  const payloadHash = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+
+  // Simulate that the key is already claimed, and the hash matches
+  redis.set = async () => null as any; // NX fails
+  redis.get = async (key: string) => {
+    if (key.includes('bulk_res')) return JSON.stringify(cachedResponse) as any;
+    return payloadHash as any; // The hashes match
+  };
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    headers: {
+      'idempotency-key': 'idem-key-123'
+    },
+    payload,
+  });
+
+  t.equal(res.statusCode, 200, 'returns 200 OK');
+  const body = JSON.parse(res.body);
+  t.equal(body.data.batchId, 'batch_cached123', 'returns cached batchId');
+  t.end();
+});
+
+test('POST /api/settlements/bulk: rejects same idempotency key with different payload', async (t) => {
+  resetMocks();
+
+  const payload = {
+    merchantId: MOCK_MERCHANT_STANDARD.id,
+    settlements: BATCH_VALID_STANDARD,
+  };
+
+  // Simulate that the key is already claimed, but the stored hash is different
+  redis.set = async () => null as any; // NX fails
+  redis.get = async (key: string) => {
+    if (key.includes('bulk_res')) return null as any;
+    return 'different-hash' as any; // Hashes mismatch
+  };
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    headers: {
+      'idempotency-key': 'idem-key-456'
+    },
+    payload,
+  });
+
+  t.equal(res.statusCode, 409, 'returns 409 Conflict');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.code, 'VALIDATION_ERROR');
+  t.ok(body.error.message.includes('different payload'), 'error message indicates payload mismatch');
+  t.end();
+});
+
