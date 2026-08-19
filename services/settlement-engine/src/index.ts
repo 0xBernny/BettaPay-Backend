@@ -78,7 +78,52 @@ const pool = new pg.Pool({
   connectionTimeoutMillis: env.DATABASE_POOL_TIMEOUT * 1000,
 });
 const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter, log: getPrismaLogLevels() });
+const prismaBase = new PrismaClient({ adapter, log: getPrismaLogLevels() });
+
+export const SettlementStatusTransitions: Record<string, string[]> = {
+  pending: ['processing', 'failed'],
+  processing: ['completed', 'failed'],
+  completed: [],
+  failed: [],
+};
+
+export function validateTransition(current: string, next: string) {
+  if (current === next) return;
+  if (!SettlementStatusTransitions[current]?.includes(next)) {
+    throw new Error(`Invalid status transition from ${current} to ${next}`);
+  }
+}
+
+const prisma = prismaBase.$extends({
+  query: {
+    settlement: {
+      async update({ args, query }) {
+        if (args.data.status) {
+          const current = await prismaBase.settlement.findUnique({
+            where: args.where,
+            select: { status: true },
+          });
+          if (current) {
+            validateTransition(current.status, args.data.status as string);
+          }
+        }
+        return query(args);
+      },
+      async updateMany({ args, query }) {
+        if (args.data.status) {
+          const records = await prismaBase.settlement.findMany({
+            where: args.where,
+            select: { id: true, status: true },
+          });
+          for (const record of records) {
+            validateTransition(record.status, args.data.status as string);
+          }
+        }
+        return query(args);
+      },
+    },
+  },
+}) as unknown as typeof prismaBase;
 
 type SettlementJobData = {
   id: string;
@@ -97,7 +142,7 @@ const fastify = Fastify({
 });
 
 registerRequestId(fastify);
-setupPrismaQueryLogging(prisma, fastify.log);
+setupPrismaQueryLogging(prismaBase, fastify.log);
 startPrismaPoolMetricsCollector(pool, promClient.register, 10000, fastify.log, promClient);
 
 // Shared Redis client (use createRedisClient factory with connection sharing)
@@ -291,6 +336,12 @@ const worker = new Worker('settlements', async job => {
   }
 
   try {
+    // Transition to processing first
+    await prisma.settlement.update({
+      where: { id: settlementId },
+      data: { status: 'processing' },
+    });
+
     // In a real app this interacts with Soroban; here we mark completed.
     const updatedSettlement = await prisma.settlement.update({
       where: { id: settlementId },
@@ -1225,6 +1276,12 @@ const batchWorker = new Worker(
               totalFees,
               totalNet,
             },
+          });
+
+          // Update settlements to processing first
+          await prisma.settlement.updateMany({
+            where: { id: { in: settlements.map((s) => s.id) } },
+            data: { status: 'processing' },
           });
 
           // Update settlements with batchId and mark completed
