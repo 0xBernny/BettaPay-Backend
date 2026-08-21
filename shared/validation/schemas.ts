@@ -58,8 +58,10 @@ export type WalletChallengeQuery = z.infer<typeof WalletChallengeQuery>;
 
 export const WalletVerifyBody = z.object({
   address: StellarAddressSchema,
-  challenge: z.string().min(1),
-  signature: z.string().min(1)
+  nonce: z.string().min(1, 'nonce is required').max(512, 'nonce is too long'),
+  signature: z.string().min(1, 'signature is required'),
+  challenge: z.string().min(1).optional(),
+  message: z.string().min(1).optional(),
 });
 export type WalletVerifyBody = z.infer<typeof WalletVerifyBody>;
 
@@ -141,9 +143,8 @@ export const fxQuoteSchema = z.object({
   toCurrency: CurrencyCode,
   rate: z.string(),
   expiresAt: isoDateString,
-  rateBatchId: z.string().uuid()
+  rateBatchId: z.string().uuid(),
   slippageBps: z.number().int().min(0).optional(),
-  expiresAt: isoDateString
 });
 
 export const billPaymentSchema = z.object({

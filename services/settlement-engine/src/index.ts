@@ -27,7 +27,7 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import * as promClient from 'prom-client';
 import * as crypto from 'crypto';
-import { Queue, Worker } from 'bullmq';
+import { Queue, Worker, type Job } from 'bullmq';
 import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
@@ -275,7 +275,27 @@ async function getMonthlyVolume(merchantId: string): Promise<number> {
   }
 }
 
-const worker = new Worker('settlements', async job => {
+// BullMQ has no per-job timeout option in WorkerOptions, so the configurable
+// SETTLEMENT_JOB_TIMEOUT_MS is enforced with a watchdog that races the
+// processor. Jobs that exceed the timeout are failed like any other error.
+function withJobTimeout<T>(
+  processor: (job: Job) => Promise<T>,
+  job: Job,
+  timeoutMs: number,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Settlement job timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  return Promise.race([processor(job), timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+const baseSettlementProcessor = async (job: Job): Promise<void> => {
   const settlementId = job.data.id;
   const merchantId = job.data.merchantId;
   const traceId = job.data.traceId;
@@ -382,11 +402,16 @@ const worker = new Worker('settlements', async job => {
       await releaseSemaphore(redis, merchantId).catch(() => {});
     }
   }
-}, {
-  connection: redis,
-  concurrency: 5,
-  timeout: env.SETTLEMENT_JOB_TIMEOUT_MS,
-});
+};
+
+const worker = new Worker(
+  'settlements',
+  (job) => withJobTimeout(baseSettlementProcessor, job, env.SETTLEMENT_JOB_TIMEOUT_MS),
+  {
+    connection: redis,
+    concurrency: 5,
+  },
+);
 
 const getActiveSettlementJob = trackActiveJob(worker);
 
@@ -1455,7 +1480,7 @@ const start = async () => {
   }
 };
 
-export { fastify, prisma, settlementQueue };
+export { fastify, prisma, redis, settlementQueue };
 
 const isDirectRun = 
   !process.argv[1] || 

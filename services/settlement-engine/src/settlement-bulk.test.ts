@@ -1,4 +1,5 @@
 import test from 'tape';
+import crypto from 'node:crypto';
 import { fastify, prisma, settlementQueue, redis } from './index.js';
 import {
   MOCK_MERCHANT_STANDARD,
@@ -284,7 +285,6 @@ test('POST /api/settlements/bulk: idempotency successfully returns cached respon
     settlements: BATCH_VALID_STANDARD,
   };
 
-  import crypto from 'node:crypto';
   const payloadHash = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 
   // Simulate that the key is already claimed, and the hash matches

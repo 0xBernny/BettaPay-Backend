@@ -58,6 +58,10 @@ import {
   decryptSensitiveFields,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
+import {
+  checkDownstreamReadiness,
+  type DownstreamService,
+} from "./downstream-readiness.js";
 import { createFxClient } from "./clients/fx-client.js";
 import {
   createIndexerClient,
@@ -78,8 +82,8 @@ import {
   UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
   UpdateMerchantNameBody,
-  WalletChallengeQuery,
   WalletVerifyBody,
+  AuthIpScoreQuery,
   SettlementListQuery,
   PaginationQuery,
   BulkCancelPaymentsBody,
@@ -127,6 +131,20 @@ declare module "fastify" {
 
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// --- Auth hardening constants (#254, #319 task list) -------------------------
+const AUTH_IP_SCORE_WINDOW_SECONDS = 15 * 60;
+const AUTH_IP_RETRY_AFTER_SECONDS = 5 * 60;
+const USED_NONCE_TTL_SECONDS = 5 * 60;
+const REFRESH_RATE_LIMIT_SECONDS = 60;
+const REFRESH_RATE_LIMIT_MAX = 10;
+
+interface MerchantJwtPayload {
+  merchantId?: string;
+  ownerId?: string;
+  jti?: string;
+  exp?: number;
+}
 
 // Caps decompressed request bodies. Fastify's own bodyLimit only sees the
 // compressed (on-the-wire) byte count, so a small gzip payload can otherwise
@@ -250,15 +268,6 @@ export function getDefaultPrisma(): PrismaClient {
 // (defined after buildApp, at module scope) need it but don't have their own
 // handle on the instance buildApp created internally.
 let sharedRedis: ReturnType<typeof createRedisClient> | null = null;
-
-const redis = new Redis(env.REDIS_URL, {
-  maxRetriesPerRequest: env.REDIS_MAX_RETRIES,
-  lazyConnect: true,
-});
-
-redis.on('error', (err) => {
-  fastify.log.warn({ err: err.message }, 'Redis connection error');
-});
 
 // --- Response logging hooks -------------------------------------------------
 const SENSITIVE_FIELDS = new Set([
@@ -618,19 +627,12 @@ export function buildApp(opts: AppOptions = {}) {
         return;
       }
 
-// Authentication hook
-fastify.decorate('authenticate', async function (request: FastifyRequest, reply: FastifyReply) {
-  try {
-    await request.jwtVerify();
-    const payload = request.user as MerchantJwtPayload;
-    if (payload.jti && await isJtiRevoked(payload.jti)) {
-      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
-    }
-  } catch (err) {
-    request.log.error(err);
-    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
-  }
-});
+      if (await isJtiRevoked(jti)) {
+        return reply
+          .code(401)
+          .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
+      }
+
       try {
         const ok = await updateSessionLastUsed(jti, merchantId);
         if (!ok) {
@@ -743,6 +745,171 @@ fastify.decorate('authenticate', async function (request: FastifyRequest, reply:
   // #386 — exponential backoff retry strategy
   const redis = createRedisClient(env.REDIS_URL, fastify.log);
   sharedRedis = redis;
+
+  // Close the Redis client with the app so test processes don't leak sockets.
+  // disconnect() (not quit()) because with enableOfflineQueue: false a QUIT
+  // issued while the client is still connecting is silently dropped and the
+  // socket stays open, keeping the process alive after app.close().
+  fastify.addHook("onClose", async () => {
+    redis.disconnect();
+  });
+
+  // Auth hardening helpers (#254, #319 task list) — IP reputation scoring,
+  // JWT refresh/revocation, and nonce replay protection.
+  function signMerchantJwt(merchantId: string, ownerId: string): string {
+    return fastify.jwt.sign({ merchantId, ownerId, jti: crypto.randomUUID() });
+  }
+
+  function getRequestIp(request: FastifyRequest): string {
+    const forwarded = request.headers["x-forwarded-for"];
+    const forwardedValue = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+    if (forwardedValue) return forwardedValue.split(",")[0].trim();
+    return request.ip;
+  }
+
+  function authIpScoreKey(ip: string): string {
+    return "auth_ip_score:" + ip;
+  }
+
+  function revokedJtiKey(jti: string): string {
+    return "revoked_jti:" + jti;
+  }
+
+  function usedNonceKey(nonce: string): string {
+    return "used_nonce:" + nonce;
+  }
+
+  function refreshRateKey(merchantId: string): string {
+    return "auth_refresh_rate:" + merchantId;
+  }
+
+  function toNonNegativeInt(value: unknown): number {
+    const parsed = Number(value ?? 0);
+    if (!Number.isFinite(parsed) || parsed < 0) return 0;
+    return Math.floor(parsed);
+  }
+
+  async function getAuthIpScore(ip: string): Promise<number> {
+    try {
+      return toNonNegativeInt(await redis.get(authIpScoreKey(ip)));
+    } catch (err) {
+      fastify.log.warn({ err, ip }, "Unable to read auth IP score");
+      return 0;
+    }
+  }
+
+  async function updateAuthIpScore(ip: string, delta: number): Promise<number> {
+    const key = authIpScoreKey(ip);
+    try {
+      if (delta > 0) {
+        const score = await redis.incrby(key, delta);
+        await redis.expire(key, AUTH_IP_SCORE_WINDOW_SECONDS);
+        return toNonNegativeInt(score);
+      }
+      const current = toNonNegativeInt(await redis.get(key));
+      const next = Math.max(0, current + delta);
+      if (next === 0) {
+        await redis.del(key);
+      } else {
+        await redis.set(key, String(next), "EX", AUTH_IP_SCORE_WINDOW_SECONDS);
+      }
+      return next;
+    } catch (err) {
+      fastify.log.warn({ err, ip, delta }, "Unable to update auth IP score");
+      return 0;
+    }
+  }
+
+  async function enforceAuthIpReputation(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    const ip = getRequestIp(request);
+    const score = await getAuthIpScore(ip);
+    if (score >= env.AUTH_IP_THRESHOLD) {
+      await reply
+        .header("Retry-After", String(AUTH_IP_RETRY_AFTER_SECONDS))
+        .code(429)
+        .send(createErrorResponse(ErrorCodes.RATE_LIMITED, "Too many failed authentication attempts"));
+    }
+  }
+
+  async function recordAuthIpFailure(request: FastifyRequest): Promise<void> {
+    await updateAuthIpScore(getRequestIp(request), 1);
+  }
+
+  async function recordAuthIpSuccess(request: FastifyRequest): Promise<void> {
+    await updateAuthIpScore(getRequestIp(request), -1);
+  }
+
+  async function isJtiRevoked(jti: string): Promise<boolean> {
+    try {
+      return (await redis.exists(revokedJtiKey(jti))) === 1;
+    } catch (err) {
+      fastify.log.warn({ err, jti }, "Unable to read JWT blocklist");
+      return false;
+    }
+  }
+
+  async function revokeJti(jti: string, ttlSeconds: number): Promise<void> {
+    if (ttlSeconds <= 0) return;
+    try {
+      await redis.set(revokedJtiKey(jti), "1", "EX", ttlSeconds);
+    } catch (err) {
+      fastify.log.warn({ err, jti }, "Unable to write JWT blocklist");
+    }
+  }
+
+  async function incrementRefreshRate(merchantId: string): Promise<number> {
+    try {
+      const key = refreshRateKey(merchantId);
+      const count = await redis.incr(key);
+      if (count === 1) await redis.expire(key, REFRESH_RATE_LIMIT_SECONDS);
+      return count;
+    } catch (err) {
+      fastify.log.warn({ err, merchantId }, "Unable to update refresh rate limit");
+      return 1;
+    }
+  }
+
+  async function isNonceUsed(nonce: string): Promise<boolean> {
+    try {
+      return (await redis.exists(usedNonceKey(nonce))) === 1;
+    } catch (err) {
+      fastify.log.warn({ err }, "Unable to read used nonce");
+      return true;
+    }
+  }
+
+  async function markNonceUsed(nonce: string): Promise<boolean> {
+    try {
+      const result = await redis.set(usedNonceKey(nonce), "1", "EX", USED_NONCE_TTL_SECONDS, "NX");
+      return result === "OK";
+    } catch (err) {
+      fastify.log.warn({ err }, "Unable to write used nonce");
+      return false;
+    }
+  }
+
+  function decodeWalletSignature(signature: string): Buffer {
+    const trimmed = signature.trim();
+    if (/^[0-9a-f]+$/i.test(trimmed) && trimmed.length % 2 === 0) {
+      return Buffer.from(trimmed, "hex");
+    }
+    return Buffer.from(trimmed, "base64");
+  }
+
+  function walletChallenge(body: { nonce: string; challenge?: string; message?: string }): string {
+    return body.challenge ?? body.message ?? body.nonce;
+  }
+
+  function verifyWalletSignature(address: string, challenge: string, signature: string): boolean {
+    try {
+      return Keypair.fromPublicKey(address).verify(
+        Buffer.from(challenge, "utf8"),
+        decodeWalletSignature(signature),
+      );
+    } catch {
+      return false;
+    }
+  }
 
   const GOOGLE_AUTH_GRACE_PERIOD_MS = 30_000;
   const GOOGLE_AUTH_LOCKOUT_KEY_PREFIX = "auth_fail:google:";
@@ -859,139 +1026,6 @@ fastify.decorate('authenticate', async function (request: FastifyRequest, reply:
       .catch(() => {});
   }
 
-  fastify.get<{ Querystring: WalletChallengeQuery }>(
-    "/api/auth/wallet/challenge",
-    {
-      config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
-    },
-    async (request, reply) => {
-      const { address } = WalletChallengeQuery.parse(request.query);
-      const nonce = crypto.randomBytes(32).toString("hex");
-      const challenge = `BettaPay:${address}:${nonce}`;
-      const expiresAt = Date.now() + 2 * 60 * 1000; // 2 minutes
-      try {
-        await redis.set(
-          `wallet_challenge:${address}`,
-          JSON.stringify({ challenge, expiresAt }),
-          "PX",
-          120000,
-        );
-      } catch (err) {
-        request.log.error({ err }, "Failed to set wallet challenge in Redis");
-        return reply
-          .code(503)
-          .send({ error: "Authentication service unavailable" });
-      }
-      return reply.send({ challenge, expiresAt });
-    },
-  );
-
-  fastify.post<{ Body: WalletVerifyBody }>(
-    "/api/auth/wallet/verify",
-    {
-      config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
-    },
-    async (request, reply) => {
-      const d = WalletVerifyBody.parse(request.body);
-      const ip = request.ip;
-      const lockoutKey = `wallet_lockout:${d.address}`;
-
-      const failedAttempts = parseInt((await redis.get(lockoutKey)) || "0", 10);
-      const maxAttempts = parseInt(
-        process.env.AUTH_MAX_FAILED_ATTEMPTS || "5",
-        10,
-      );
-      if (failedAttempts >= maxAttempts) {
-        request.log.warn(
-          { address: d.address, ip },
-          "[Auth] Wallet verify locked out due to too many failed attempts",
-        );
-        return reply
-          .code(429)
-          .send({ error: "Too many failed attempts. Try again later." });
-      }
-
-      let storedRaw;
-      try {
-        storedRaw = await redis.get(`wallet_challenge:${d.address}`);
-      } catch (err) {
-        request.log.error({ err }, "Failed to get wallet challenge from Redis");
-        return reply
-          .code(503)
-          .send({ error: "Authentication service unavailable" });
-      }
-
-      if (!storedRaw) {
-        return reply
-          .code(400)
-          .send({ error: "Challenge expired or not found" });
-      }
-
-      const stored = JSON.parse(storedRaw);
-
-      if (Date.now() > stored.expiresAt) {
-        await redis.del(`wallet_challenge:${d.address}`).catch(() => {});
-        return reply.code(400).send({ error: "Challenge expired" });
-      }
-      if (stored.challenge !== d.challenge) {
-        return reply.code(400).send({ error: "Invalid challenge" });
-      }
-
-      await redis.del(`wallet_challenge:${d.address}`).catch(() => {}); // Single use
-
-      try {
-        const keypair = Keypair.fromPublicKey(d.address);
-        const isValid = keypair.verify(
-          Buffer.from(d.challenge, "utf-8"),
-          Buffer.from(d.signature, "base64"),
-        );
-        if (!isValid) {
-          const lockoutMinutes = parseInt(
-            process.env.AUTH_LOCKOUT_MINUTES || "15",
-            10,
-          );
-          await redis.incr(lockoutKey);
-          await redis.expire(lockoutKey, lockoutMinutes * 60);
-          request.log.warn(
-            { address: d.address, ip },
-            "[Auth] Invalid signature during wallet verify",
-          );
-          return reply.code(401).send({ error: "Invalid signature" });
-        }
-      } catch (err) {
-        const lockoutMinutes = parseInt(
-          process.env.AUTH_LOCKOUT_MINUTES || "15",
-          10,
-        );
-        await redis.incr(lockoutKey);
-        await redis.expire(lockoutKey, lockoutMinutes * 60);
-        request.log.warn(
-          { address: d.address, ip },
-          "[Auth] Signature verification failed",
-        );
-        return reply.code(401).send({ error: "Signature verification failed" });
-      }
-
-      await redis.del(lockoutKey).catch(() => {}); // reset on success
-
-      const merchant = await prisma.merchant.upsert({
-        where: { ownerId: d.address },
-        update: {},
-        create: {
-          id: crypto.randomUUID(),
-          name: "My Business",
-          ownerId: d.address,
-          settings: {},
-        },
-      });
-
-    const jwtToken = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId });
-    return reply.send({ token: jwtToken });
-  } catch (err: any) {
-    request.log.error({ err }, '[Auth] Google OAuth failed');
-    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Google token verification failed'));
-  }
-});
 
 fastify.post('/api/auth/refresh', {
   preHandler: [enforceAuthIpReputation]
@@ -1094,68 +1128,6 @@ fastify.get('/api/admin/auth/ip-score', {
   const { ip } = AuthIpScoreQuery.parse(request.query ?? {});
   return { ip, score: await getAuthIpScore(ip) };
 });
-
-// Merchants
-fastify.post<{ Body: z.infer<typeof CreateMerchantBody> }>('/api/merchants', {
-  preValidation: [fastify.authenticate],
-  preHandler: [logRequestBody],
-  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
-}, async (request, reply) => {
-    const d = CreateMerchantBody.parse(request.body);
-    const secret = d.secret || crypto.randomBytes(24).toString('hex');
-    const secretHash = encryptField(hashSecret(secret));
-    const merchant = await prisma.$transaction(async (tx) => {
-      const created = await tx.merchant.create({
-        data: {
-          id: d.id,
-          name: d.name,
-          ownerId: d.ownerId,
-          settings: d.settings as any ?? {},
-          secretHash,
-        }
-      });
-      await logAuditEvent('merchant.created', 'merchant', created.id, { before: null, after: created }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
-      return created;
-    });
-    if (!d.secret) {
-      fastify.log.warn({ merchantId: merchant.id }, 'Auto-generated merchant secret returned in response. This will only be shown once.');
-    }
-    const { secretHash: _hash, ...safeMerchant } = merchant;
-    return reply.code(201).send({ data: { merchant: safeMerchant, secret } });
-});
-
-fastify.get<{ Params: { id: string } }>('/api/merchants/:id', {
-  preValidation: [fastify.authenticate]
-}, async (request, reply): Promise<ApiResponse<Merchant>> => {
-  const { id } = request.params;
-  const merchant = await prisma.merchant.findFirst({
-    where: { id, deletedAt: null },
-  });
-  if (!merchant) {
-    reply.code(404);
-    return { error: createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found') };
-  }
-  return { data: merchant };
-});
-
-fastify.delete<{ Params: { id: string } }>('/api/merchants/:id', {
-  preValidation: [fastify.authenticate],
-  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
-}, async (request, reply) => {
-  const { id } = request.params;
-  const merchant = await prisma.merchant.findFirst({
-    where: { id, deletedAt: null },
-  });
-  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
-      const deviceInfo = `${request.ip || "unknown"} ${request.headers["user-agent"] ?? "unknown"}`;
-      const jti = await createAuthSession(merchant.id, deviceInfo);
-      const token = fastify.jwt.sign(
-        { merchantId: merchant.id, ownerId: merchant.ownerId },
-        { jwtid: jti },
-      );
-      return reply.send({ token });
-    },
-  );
 
   const walletChallenges = new Map<
     string,
@@ -1414,7 +1386,7 @@ fastify.delete<{ Params: { id: string } }>('/api/merchants/:id', {
         const jti = await createAuthSession(merchant.id, deviceInfo);
         const jwtToken = fastify.jwt.sign(
           { merchantId: merchant.id, ownerId: merchant.ownerId },
-          { jwtid: jti },
+{ jti },
         );
         return reply.send({ token: jwtToken });
       } catch (err: any) {
@@ -2515,15 +2487,6 @@ fastify.delete<{ Params: { id: string } }>('/api/merchants/:id', {
     "/api/admin/assets",
     {
       preValidation: [fastify.serviceAuth],
-      schema: {
-        body: z.object({
-          code: z.string().min(1),
-          contractId: z.string().min(1),
-          decimals: z.number().int().min(0),
-          name: z.string().min(1),
-          isActive: z.boolean().default(true),
-        }),
-      },
     },
     async (request, reply) => {
       const body = request.body as z.infer<typeof CreateSupportedAssetBody>;
@@ -2571,15 +2534,6 @@ fastify.delete<{ Params: { id: string } }>('/api/merchants/:id', {
     "/api/admin/assets/:code",
     {
       preValidation: [fastify.serviceAuth],
-      schema: {
-        params: z.object({ code: z.string().min(1) }),
-        body: z.object({
-          contractId: z.string().min(1).optional(),
-          decimals: z.number().int().min(0).optional(),
-          name: z.string().min(1).optional(),
-          isActive: z.boolean().optional(),
-        }),
-      },
     },
     async (request, reply) => {
       const { code } = request.params as { code: string };
@@ -2624,9 +2578,6 @@ fastify.delete<{ Params: { id: string } }>('/api/merchants/:id', {
     "/api/admin/assets/:code",
     {
       preValidation: [fastify.serviceAuth],
-      schema: {
-        params: z.object({ code: z.string().min(1) }),
-      },
     },
     async (request, reply) => {
       const { code } = request.params as { code: string };
@@ -2677,23 +2628,37 @@ fastify.delete<{ Params: { id: string } }>('/api/merchants/:id', {
 
 // ─── Warmup ─────────────────────────────────────────────────────────────────
 
-interface DownstreamService {
-  name: string;
-  healthUrl: string;
-}
-
 function getDownstreamServices(env: Env): DownstreamService[] {
   return [
-    { name: "fx-engine", healthUrl: `${env.FX_ENGINE_URL}/api/health` },
-    { name: "indexer", healthUrl: `${env.INDEXER_URL}/api/health` },
+    {
+      name: "fx-engine",
+      healthUrl: `${env.FX_ENGINE_URL}/api/health`,
+      capabilityUrl: `${env.FX_ENGINE_URL}/api/currencies`,
+      validateBody: (body) =>
+        typeof body === "object" && body !== null && Array.isArray((body as { currencies?: unknown }).currencies),
+    },
+    {
+      name: "indexer",
+      healthUrl: `${env.INDEXER_URL}/api/health`,
+      capabilityUrl: `${env.INDEXER_URL}/api/events?limit=1`,
+      // Internal endpoint — requires the inter-service token (#117).
+      serviceToken: env.INTER_SERVICE_SECRET,
+      validateBody: (body) =>
+        typeof body === "object" && body !== null && Array.isArray((body as { data?: unknown }).data),
+    },
   ];
 }
 
 /**
  * Make best-effort warmup requests to downstream services so their caches,
  * connection pools, and health state are ready before the gateway accepts
- * traffic. Each call carries a unique x-trace-id so operators can correlate
- * startup events across services.
+ * traffic.
+ *
+ * Readiness is capability-aware (#556): each service is only considered ready
+ * when both its `/api/health` ping succeeds AND a real, work-bearing endpoint
+ * responds with the expected contract. This catches schema/DB drift in a
+ * downstream that a bare ping would miss until traffic. Per-service probe
+ * detail is logged so operators can see exactly what failed.
  *
  * Errors are logged but never thrown — a downstream that is still warming up
  * should not prevent the gateway from starting.
@@ -2702,37 +2667,7 @@ async function warmupDownstreamServices(
   env: Env,
   logger: FastifyBaseLogger,
 ): Promise<void> {
-  const services = getDownstreamServices(env);
-
-  await Promise.allSettled(
-    services.map(async (svc) => {
-      const traceId = crypto.randomUUID();
-      const startTime = Date.now();
-
-      try {
-        const response = await fetch(svc.healthUrl, {
-          headers: { "x-trace-id": traceId },
-          signal: AbortSignal.timeout(5_000),
-        });
-        const durationMs = Date.now() - startTime;
-        logger.info(
-          {
-            traceId,
-            targetService: svc.name,
-            statusCode: response.status,
-            durationMs,
-          },
-          "Warmup completed",
-        );
-      } catch (err) {
-        const durationMs = Date.now() - startTime;
-        logger.warn(
-          { traceId, targetService: svc.name, durationMs, err },
-          "Warmup failed — downstream may not be ready",
-        );
-      }
-    }),
-  );
+  await checkDownstreamReadiness(getDownstreamServices(env), { logger });
 }
 
 // Graceful shutdown
