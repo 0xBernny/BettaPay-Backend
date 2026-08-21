@@ -49,6 +49,11 @@ export const ErrorCodes = {
   // #317 — returned when a suspended merchant attempts to create a payment
   // or settlement. Distinct from INVALID_REQUEST so clients can branch on it.
   MERCHANT_SUSPENDED: 'MERCHANT_SUSPENDED',
+  // FX Engine — quote age validation (#253): served quotes are rejected when
+  // they are too fresh (quoteAge < QUOTE_MIN_AGE_MS) or too old
+  // (quoteAge > QUOTE_MAX_LIFETIME_MS).
+  QUOTE_TOO_YOUNG: 'QUOTE_TOO_YOUNG',
+  QUOTE_TOO_OLD: 'QUOTE_TOO_OLD',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -181,6 +186,10 @@ export const EnvSchema = z.object({
     .string()
     .transform((s) => parseInt(s, 10))
     .default("15"),
+  AUTH_IP_THRESHOLD: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("20"),
 
   // Indexer RPC backoff ceiling. Doubles the wait interval on 429s up to
   // this maximum value.
@@ -301,6 +310,17 @@ export const EnvSchema = z.object({
     .transform((s) => parseInt(s, 10))
     .default("2000"),
 
+  // FX Engine — staleness threshold (seconds). Rates older than this trigger
+  // structured WARN (live source) or ERROR (seed source) logs when served.
+  // Default: 300 (5 minutes).
+  MAX_STALE_SECONDS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("300")
+    .refine((val) => Number.isFinite(val) && val > 0, {
+      message: "MAX_STALE_SECONDS must be a positive integer",
+    }),
+
   // FX Engine — slippage tolerance (basis points; 100 bps = 1%)
   DEFAULT_SLIPPAGE_BPS: z
     .string()
@@ -378,6 +398,18 @@ export const EnvSchema = z.object({
     .string()
     .transform((s) => parseInt(s, 10))
     .default("100000"),
+
+  // Settlement Engine — worker job timeout (ms). Jobs exceeding this duration
+  // are automatically failed by BullMQ. Default: 30000 (30 seconds).
+  SETTLEMENT_JOB_TIMEOUT_MS: z
+    .string()
+    .transform((s) => parseInt(s, 10))
+    .default("30000")
+    .refine((val) => Number.isFinite(val) && val > 0, {
+      message: "SETTLEMENT_JOB_TIMEOUT_MS must be a positive integer",
+    }),
+}).refine((data) => data.QUOTE_MIN_AGE_MS < data.QUOTE_MAX_LIFETIME_MS, {
+  message: "QUOTE_MIN_AGE_MS must be less than QUOTE_MAX_LIFETIME_MS",
 });
 
 export type Env = Omit<

@@ -27,6 +27,11 @@ enum KycStatus {
   rejected
 }
 
+enum MerchantStatus {
+  active
+  suspended
+}
+
 model Merchant {
   id          String          @id
   name        String

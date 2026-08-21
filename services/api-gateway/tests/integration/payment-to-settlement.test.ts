@@ -6,6 +6,7 @@ import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import Redis from 'ioredis';
+import { Keypair } from '@stellar/stellar-sdk';
 import { buildApp } from '../../src/index.js';
 import { generateTestJwt } from '../../src/test-utils.js';
 import { createSettlementClient } from '../../src/clients/settlement-client.js';
@@ -198,9 +199,12 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
     settlementClient: mockSettlementClient as any,
     logger: false,
   });
+  await app.ready(); // loads plugins so app.jwt (used by generateTestJwt) is available
 
-  const merchantStellarId = 'GCMERCHANTSTELLARADDRESSFORTEST00000000000000000000001';
-  const ownerId = 'owner-e2e-user-001';
+  // CreateMerchantBody.ownerId and payment/settlement merchantId must be valid
+  // Stellar public keys, so generate real ones instead of hardcoded fixtures.
+  const merchantStellarId = Keypair.random().publicKey();
+  const ownerId = Keypair.random().publicKey();
   const authToken = generateTestJwt(app, { merchantId: merchantStellarId, ownerId });
 
   let createdPaymentId = '';
@@ -219,7 +223,7 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
         settings: {
           feeBps: 150, // 1.5% fee
           webhookUrl: `${webhookAddress}/webhook`,
-          minSettlementAmount: '10.00',
+          minSettlementAmount: 10, // schema requires a number, not a numeric string
         },
       },
     });
@@ -275,7 +279,9 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
     const body = JSON.parse(res.body);
     assert.ok(body.data, 'Response envelope must contain data');
     assert.ok(body.data.id.startsWith('pay_'), 'Payment ID must start with pay_');
-    assert.equal(body.data.amount, '100.00');
+    // amount is stored as Decimal(18,6); the API serializes it via the
+    // Prisma Decimal toJSON, which strips trailing zeros (100.00 -> 100).
+    assert.equal(body.data.amount, '100');
     assert.equal(body.data.asset, 'USDC');
     assert.equal(body.data.status, 'initiated');
 
@@ -288,7 +294,7 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
     assert.ok(paymentDb, 'Payment record must be persisted in PostgreSQL database');
     assert.equal(paymentDb.merchantId, merchantStellarId);
     assert.equal(paymentDb.status, 'initiated');
-    assert.equal(paymentDb.amount.toString(), '100.00');
+    assert.equal(paymentDb.amount.toString(), '100');
     assert.equal(paymentDb.asset, 'USDC');
   });
 
@@ -452,7 +458,9 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
       headers: { authorization: `Bearer ${authToken}` },
       payload: {
         merchantId: merchantStellarId,
-        items: [{ amount: '100.00', asset: 'UNSUPPORTED_COIN' }],
+        // EURT passes the CurrencyCode schema but is not a seeded supported
+        // asset, so the settlement engine rejects it with 422.
+        items: [{ amount: '100.00', asset: 'EURT' }],
       },
     });
 

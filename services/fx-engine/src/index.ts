@@ -75,7 +75,6 @@ const initialBatchId = randomUUID();
 let cache: RateCache = {
   rates:    { ...FALLBACK_RATES },
   batchIds: Object.fromEntries(Object.keys(FALLBACK_RATES).map((c) => [c, initialBatchId])),
-  rates: { ...FALLBACK_RATES },
   cachedAt: Date.now(),
 };
 
@@ -421,10 +420,6 @@ async function refreshTick(): Promise<void> {
         const fetched = await fetchBaseRates();
         if (fetched) {
           const batchId = randomUUID();
-          updateBaseRates(fetched, batchId);
-          fastify.log.info(
-            { durationMs: lastRefresh?.durationMs, assets: Object.keys(fetched), rateBatchId: batchId },
-            'FX rates refreshed',
           const maxDeviationBps = env.MAX_DEVIATION_BPS;
           const merged: Record<string, number> = { ...cache.rates };
           const rejected: string[] = [];
@@ -450,12 +445,13 @@ async function refreshTick(): Promise<void> {
               "Rate deviation guard rejected rates; old rates preserved",
             );
           }
-          updateBaseRates(merged);
+          updateBaseRates(merged, batchId);
           recordCircuitBreakerSuccess(fastify.log);
           fastify.log.info(
             {
               durationMs: lastRefresh?.durationMs,
               assets: Object.keys(fetched),
+              rateBatchId: batchId,
               rejectedCount: rejected.length,
             },
             "FX rates refreshed",
@@ -496,10 +492,6 @@ async function refreshTick(): Promise<void> {
     const fetched = await fetchBaseRates();
     if (fetched) {
       const batchId = randomUUID();
-      updateBaseRates(fetched, batchId);
-    } else if (fallbackStartTime === null) {
-      fallbackStartTime = Date.now();
-      fastify.log.warn('Entering fallback FX rate mode');
       const maxDeviationBps = env.MAX_DEVIATION_BPS;
       const merged: Record<string, number> = { ...cache.rates };
       const rejected: string[] = [];
@@ -525,7 +517,7 @@ async function refreshTick(): Promise<void> {
           "Rate deviation guard rejected rates (stampede fallback); old rates preserved",
         );
       }
-      updateBaseRates(merged);
+      updateBaseRates(merged, batchId);
       recordCircuitBreakerSuccess(fastify.log);
     } else {
       recordCircuitBreakerFailure(fastify.log, env.CIRCUIT_BREAKER_COOLDOWN_MS);
@@ -610,8 +602,6 @@ async function warmupCacheFromRedis(): Promise<void> {
       return;
     }
 
-    const snapshot = JSON.parse(members[0]) as { ts: number; rates: Record<string, number> };
-    updateBaseRates(snapshot.rates, randomUUID());
     // If all rates for all currencies were discarded, trigger immediate fetch
     if (Object.keys(validatedRates).length === 0) {
       fastify.log.warn(
@@ -632,7 +622,7 @@ async function warmupCacheFromRedis(): Promise<void> {
       discardedCount,
       timestamp: new Date(snapshot.ts).toISOString(),
     };
-    updateBaseRates(validatedRates);
+    updateBaseRates(validatedRates, randomUUID());
     computedRateCache.clear();
     fastify.log.info(
       {
@@ -741,7 +731,6 @@ interface StoredQuote {
   slippageBps: number;
   expiresAt:   number; // Unix ms — quote validity cutoff
   rateBatchId: string;
-  expiresAt: number; // Unix ms — quote validity cutoff
 }
 
 const fastify = Fastify({
@@ -1085,7 +1074,7 @@ fastify.post<{ Body: unknown }>(
     }
 
     lastOverrideAt = Date.now();
-    updateBaseRates({ ...cache.rates, ...body.rates });
+    updateBaseRates({ ...cache.rates, ...body.rates }, randomUUID());
     fastify.log.warn(
       { rates: body.rates },
       "Admin override: rate deviation guard bypassed",
@@ -1259,8 +1248,6 @@ fastify.get(
       cachedAt:      new Date(cache.cachedAt).toISOString(),
       expiresAt:     new Date(expiresAt).toISOString(),
       rateBatchId,
-      cachedAt: new Date(cache.cachedAt).toISOString(),
-      expiresAt: new Date(expiresAt).toISOString(),
     };
   },
 );
@@ -1481,7 +1468,6 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
       slippageLimit: (slippageBps / 10_000).toFixed(4),
       expiresAt:     new Date(stored.expiresAt).toISOString(),
       rateBatchId,
-      expiresAt: new Date(stored.expiresAt).toISOString(),
     };
   },
 );

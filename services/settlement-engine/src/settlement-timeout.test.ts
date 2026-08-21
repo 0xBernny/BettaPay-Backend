@@ -71,10 +71,14 @@ async function onJobFailed(
 
 // ── Configuration test ──────────────────────────────────────────────────────
 
-test('SETTLEMENT_JOB_TIMEOUT_MS: worker config includes timeout option', (t) => {
+test('SETTLEMENT_JOB_TIMEOUT_MS: worker enforces the configurable timeout', (t) => {
   t.ok(
-    INDEX_SRC.includes('timeout: env.SETTLEMENT_JOB_TIMEOUT_MS'),
-    'worker config includes timeout: env.SETTLEMENT_JOB_TIMEOUT_MS',
+    INDEX_SRC.includes('withJobTimeout'),
+    'worker processor is wrapped in a withJobTimeout watchdog',
+  );
+  t.ok(
+    INDEX_SRC.includes('env.SETTLEMENT_JOB_TIMEOUT_MS'),
+    'SETTLEMENT_JOB_TIMEOUT_MS is applied to the worker',
   );
   t.end();
 });
