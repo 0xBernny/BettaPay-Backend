@@ -69,6 +69,10 @@ import {
 } from "./clients/indexer-client.js";
 import { UpstreamReadTimeoutError } from "./upstream-fetch.js";
 import {
+  WalletChallengeStore,
+  WALLET_CHALLENGE_TTL_MS,
+} from "./wallet-challenge-store.js";
+import {
   createSettlementClient,
   SettlementEngineUnavailableError,
 } from "./clients/settlement-client.js";
@@ -1129,10 +1133,12 @@ fastify.get('/api/admin/auth/ip-score', {
   return { ip, score: await getAuthIpScore(ip) };
 });
 
-  const walletChallenges = new Map<
-    string,
-    { challenge: string; expiresAt: number }
-  >();
+  // Wallet auth challenges are stored in Redis under a TTL (#554), so they
+  // expire on their own, are visible to every gateway instance, and are
+  // consumed by the first verification attempt.
+  const walletChallenges = new WalletChallengeStore(redis, {
+    ttlMs: WALLET_CHALLENGE_TTL_MS,
+  });
 
   interface WalletChallengeRouteBody {
     address?: unknown;
@@ -1146,12 +1152,28 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/auth/challenge",
     async (request, reply) => {
       const d = WalletChallengeBody.parse(request.body);
-      const challenge = crypto.randomBytes(32).toString("hex");
-      const expiresAt = Date.now() + 5 * 60 * 1000; // 5 mins
-      walletChallenges.set(d.address, { challenge, expiresAt });
+
+      let issued;
+      try {
+        issued = await walletChallenges.issue(d.address);
+      } catch (err) {
+        request.log.error(
+          { err, address: d.address },
+          "[Auth] Unable to store wallet challenge",
+        );
+        return reply
+          .code(503)
+          .send(
+            createErrorResponse(
+              ErrorCodes.INTERNAL_ERROR,
+              "Authentication service unavailable",
+            ),
+          );
+      }
+
       return reply.send({
-        challenge,
-        expiresAt: new Date(expiresAt).toISOString(),
+        challenge: issued.challenge,
+        expiresAt: new Date(issued.expiresAt).toISOString(),
       });
     },
   );
@@ -1170,9 +1192,29 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/auth/verify",
     async (request, reply) => {
       const d = LegacyWalletVerifyBody.parse(request.body);
-      const challengeInfo = walletChallenges.get(d.address);
 
-      if (!challengeInfo) {
+      // Consuming is atomic: the challenge is gone whatever happens next, so
+      // it is single-use and a signature cannot be guessed at repeatedly
+      // against one outstanding challenge (#554).
+      let consumed;
+      try {
+        consumed = await walletChallenges.consume(d.address);
+      } catch (err) {
+        request.log.error(
+          { err, address: d.address },
+          "[Auth] Unable to read wallet challenge",
+        );
+        return reply
+          .code(503)
+          .send(
+            createErrorResponse(
+              ErrorCodes.INTERNAL_ERROR,
+              "Authentication service unavailable",
+            ),
+          );
+      }
+
+      if (consumed.status === "not_found") {
         return reply
           .code(400)
           .send(
@@ -1183,8 +1225,7 @@ fastify.get('/api/admin/auth/ip-score', {
           );
       }
 
-      if (Date.now() > challengeInfo.expiresAt) {
-        walletChallenges.delete(d.address);
+      if (consumed.status === "expired") {
         return reply
           .code(400)
           .send(
@@ -1194,6 +1235,8 @@ fastify.get('/api/admin/auth/ip-score', {
             ),
           );
       }
+
+      const challengeInfo = consumed.challenge;
 
       try {
         const keypair = Keypair.fromPublicKey(d.address);
@@ -1215,8 +1258,6 @@ fastify.get('/api/admin/auth/ip-score', {
             createErrorResponse(ErrorCodes.UNAUTHORIZED, "Invalid signature"),
           );
       }
-
-      walletChallenges.delete(d.address);
 
       let merchant;
       try {
