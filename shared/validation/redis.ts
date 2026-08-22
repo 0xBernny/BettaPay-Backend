@@ -10,6 +10,13 @@ export interface MinimalLogger {
   error: (obj: object, msg?: string) => void;
 }
 
+export interface RedisHealthState {
+  connected: boolean;
+  errors: number;
+  lastError?: string;
+  reconnects: number;
+}
+
 export interface CreateRedisClientOptions extends Omit<RedisOptions, 'retryStrategy'> {
   maxDelayMs?: number;
   url?: string;
@@ -19,6 +26,7 @@ export interface CreateRedisClientOptions extends Omit<RedisOptions, 'retryStrat
   onError?: (err: Error) => void;
   onClose?: () => void;
   onReconnect?: () => void;
+  healthState?: RedisHealthState;
 }
 
 const sharedRedisClients = new Map<string, Redis>();
@@ -96,6 +104,7 @@ export function createRedisClient(
     onError,
     onClose,
     onReconnect,
+    healthState,
     logger: _ignoredLogger,
     url: _ignoredUrl,
     shared: _ignoredShared,
@@ -115,21 +124,34 @@ export function createRedisClient(
 
   client.on('connect', () => {
     log?.info({ url }, 'Redis connection established');
+    if (healthState) {
+      healthState.connected = true;
+    }
     onConnect?.();
   });
 
   client.on('error', (err: Error) => {
     log?.warn({ err: err.message, url }, 'Redis connection error');
+    if (healthState) {
+      healthState.errors++;
+      healthState.lastError = err.message;
+    }
     onError?.(err);
   });
 
   client.on('close', () => {
     log?.warn({ url }, 'Redis connection closed');
+    if (healthState) {
+      healthState.connected = false;
+    }
     onClose?.();
   });
 
   client.on('reconnecting', () => {
     log?.info({ url }, 'Redis reconnecting');
+    if (healthState) {
+      healthState.reconnects++;
+    }
     onReconnect?.();
   });
 
