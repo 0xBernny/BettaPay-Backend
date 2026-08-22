@@ -15,6 +15,7 @@
  *   POST   /api/merchants/:id/unsuspend — unsuspend merchant (service-auth, #317)
  *   PATCH  /api/merchants/:id/settings — update merchant fee rules / settings (protected)
  *   POST   /api/payments             — initiate payment session (protected)
+ *   GET    /api/payments             — list payments, merchant-scoped (protected, #553)
  *   GET    /api/payments/:id         — fetch payment session
  *   PATCH  /api/payments/:id/status  — transition payment status (protected)
  *   POST   /api/settlements          — trigger settlement (protected)
@@ -94,6 +95,7 @@ import {
   WalletVerifyBody,
   AuthIpScoreQuery,
   SettlementListQuery,
+  PaymentListQuery,
   PaginationQuery,
   BulkCancelPaymentsBody,
   UpdateMerchantKycBody,
@@ -1966,6 +1968,102 @@ fastify.get('/api/admin/auth/ip-score', {
       }
 
       return reply.code(201).send({ data: payment });
+    },
+  );
+
+  // Payments listing — merchant-scoped and paginated, mirroring /api/settlements.
+  //
+  // Authorization: service-to-service callers (x-service-token) may pass
+  // merchantId to filter across merchants. Merchant-authenticated callers
+  // (JWT) are always scoped to their own merchantId.
+  //
+  // Optional bulk event enrichment (?includeEvents=true, #553): the naive
+  // approach of enriching each payment individually calls the indexer once
+  // per payment, so listing latency scales with page size. Instead this
+  // batches the lookup by the *unique* merchantIds present on the page —
+  // for the common merchant-scoped case that's a single indexer call no
+  // matter how many payments are returned — and reuses each result across
+  // every payment for that merchant.
+  fastify.get<{
+    Querystring: z.infer<typeof PaymentListQuery> & { merchantId?: string };
+  }>(
+    "/api/payments",
+    {
+      preValidation: async (request: FastifyRequest, reply: FastifyReply) => {
+        if (request.headers["x-service-token"]) {
+          await fastify.serviceAuth(request, reply);
+          return;
+        }
+        await fastify.authenticate(request, reply);
+      },
+      config: { rateLimit: { max: 100, timeWindow: "1 minute" } },
+    },
+    async (request, reply) => {
+      const query = PaymentListQuery.parse(request.query);
+      const { status, from, to, limit, page, includeEvents } = query;
+      const requestedMerchantId = (request.query as { merchantId?: string })
+        .merchantId;
+
+      const isServiceAuth = Boolean(request.headers["x-service-token"]);
+      const scopedMerchantId = isServiceAuth
+        ? requestedMerchantId
+        : (request.user as { merchantId?: string } | undefined)?.merchantId;
+
+      const where: any = {};
+      if (scopedMerchantId) {
+        where.merchantId = scopedMerchantId;
+      }
+      if (status) {
+        where.status = status;
+      }
+      if (from || to) {
+        where.createdAt = {};
+        if (from) where.createdAt.gte = new Date(from);
+        if (to) where.createdAt.lte = new Date(to);
+      }
+
+      const [records, total] = await Promise.all([
+        prisma.payment.findMany({
+          where,
+          orderBy: { createdAt: "desc" },
+          take: limit,
+          skip: (page - 1) * limit,
+        }),
+        prisma.payment.count({ where }),
+      ]);
+
+      if (!includeEvents || records.length === 0) {
+        return reply.send({
+          data: records,
+          pagination: buildPaginationMeta(page, limit, total),
+        });
+      }
+
+      // One indexer call per unique merchantId on the page, not per payment.
+      const uniqueMerchantIds = [
+        ...new Set(records.map((p: { merchantId: string }) => p.merchantId)),
+      ];
+      const eventsByMerchant = new Map(
+        await Promise.all(
+          uniqueMerchantIds.map(async (merchantId) => {
+            const events = await indexerClient.getPaymentEvents(
+              merchantId,
+              request.headers,
+            );
+            return [merchantId, events] as const;
+          }),
+        ),
+      );
+
+      const data = records.map((payment: { merchantId: string }) => ({
+        ...payment,
+        events: eventsByMerchant.get(payment.merchantId) ?? null,
+      }));
+
+      return reply.send({
+        data,
+        pagination: buildPaginationMeta(page, limit, total),
+      });
     },
   );
 
