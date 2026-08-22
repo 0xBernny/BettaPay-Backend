@@ -131,11 +131,14 @@ model IndexedEvent {
 }
 
 model WebhookSubscription {
-  id            String   @id
-  url           String
-  createdAt     DateTime @default(now())
-  signingSecret String?
-  merchantId    String?
+  id                 String    @id
+  url                String
+  createdAt          DateTime  @default(now())
+  signingSecret      String?
+  merchantId         String?
+  lastTestedAt       DateTime?
+  lastTestStatus     String?
+  lastTestStatusCode Int?
 }
 
 model AuditLog {

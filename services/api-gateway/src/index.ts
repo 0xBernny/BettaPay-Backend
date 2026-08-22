@@ -1502,6 +1502,54 @@ fastify.get('/api/admin/auth/ip-score', {
     },
   );
 
+  fastify.post<{ Params: { id: string } }>(
+    "/api/webhooks/:id/test",
+    { preValidation: [fastify.authenticate] },
+    async (request, reply) => {
+      const { id } = request.params;
+      const payload = request.user as MerchantJwtPayload;
+
+      const existing = await prisma.webhookSubscription.findUnique({
+        where: { id },
+      });
+
+      if (!existing) {
+        return reply
+          .code(404)
+          .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Webhook subscription not found"));
+      }
+
+      if (existing.merchantId !== payload.merchantId) {
+        return reply
+          .code(403)
+          .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Forbidden"));
+      }
+
+      try {
+        const testResult = await indexerClient.testWebhook(
+          id,
+          request.headers as Record<string, string | string[] | undefined>
+        );
+        if (!testResult) {
+          return reply
+            .code(503)
+            .send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, "Indexer service unavailable"));
+        }
+        return reply.send(testResult);
+      } catch (err) {
+        if (err instanceof Error && err.message === 'NOT_FOUND') {
+          return reply
+            .code(404)
+            .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Webhook subscription not found in indexer"));
+        }
+        request.log.error({ err, id }, "Failed to test webhook");
+        return reply
+          .code(500)
+          .send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, "Failed to test webhook"));
+      }
+    },
+  );
+
   fastify.get(
     "/api/auth/sessions",
     {
