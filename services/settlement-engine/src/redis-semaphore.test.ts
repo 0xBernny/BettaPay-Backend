@@ -38,6 +38,31 @@ function createMockRedis() {
       delete ttls[key];
       return 1;
     },
+    async eval(script: string, numKeys: number, ...args: string[]) {
+      // Mock for the specific acquireScript used in redis-semaphore.ts
+      const key = args[0];
+      const now = parseInt(args[1], 10);
+      const windowMs = parseInt(args[2], 10);
+      const maxConcurrent = parseInt(args[3], 10);
+      const member = args[4];
+      const ttlSeconds = parseInt(args[5], 10);
+
+      if (store[key]) {
+        store[key] = store[key].filter(e => e.score >= now - windowMs);
+      }
+
+      const count = (store[key] ?? []).length;
+      if (count >= maxConcurrent) {
+        return 0;
+      }
+
+      if (!store[key]) store[key] = [];
+      store[key].push({ score: now, member });
+      store[key].sort((a, b) => a.score - b.score);
+
+      ttls[key] = ttlSeconds;
+      return 1;
+    },
   };
 }
 
@@ -127,5 +152,22 @@ test('acquire after release: re-acquires freed slot', async (t) => {
 
   await releaseSemaphore(redis, 'merchant-1');
   t.ok(await acquireSemaphore(redis, 'merchant-1', opts), 're-acquires after release');
+  t.end();
+});
+
+test('acquireSemaphore: handles concurrent acquires safely', async (t) => {
+  const redis = createMockRedis() as any;
+  const maxConcurrent = 3;
+  const numWorkers = 10;
+  
+  const promises = [];
+  for (let i = 0; i < numWorkers; i++) {
+    promises.push(acquireSemaphore(redis, 'merchant-concurrent', { maxConcurrent }));
+  }
+
+  const results = await Promise.all(promises);
+  const acquiredCount = results.filter(Boolean).length;
+  
+  t.equal(acquiredCount, maxConcurrent, 'only maxConcurrent acquires succeed under concurrency');
   t.end();
 });

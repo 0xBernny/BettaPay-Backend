@@ -74,6 +74,16 @@ export function decryptField(ciphertext: string, secretKey?: string): string {
   }
 }
 
+// Only plain objects are walked. Non-plain objects (Date, Prisma Decimal,
+// Buffer, class instances) are passed through untouched: spreading them would
+// strip their prototypes (e.g. Date -> {}, Decimal -> {d,e,s}) and corrupt
+// every API response that contains one. They can never hold sensitive fields.
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
 export function encryptSensitiveFields<T>(data: T, secretKey?: string): T {
   if (!data || typeof data !== 'object') {
     return data;
@@ -81,6 +91,10 @@ export function encryptSensitiveFields<T>(data: T, secretKey?: string): T {
 
   if (Array.isArray(data)) {
     return data.map((item) => encryptSensitiveFields(item, secretKey)) as unknown as T;
+  }
+
+  if (!isPlainObject(data)) {
+    return data;
   }
 
   const result: Record<string, any> = { ...(data as Record<string, any>) };
@@ -104,6 +118,10 @@ export function decryptSensitiveFields<T>(data: T, secretKey?: string): T {
 
   if (Array.isArray(data)) {
     return data.map((item) => decryptSensitiveFields(item, secretKey)) as unknown as T;
+  }
+
+  if (!isPlainObject(data)) {
+    return data;
   }
 
   const result: Record<string, any> = { ...(data as Record<string, any>) };

@@ -333,6 +333,9 @@ test('cross-rate: only one rate available — error thrown', (t) => {
     t.ok(e.message.includes('EURT'), `error mentions the missing currency: ${e.message}`);
     t.equal(warnings.length, 0, 'no warning logged when one rate is missing');
   }
+  t.end();
+});
+
 test('jitter: delays are within ±25% range and mean approximates the base interval', (t) => {
   const BASE_INTERVAL = 100;
   const SAMPLES = 1000;
