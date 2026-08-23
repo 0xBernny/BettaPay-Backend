@@ -250,7 +250,7 @@ const webhookWorker = createWebhookWorker('indexer-webhooks', sharedRedis, {
     warn: (obj, msg) => fastify.log.warn(obj, msg),
     error: (obj, msg) => fastify.log.error(obj, msg),
   },
-);
+});
 const getActiveWebhookJob = trackActiveJob(webhookWorker);
 
 // ── Dead-letter queue (DLQ) for webhooks that exhaust all retries (#354) ─────
