@@ -27,6 +27,13 @@ enum KycStatus {
   rejected
 }
 
+// #317 — Merchant suspension status. Backfilled to 'active' for existing rows
+// by the add_merchant_status migration.
+enum MerchantStatus {
+  active
+  suspended
+}
+
 model Merchant {
   id          String          @id
   name        String

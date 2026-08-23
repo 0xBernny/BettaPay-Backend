@@ -164,13 +164,12 @@ const BASE_BACKOFF = 1000;
 const MAX_BACKOFF = env.MAX_BACKOFF_INTERVAL_MS;
 let currentBackoff: number = BASE_BACKOFF;
 
-<<<<<<< HEAD
 // ── Shared Redis client ──────────────────────────────────────────────────────
 const sharedRedis = createRedisClient(env.REDIS_URL, fastify.log, { shared: true });
 fastify.addHook('onClose', async () => {
   await sharedRedis.quit().catch(() => {});
 });
-=======
+
 const indexerPollBackoffGauge = new promClient.Gauge({
   name: "indexer_poll_backoff_ms",
   help: "Current indexer polling backoff interval in milliseconds",
@@ -238,43 +237,18 @@ export function calculateBackoffAfterError(err: unknown): number {
   return currentBackoff;
 }
 
-// ── BullMQ webhook delivery queue ────────────────────────────────────────────
-
-const redisConn = new URL(env.REDIS_URL);
-const connectionParams = {
-  host: redisConn.hostname,
-  port: parseInt(redisConn.port || "6379", 10),
-  maxRetriesPerRequest: 3,
-};
->>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
 
 // ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
 //
 // Queue name kept as 'indexer-webhooks' so any jobs already in Redis from the
 // previous inline implementation are picked up without data loss (migration
 // safety — see shared/webhook-delivery/index.ts for details).
-<<<<<<< HEAD
 export const webhookQueue = createWebhookQueue('indexer-webhooks', sharedRedis);
 const webhookWorker = createWebhookWorker('indexer-webhooks', sharedRedis, {
   logger: {
     info: (obj, msg) => fastify.log.info(obj, msg),
     warn: (obj, msg) => fastify.log.warn(obj, msg),
     error: (obj, msg) => fastify.log.error(obj, msg),
-=======
-export const webhookQueue = createWebhookQueue(
-  "indexer-webhooks",
-  connectionParams,
-);
-const webhookWorker = createWebhookWorker(
-  "indexer-webhooks",
-  connectionParams,
-  {
-    logger: {
-      info: (obj, msg) => fastify.log.info(obj, msg),
-      warn: (obj, msg) => fastify.log.warn(obj, msg),
-      error: (obj, msg) => fastify.log.error(obj, msg),
-    },
->>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
   },
 );
 const getActiveWebhookJob = trackActiveJob(webhookWorker);
@@ -316,10 +290,6 @@ webhookWorker.on("failed", async (job, err) => {
   }
 });
 
-<<<<<<< HEAD
-webhookWorker.on('error', (err) => {
-  fastify.log.error({ err: err.message }, '[Indexer] Webhook worker error');
-=======
 // #386 — exponential backoff retry strategy
 const redisHealth = createRedisClient(env.REDIS_URL, fastify.log);
 redisHealth.on("error", (err) =>
@@ -331,7 +301,6 @@ fastify.addHook("onClose", async () => {
 
 webhookWorker.on("error", (err) => {
   fastify.log.error({ err: err.message }, "[Indexer] Webhook worker error");
->>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
 });
 webhookQueue.on("error", (err) => {
   fastify.log.error({ err: err.message }, "[Indexer] Webhook queue error");
@@ -339,13 +308,8 @@ webhookQueue.on("error", (err) => {
 
 // ── Replay queue & worker ─────────────────────────────────────────────────────
 
-<<<<<<< HEAD
 const replayQueue = new Queue('indexer-replays', {
   connection: sharedRedis,
-=======
-const replayQueue = new Queue("indexer-replays", {
-  connection: connectionParams,
->>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
   defaultJobOptions: {
     attempts: 2,
     backoff: { type: "exponential", delay: 2000 },
@@ -354,9 +318,6 @@ const replayQueue = new Queue("indexer-replays", {
   },
 });
 
-<<<<<<< HEAD
-const PROGRESS_KEY_PREFIX = 'replay:progress:';
-=======
 // #386 — exponential backoff retry strategy
 const replayProgressRedis = createRedisClient(env.REDIS_URL, fastify.log);
 replayProgressRedis.on("error", (err) =>
@@ -366,8 +327,7 @@ replayProgressRedis.on("error", (err) =>
   ),
 );
 
-const PROGRESS_KEY_PREFIX = "replay:progress:";
->>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
+const PROGRESS_KEY_PREFIX = 'replay:progress:';
 
 async function updateReplayProgress(
   jobId: string,
@@ -950,13 +910,9 @@ fastify.get<{ Params: { jobId: string } }>(
   async (request, reply) => {
     const { jobId } = request.params;
     try {
-<<<<<<< HEAD
-      const raw = await sharedRedis.get(`${PROGRESS_KEY_PREFIX}${jobId}`);
-=======
       const raw = await replayProgressRedis.get(
         `${PROGRESS_KEY_PREFIX}${jobId}`,
       );
->>>>>>> 046ebd1747090a489d2047f0995b2652eb1e07e7
       if (!raw) {
         return reply.code(404).send({
           error: {

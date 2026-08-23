@@ -58,8 +58,12 @@ export type WalletChallengeQuery = z.infer<typeof WalletChallengeQuery>;
 
 export const WalletVerifyBody = z.object({
   address: StellarAddressSchema,
-  challenge: z.string().min(1),
-  signature: z.string().min(1)
+  challenge: z.string().min(1).optional(),
+  signature: z.string().min(1),
+  // #task — nonce replay protection: the client signs a fresh nonce, and a
+  // used nonce is rejected with 409 on subsequent attempts.
+  nonce: z.string().min(1).optional(),
+  message: z.string().min(1).optional()
 });
 export type WalletVerifyBody = z.infer<typeof WalletVerifyBody>;
 
@@ -141,9 +145,8 @@ export const fxQuoteSchema = z.object({
   toCurrency: CurrencyCode,
   rate: z.string(),
   expiresAt: isoDateString,
-  rateBatchId: z.string().uuid()
+  rateBatchId: z.string().uuid(),
   slippageBps: z.number().int().min(0).optional(),
-  expiresAt: isoDateString
 });
 
 export const billPaymentSchema = z.object({
