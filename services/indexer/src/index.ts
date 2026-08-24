@@ -237,7 +237,6 @@ export function calculateBackoffAfterError(err: unknown): number {
   return currentBackoff;
 }
 
-// ── BullMQ webhook delivery queue ────────────────────────────────────────────
 
 // ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
 //
@@ -291,8 +290,17 @@ webhookWorker.on("failed", async (job, err) => {
   }
 });
 
-webhookWorker.on('error', (err) => {
-  fastify.log.error({ err: err.message }, '[Indexer] Webhook worker error');
+// #386 — exponential backoff retry strategy
+const redisHealth = createRedisClient(env.REDIS_URL, fastify.log);
+redisHealth.on("error", (err) =>
+  fastify.log.warn({ err: err.message }, "[Indexer] Redis health client error"),
+);
+fastify.addHook("onClose", async () => {
+  await redisHealth.quit().catch(() => {});
+});
+
+webhookWorker.on("error", (err) => {
+  fastify.log.error({ err: err.message }, "[Indexer] Webhook worker error");
 });
 webhookQueue.on("error", (err) => {
   fastify.log.error({ err: err.message }, "[Indexer] Webhook queue error");
@@ -300,7 +308,7 @@ webhookQueue.on("error", (err) => {
 
 // ── Replay queue & worker ─────────────────────────────────────────────────────
 
-const replayQueue = new Queue("indexer-replays", {
+const replayQueue = new Queue('indexer-replays', {
   connection: sharedRedis,
   defaultJobOptions: {
     attempts: 2,
@@ -310,7 +318,16 @@ const replayQueue = new Queue("indexer-replays", {
   },
 });
 
-const PROGRESS_KEY_PREFIX = "replay:progress:";
+// #386 — exponential backoff retry strategy
+const replayProgressRedis = createRedisClient(env.REDIS_URL, fastify.log);
+replayProgressRedis.on("error", (err) =>
+  fastify.log.warn(
+    { err: err.message },
+    "[Indexer] Replay progress Redis error",
+  ),
+);
+
+const PROGRESS_KEY_PREFIX = 'replay:progress:';
 
 async function updateReplayProgress(
   jobId: string,
@@ -893,7 +910,9 @@ fastify.get<{ Params: { jobId: string } }>(
   async (request, reply) => {
     const { jobId } = request.params;
     try {
-      const raw = await sharedRedis.get(`${PROGRESS_KEY_PREFIX}${jobId}`);
+      const raw = await replayProgressRedis.get(
+        `${PROGRESS_KEY_PREFIX}${jobId}`,
+      );
       if (!raw) {
         return reply.code(404).send({
           error: {
@@ -1488,10 +1507,10 @@ const start = async () => {
   try {
     // #391 — wait for both dependencies before accepting traffic
     await connectWithRetry(prisma, fastify.log);
-    await waitForRedis(sharedRedis, fastify.log);
+    await waitForRedis(redisHealth, fastify.log);
 
     // #387 — Redis memory monitoring
-    startRedisMemoryMonitor(sharedRedis, fastify.log);
+    startRedisMemoryMonitor(redisHealth, fastify.log);
 
     // #352 — smart startup ledger discovery
     latestLedgerCursor = await discoverStartLedger();
@@ -1523,7 +1542,7 @@ process.on("SIGTERM", async () => {
     getActiveWebhookJob,
   );
   await dlqQueue.close();
-  await sharedRedis.quit().catch(() => {});
+  await replayProgressRedis.quit().catch(() => {});
   await fastify.close();
   await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
   process.exit(0);

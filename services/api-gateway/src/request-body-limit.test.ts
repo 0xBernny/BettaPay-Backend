@@ -38,7 +38,8 @@ test('payload above limit is rejected with HTTP 413 on gateway app', async (t) =
 
   t.equal(response.statusCode, 413, 'returns 413 Payload Too Large');
   const body = JSON.parse(response.body);
-  t.equal(body.error, 'Payload Too Large', 'error name is Payload Too Large');
+  t.equal(body.error.code, 'FST_ERR_CTP_BODY_TOO_LARGE', 'reports the body-too-large error code');
+  t.match(body.error.message, /too large/i, 'message mentions the oversized body');
 
   await app.close();
   t.end();
