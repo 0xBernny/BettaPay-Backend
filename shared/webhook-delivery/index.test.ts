@@ -24,6 +24,8 @@ import {
   createWebhookQueue,
   createWebhookWorker,
   signPayload,
+  verifySignature,
+  canonicalize,
   WEBHOOK_DEFAULTS,
   type WebhookJobData,
   type WebhookLogger,
@@ -221,10 +223,13 @@ function extractProcessor(
       redis: redisOverride,
     });
 
-    // BullMQ Worker stores the processor internally — access it via cast.
-    // This is intentional test-only introspection; production code never
-    // accesses this field.
-    captured = (w as any).processor as (job: FakeJob) => Promise<void>;
+    // BullMQ v5 stores the processor as `processFn` on the Worker instance
+    // (older versions exposed it as `processor`).  Access it via cast —
+    // intentional test-only introspection; production code never accesses
+    // this field.
+    captured = ((w as any).processFn ?? (w as any).processor) as (
+      job: FakeJob,
+    ) => Promise<void>;
 
     // Close the worker async (ignore Redis errors).
     void (w as any).close?.().catch(() => {});
@@ -516,6 +521,178 @@ test('signPayload — different bodies produce different signatures', (t) => {
   const sig2 = signPayload('{"b":2}', secret);
 
   t.notEqual(sig1, sig2, 'different bodies yield different signatures');
+  t.end();
+});
+
+// ── Part 6b: Canonical JSON serialization (#567) ────────────────────────────
+
+test('canonicalize — sorts object keys recursively and strips whitespace', (t) => {
+  t.equal(canonicalize({ b: 1, a: 2 }), '{"a":2,"b":1}', 'top-level keys are sorted');
+  t.equal(
+    canonicalize({ z: { y: 1, x: [3, 2, 1] }, a: 'v' }),
+    '{"a":"v","z":{"x":[3,2,1],"y":1}}',
+    'nested keys are sorted; array order is preserved',
+  );
+  t.equal(canonicalize({ a: 1 }), JSON.stringify({ a: 1 }), 'no insignificant whitespace');
+  t.equal(canonicalize(null), 'null', 'null serializes as null');
+  t.equal(canonicalize([1, 'two', true, null]), '[1,"two",true,null]', 'primitives in arrays');
+  t.end();
+});
+
+test('canonicalize — semantically identical payloads produce identical bytes', (t) => {
+  const payload = {
+    version: '1.0',
+    event: {
+      id: 'evt_1',
+      type: 'payment.completed',
+      amount: 100,
+      meta: { z: 'last', a: 'first', arr: [1, 2, { b: 1, a: 2 }] },
+    },
+  };
+
+  // Same data, different key insertion order (what a reserialization produces).
+  const shuffled = {
+    event: {
+      meta: { arr: [1, 2, { a: 2, b: 1 }], a: 'first', z: 'last' },
+      amount: 100,
+      type: 'payment.completed',
+      id: 'evt_1',
+    },
+    version: '1.0',
+  };
+
+  const roundTripped = JSON.parse(JSON.stringify(payload));
+
+  t.equal(canonicalize(payload), canonicalize(shuffled), 'key reordering does not change canonical bytes');
+  t.equal(canonicalize(payload), canonicalize(roundTripped), 'parse/stringify round-trip does not change canonical bytes');
+  t.end();
+});
+
+test('#567 — signature survives canonical re-serialization (sign & verify the canonical form)', (t) => {
+  const secret = 'merchant-secret';
+  const payload = {
+    version: '1.0',
+    event: { id: 'evt_1', type: 'payment.completed', meta: { b: 2, a: 1 } },
+  };
+
+  // Re-serialize the payload the way a consumer would after logging/storing
+  // it: parse, then stringify again (whitespace/key order may differ).
+  const reserialized = JSON.stringify(JSON.parse(JSON.stringify(payload)));
+  const canonical = canonicalize(payload);
+  const signature = signPayload(canonical, secret);
+
+  t.notEqual(reserialized, canonical, 'raw reserialization differs from canonical bytes (the original bug)');
+  t.equal(
+    canonicalize(JSON.parse(reserialized)),
+    canonical,
+    'canonicalizing the reserialized payload restores the signed bytes',
+  );
+  t.ok(
+    verifySignature(canonicalize(JSON.parse(reserialized)), secret, signature),
+    'verification matches after canonical re-serialization',
+  );
+  t.ok(verifySignature(canonical, secret, signature), 'verification matches on the original canonical form');
+  t.end();
+});
+
+// ── Part 6c: verifySignature (#567) ─────────────────────────────────────────
+
+test('verifySignature — accepts a valid signature', (t) => {
+  const secret = 'secret';
+  const body = canonicalize({ version: '1.0', event: { type: 'payment.completed' } });
+  const sig = signPayload(body, secret);
+
+  t.ok(verifySignature(body, secret, sig), 'valid signature verifies');
+  t.end();
+});
+
+test('verifySignature — rejects tampered body, wrong secret, malformed header', (t) => {
+  const secret = 'secret';
+  const body = canonicalize({ event: { type: 'payment.completed' } });
+  const sig = signPayload(body, secret);
+
+  t.notOk(
+    verifySignature(canonicalize({ event: { type: 'payment.failed' } }), secret, sig),
+    'tampered body rejected',
+  );
+  t.notOk(verifySignature(body, 'wrong-secret', sig), 'wrong secret rejected');
+  t.notOk(verifySignature(body, secret, 'garbage'), 'malformed header rejected');
+  t.notOk(verifySignature(body, secret, 't=abc,s=xyz'), 'non-numeric timestamp rejected');
+  t.notOk(
+    verifySignature(body, secret, sig.replace(/s=[0-9a-f]{64}$/, `s=${'0'.repeat(64)}`)),
+    'modified HMAC rejected',
+  );
+  t.end();
+});
+
+test('verifySignature — enforces maxAgeSeconds replay window', (t) => {
+  const secret = 'secret';
+  const body = canonicalize({ event: { type: 'payment.completed' } });
+  const now = 1_700_000_000;
+
+  const makeSig = (ts: number) => {
+    const hmac = crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
+    return `t=${ts},s=${hmac}`;
+  };
+
+  t.ok(verifySignature(body, secret, makeSig(now - 100), { maxAgeSeconds: 300, now }), 'fresh signature within window accepted');
+  t.notOk(verifySignature(body, secret, makeSig(now - 400), { maxAgeSeconds: 300, now }), 'signature older than window rejected');
+  t.ok(verifySignature(body, secret, makeSig(now - 400)), 'age check is optional — accepted without maxAgeSeconds');
+  t.end();
+});
+
+test('worker processor — signs the canonical body, verification survives reserialization (#567)', async (t) => {
+  let capturedBody = '';
+  let capturedSignature = '';
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    capturedBody = String(init?.body ?? '');
+    const headers = Object.fromEntries(
+      Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])
+    );
+    capturedSignature = headers['X-BettaPay-Signature'] ?? '';
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — canonical signing test skipped');
+    t.end();
+    return;
+  }
+
+  const event = {
+    id: 'evt_1',
+    type: 'settlement.completed',
+    data: { amount: '100', currency: 'USDC' },
+  };
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event,
+    signingSecret: 'my-secret',
+  });
+
+  await processor(job as any);
+
+  t.equal(capturedBody, canonicalize({ version: '1.0', event }), 'worker POSTs the canonical serialization');
+  t.ok(capturedSignature.startsWith('t='), 'signature header is present');
+
+  // Consumer receives the payload, logs/stores it, and reserializes it with
+  // keys in a different order — verification must still match.
+  const reserialized = JSON.parse(capturedBody);
+  const reordered = {
+    event: {
+      data: { currency: 'USDC', amount: '100' },
+      type: 'settlement.completed',
+      id: 'evt_1',
+    },
+    version: '1.0',
+  };
+  t.same(reordered, reserialized, 'reordered object is semantically identical');
+  t.ok(
+    verifySignature(canonicalize(reordered), 'my-secret', capturedSignature),
+    'signature verifies against canonical re-serialization',
+  );
   t.end();
 });
 
