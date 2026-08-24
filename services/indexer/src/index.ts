@@ -16,7 +16,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import crypto from "crypto";
-import { Queue, Worker } from "bullmq";
+import { Queue, Worker, QueueEvents } from "bullmq";
 import {
   createWebhookQueue,
   createWebhookWorker,
@@ -1005,6 +1005,79 @@ fastify.delete<{ Params: { id: string } }>(
     cacheState.subscriptions = null; // Invalidate cache
     return reply.code(204).send();
   },
+);
+
+fastify.post<{ Params: { id: string } }>(
+  "/api/webhooks/:id/test",
+  { preValidation: [fastify.serviceAuth] },
+  async (request, reply) => {
+    const { id } = request.params;
+    const existing = await prisma.webhookSubscription.findUnique({
+      where: { id },
+    });
+
+    if (!existing) {
+      return reply.code(404).send({
+        error: { code: "NOT_FOUND", message: `Webhook subscription ${id} not found` },
+      });
+    }
+
+    const payload = {
+      type: 'test',
+      timestamp: new Date().toISOString(),
+      subscriptionId: id,
+      test: true,
+    };
+
+    const job = await webhookQueue.add("deliver", {
+      url: existing.url,
+      event: payload,
+      version: "1.0",
+      signingSecret: existing.signingSecret ?? undefined,
+    }, { attempts: 1 });
+
+    const queueEvents = new QueueEvents("indexer-webhooks", { connection: sharedRedis });
+    try {
+      await job.waitUntilFinished(queueEvents);
+      
+      const testedAt = new Date();
+      await prisma.webhookSubscription.update({
+        where: { id },
+        data: {
+          lastTestedAt: testedAt,
+          lastTestStatus: 'success',
+          lastTestStatusCode: 200,
+        }
+      });
+      return { success: true, statusCode: 200 };
+    } catch (err: any) {
+      let statusCode = null;
+      let errorMsg = err.message || String(err);
+      const match = errorMsg.match(/HTTP (\d+) from/);
+      if (match) {
+        statusCode = parseInt(match[1], 10);
+        errorMsg = `HTTP ${statusCode}`;
+      } else if (errorMsg.includes('connect ECONNREFUSED')) {
+        errorMsg = 'connect ECONNREFUSED';
+      }
+
+      const testedAt = new Date();
+      await prisma.webhookSubscription.update({
+        where: { id },
+        data: {
+          lastTestedAt: testedAt,
+          lastTestStatus: 'failed',
+          lastTestStatusCode: statusCode,
+        }
+      });
+      
+      const response: any = { success: false, error: errorMsg };
+      if (statusCode) response.statusCode = statusCode;
+      return response;
+    } finally {
+      await queueEvents.close();
+    }
+  }
 );
 
 // ── Admin: dead-letter queue (#354) ──────────────────────────────────────────

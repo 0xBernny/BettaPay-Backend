@@ -392,6 +392,8 @@ export const WebhookSubscriptionSchema = z.object({
   id: idSchema,
   url: z.string().url(),
   createdAt: isoDateString,
+  signingSecret: z.string().nullable().optional(),
+  merchantId: z.string().nullable().optional(),
   lastTestedAt: isoDateString.nullable().optional(),
   lastTestStatus: WebhookTestStatus.nullable().optional(),
   lastTestStatusCode: z.number().int().min(100).max(599).nullable().optional(),
