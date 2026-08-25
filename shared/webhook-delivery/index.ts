@@ -22,6 +22,12 @@
  *    BullMQ's own exponential back-off handles retry scheduling — no
  *    in-process `setTimeout` sleeping required.
  *
+ *    Custom headers: pass `headers` on `WebhookJobData` to have the worker
+ *    send merchant-specific headers (idempotency keys, bearer tokens, etc.)
+ *    with every attempt.  Because they're part of the persisted job data,
+ *    the same headers are sent on retries — not just the initial attempt.
+ *    `Content-Type` and `X-BettaPay-Signature` can't be overridden this way.
+ *
  * Retry / back-off
  * ────────────────
  *  Default: 5 attempts, exponential back-off starting at 1 000 ms.
@@ -78,7 +84,22 @@ export interface WebhookJobData {
   eventId?: string;
   /** Semantic version of the event payload structure. */
   version?: string;
+  /**
+   * Optional per-subscription custom headers (e.g. merchant-specific
+   * idempotency or auth headers) to send with every delivery attempt.
+   *
+   * Because these live on `WebhookJobData`, BullMQ persists them as part of
+   * the job — the same headers are replayed on every retry attempt, not just
+   * the first.  `Content-Type` and `X-BettaPay-Signature` are reserved and
+   * cannot be overridden this way (checked case-insensitively) so a
+   * misconfigured or malicious header set can't spoof the HMAC signature or
+   * change how the body is interpreted.
+   */
+  headers?: Record<string, string>;
 }
+
+/** Header names the worker always controls; custom headers cannot override them. */
+const RESERVED_HEADER_NAMES = new Set(['content-type', 'x-bettapay-signature']);
 
 /** Subset of a logger that the worker uses for structured output. */
 export interface WebhookLogger {
@@ -336,7 +357,7 @@ export function createWebhookWorker(
   const worker = new Worker<WebhookJobData>(
     queueName,
     async (job) => {
-      const { url, event, signingSecret, eventId, version = '1.0' } = job.data;
+      const { url, event, signingSecret, eventId, version = '1.0', headers: customHeaders } = job.data;
       const attempt = job.attemptsMade + 1; // attemptsMade is 0-indexed
 
       // ── Deduplication check ─────────────────────────────────────────────
@@ -362,7 +383,18 @@ export function createWebhookWorker(
       logger?.info({ url, jobId: job.id, attempt }, '[webhook-delivery] Delivering webhook');
 
       const body = canonicalize({ version, event });
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const headers: Record<string, string> = {};
+
+      // Custom headers first — merchant-configured idempotency/auth headers
+      // are preserved on every attempt because they live on job.data, which
+      // BullMQ persists across retries.  Reserved names are dropped here so
+      // they can't shadow the Content-Type / signature headers set below.
+      for (const [key, value] of Object.entries(customHeaders ?? {})) {
+        if (RESERVED_HEADER_NAMES.has(key.toLowerCase())) continue;
+        headers[key] = value;
+      }
+
+      headers['Content-Type'] = 'application/json';
 
       if (signingSecret) {
         headers['X-BettaPay-Signature'] = signPayload(body, signingSecret);
