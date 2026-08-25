@@ -100,6 +100,16 @@ export function createMockPrisma(initialData: MockData = {}) {
     supportedAssets: [...(initialData.supportedAssets || [])],
   };
 
+  function filterPayments(where: any = {}) {
+    return store.payments.filter((p) => {
+      if (where?.merchantId && p.merchantId !== where.merchantId) return false;
+      if (where?.status && p.status !== where.status) return false;
+      if (where?.createdAt?.gte && new Date(p.createdAt) < new Date(where.createdAt.gte)) return false;
+      if (where?.createdAt?.lte && new Date(p.createdAt) > new Date(where.createdAt.lte)) return false;
+      return true;
+    });
+  }
+
   const mockPayment = {
     findUnique: async ({ where }: { where: { id: string } }) => {
       return store.payments.find((p) => p.id === where.id) || null;
@@ -114,12 +124,16 @@ export function createMockPrisma(initialData: MockData = {}) {
         }) || null
       );
     },
-    findMany: async ({ where }: { where?: any } = {}) => {
-      if (!where) return [...store.payments];
-      return store.payments.filter((p) => {
-        if (where.merchantId && p.merchantId !== where.merchantId) return false;
-        return true;
-      });
+    findMany: async ({ where, take, skip }: { where?: any; take?: number; skip?: number } = {}) => {
+      const result = filterPayments(where).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+      const start = skip || 0;
+      const end = take !== undefined ? start + take : undefined;
+      return result.slice(start, end);
+    },
+    count: async ({ where }: { where?: any } = {}) => {
+      return filterPayments(where).length;
     },
     create: async ({ data }: { data: any }) => {
       const created = {

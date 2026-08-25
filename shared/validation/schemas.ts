@@ -544,6 +544,22 @@ export const SettlementListQuery = PaginationQuery.extend({
 );
 export type SettlementListQuery = z.infer<typeof SettlementListQuery>;
 
+export const PaymentListQuery = PaginationQuery.extend({
+  status: z.enum(['initiated', 'completed', 'failed', 'cancelled']).optional(),
+  from: isoDateString.optional(),
+  to: isoDateString.optional(),
+  // Batches on-chain event enrichment across the page instead of querying the
+  // indexer once per payment (#553): see the /api/payments handler.
+  includeEvents: z.coerce.boolean().default(false),
+}).refine(
+  (data) => {
+    if (data.from && data.to) return data.from <= data.to;
+    return true;
+  },
+  { message: 'to must be after from' }
+);
+export type PaymentListQuery = z.infer<typeof PaymentListQuery>;
+
 export const DateRangeQuery = z
   .object({
     from: isoDateString.optional(),
