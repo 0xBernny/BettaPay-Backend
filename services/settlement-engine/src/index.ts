@@ -146,7 +146,16 @@ setupPrismaQueryLogging(prismaBase, fastify.log);
 startPrismaPoolMetricsCollector(pool, promClient.register, 10000, fastify.log, promClient);
 
 // Shared Redis client (use createRedisClient factory with connection sharing)
-const redis = createRedisClient(env.REDIS_URL, fastify.log, { shared: true });
+const redisHealthState: import('@bettapay/validation').RedisHealthState = {
+  connected: false,
+  errors: 0,
+  reconnects: 0,
+};
+
+const redis = createRedisClient(env.REDIS_URL, fastify.log, {
+  shared: true,
+  healthState: redisHealthState,
+});
 
 fastify.addHook('onClose', async () => {
   await redis.quit().catch(() => {});
@@ -458,6 +467,7 @@ fastify.get('/api/health', async (_request, reply) => {
   const health = await buildSettlementEngineHealthResponse({
     queryDatabase: () => prisma.$queryRaw`SELECT 1`,
     pingRedis: () => redis.ping(),
+    redisHealthState,
     getQueueJobCounts: () => settlementQueue.getJobCounts(),
     getQueueIsPaused: () => settlementQueue.isPaused(),
     startTime,

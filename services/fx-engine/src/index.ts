@@ -758,7 +758,13 @@ const fastify = Fastify({
 
 registerRequestId(fastify);
 // #386 — exponential backoff retry strategy
-redis = createRedisClient(env.REDIS_URL, fastify.log);
+const redisHealthState: import('@bettapay/validation').RedisHealthState = {
+  connected: false,
+  errors: 0,
+  reconnects: 0,
+};
+
+redis = createRedisClient(env.REDIS_URL, fastify.log, { healthState: redisHealthState });
 redis.on("error", (err: any) =>
   fastify.log.warn({ err: err.message }, "Redis error in fx-engine"),
 );
@@ -894,6 +900,7 @@ function logRateStalenessIfStale(
 fastify.get("/api/health", async (_request, reply) => {
   const health = await buildFxEngineHealthResponse({
     pingRedis: () => redis.ping(),
+    redisHealthState,
     ratesApiUrl: env.RATES_API_URL,
     startTime,
     service: "fx-engine",

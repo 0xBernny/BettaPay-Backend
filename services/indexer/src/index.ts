@@ -165,7 +165,16 @@ const MAX_BACKOFF = env.MAX_BACKOFF_INTERVAL_MS;
 let currentBackoff: number = BASE_BACKOFF;
 
 // ── Shared Redis client ──────────────────────────────────────────────────────
-const sharedRedis = createRedisClient(env.REDIS_URL, fastify.log, { shared: true });
+const redisHealthState: import('@bettapay/validation').RedisHealthState = {
+  connected: false,
+  errors: 0,
+  reconnects: 0,
+};
+
+const sharedRedis = createRedisClient(env.REDIS_URL, fastify.log, {
+  shared: true,
+  healthState: redisHealthState,
+});
 fastify.addHook('onClose', async () => {
   await sharedRedis.quit().catch(() => {});
 });
@@ -731,6 +740,7 @@ fastify.get("/api/health", async (_request, reply) => {
   const health = await buildIndexerHealthResponse({
     queryDatabase: () => prisma.$queryRaw`SELECT 1`,
     pingRedis: () => sharedRedis.ping(),
+    redisHealthState,
     getQueueJobCounts: () => webhookQueue.getJobCounts(),
     getQueueIsPaused: () => webhookQueue.isPaused(),
     getLatestLedger: () => server.getLatestLedger(),

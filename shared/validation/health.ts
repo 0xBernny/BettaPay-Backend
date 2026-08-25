@@ -71,12 +71,36 @@ export async function checkPostgresql(
 export async function checkRedisPing(
   pingFn: () => Promise<string>,
   timeoutMs = HEALTH_CHECK_TIMEOUT_MS,
+  healthState?: { connected: boolean; errors: number; lastError?: string; reconnects: number },
 ): Promise<DependencyHealth> {
   const result = await withLatency(pingFn, timeoutMs);
-  if (result.ok && result.value === 'PONG') {
-    return { name: 'redis', status: 'connected', latencyMs: result.latencyMs };
+  
+  const details: Record<string, unknown> = {};
+  
+  if (healthState) {
+    details.connected = healthState.connected;
+    details.errors = healthState.errors;
+    details.reconnects = healthState.reconnects;
+    if (healthState.lastError) {
+      details.lastError = healthState.lastError;
+    }
   }
-  return { name: 'redis', status: 'disconnected', latencyMs: result.latencyMs };
+  
+  if (result.ok && result.value === 'PONG') {
+    return { 
+      name: 'redis', 
+      status: 'connected', 
+      latencyMs: result.latencyMs,
+      ...(Object.keys(details).length > 0 ? { details } : {}),
+    };
+  }
+  
+  return { 
+    name: 'redis', 
+    status: 'disconnected', 
+    latencyMs: result.latencyMs,
+    ...(Object.keys(details).length > 0 ? { details } : {}),
+  };
 }
 
 export const BULLMQ_WAITING_DEGRADED_THRESHOLD = 1000;
