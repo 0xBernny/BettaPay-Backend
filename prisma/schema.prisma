@@ -90,6 +90,9 @@ model Settlement {
   asset                   String
   status                  SettlementStatus @default(pending)
   webhookUrl              String?
+  // Custom headers (idempotency keys, auth tokens, etc.) sent with every
+  // webhook delivery attempt for this settlement, including retries (#569).
+  webhookHeaders          Json?
   batchId                 String?
   initiatedAt             DateTime         @default(now())
   completedAt             DateTime?
@@ -138,6 +141,9 @@ model WebhookSubscription {
   createdAt          DateTime  @default(now())
   signingSecret      String?
   merchantId         String?
+  // Custom headers (idempotency keys, auth tokens, etc.) sent with every
+  // delivery attempt for this subscription, including retries (#569).
+  headers            Json?
   lastTestedAt       DateTime?
   lastTestStatus     String?
   lastTestStatusCode Int?

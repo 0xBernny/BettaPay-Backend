@@ -38,6 +38,7 @@ import {
   DateRangeQuery,
   EVENT_TYPES,
   WebhookUrlSchema,
+  WebhookHeadersSchema,
   buildPrismaConnectionUrl,
   connectWithRetry,
   createLoggerOptions,
@@ -728,6 +729,7 @@ export async function persistEvent(
       event: record as Record<string, unknown>,
       version: "1.0",
       signingSecret: sub.signingSecret ?? undefined,
+      headers: (sub.headers as Record<string, string> | null) ?? undefined,
     });
   }
 
@@ -966,18 +968,21 @@ fastify.post(
 );
 
 // Issue #70 — webhook subscription CRUD
+// #569 — headers is optional: merchant-configured custom headers (idempotency
+// keys, auth tokens, etc.) sent with every delivery attempt, including retries.
 const WebhookBody = z.object({
   url: WebhookUrlSchema,
+  headers: WebhookHeadersSchema.optional(),
 });
 
 fastify.post(
   "/api/webhooks",
   { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
-    const { url } = WebhookBody.parse(request.body);
+    const { url, headers } = WebhookBody.parse(request.body);
     const sub = await prisma.$transaction(async (tx) => {
       const created = await tx.webhookSubscription.create({
-        data: { id: "wh_" + crypto.randomUUID().replace(/-/g, ""), url },
+        data: { id: "wh_" + crypto.randomUUID().replace(/-/g, ""), url, headers: headers ?? undefined },
       });
       await logAuditEvent(
         "webhook.registered",
@@ -1063,6 +1068,7 @@ fastify.post<{ Params: { id: string } }>(
       event: payload,
       version: "1.0",
       signingSecret: existing.signingSecret ?? undefined,
+      headers: (existing.headers as Record<string, string> | null) ?? undefined,
     }, { attempts: 1 });
 
     const queueEvents = new QueueEvents("indexer-webhooks", { connection: sharedRedis });

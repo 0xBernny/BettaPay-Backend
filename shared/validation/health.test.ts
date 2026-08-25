@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import {
   aggregateAllHealth,
   buildHealthResponse,
+  buildIndexerHealthResponse,
   buildSettlementEngineHealthResponse,
   checkBullMQ,
+  checkRedisPing,
   computeOverallStatus,
 } from './health.js';
 import type { DependencyHealth, HealthResponse } from './schemas.js';
@@ -164,6 +166,46 @@ test('buildSettlementEngineHealthResponse marks unhealthy when the queue is paus
   });
 
   assert.equal(health.status, 'unhealthy');
+});
+
+test('buildSettlementEngineHealthResponse forwards redisHealthState into the redis dependency details', async () => {
+  const health = await buildSettlementEngineHealthResponse({
+    queryDatabase: async () => [{ '?column?': 1 }],
+    pingRedis: async () => 'PONG',
+    getQueueJobCounts: async () => ({ waiting: 0, active: 0, failed: 0, delayed: 0 }),
+    getQueueIsPaused: async () => false,
+    redisHealthState: { connected: true, errors: 3, lastError: 'ECONNRESET', reconnects: 1 },
+    startTime: Date.now(),
+    service: 'settlement-engine',
+    version: '0.1.0',
+  });
+
+  const redisDep = health.dependencies.find((d) => d.name === 'redis');
+  assert.ok(redisDep?.details);
+  assert.equal(redisDep!.details!.errors, 3);
+  assert.equal(redisDep!.details!.reconnects, 1);
+  assert.equal(redisDep!.details!.lastError, 'ECONNRESET');
+});
+
+test('buildIndexerHealthResponse forwards redisHealthState into the redis dependency details', async () => {
+  const health = await buildIndexerHealthResponse({
+    queryDatabase: async () => [{ '?column?': 1 }],
+    pingRedis: async () => 'PONG',
+    getQueueJobCounts: async () => ({ waiting: 0, active: 0, failed: 0, delayed: 0 }),
+    getQueueIsPaused: async () => false,
+    redisHealthState: { connected: false, errors: 7, lastError: 'ETIMEDOUT', reconnects: 2 },
+    getLatestLedger: async () => ({ sequence: 100 }),
+    lagWarnThreshold: 50,
+    startTime: Date.now(),
+    service: 'indexer',
+    version: '0.1.0',
+  });
+
+  const redisDep = health.dependencies.find((d) => d.name === 'redis');
+  assert.ok(redisDep?.details);
+  assert.equal(redisDep!.details!.errors, 7);
+  assert.equal(redisDep!.details!.reconnects, 2);
+  assert.equal(redisDep!.details!.lastError, 'ETIMEDOUT');
 });
 
 test('aggregateAllHealth returns healthy when gateway and downstream services are healthy', async () => {

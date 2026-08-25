@@ -79,6 +79,7 @@ export function createMockIndexerClient(
 ): IndexerClient {
   return {
     getPaymentEvents: async (): Promise<IndexerEvent[]> => [],
+    testWebhook: async () => ({ success: true, statusCode: 200 }),
     ...overrides,
   };
 }

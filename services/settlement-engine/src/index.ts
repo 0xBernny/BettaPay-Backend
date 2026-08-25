@@ -61,6 +61,7 @@ import {
   startMetricsServer,
   runStartupChecks,
   startPrismaPoolMetricsCollector,
+  WebhookHeadersSchema,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
@@ -284,6 +285,20 @@ async function getMonthlyVolume(merchantId: string): Promise<number> {
   }
 }
 
+// Custom webhook headers (idempotency keys, auth tokens, etc.) are configured
+// per-merchant via PATCH /api/merchants/:id/settings (settings.webhookHeaders,
+// see UpdateMerchantSettingsBody) and captured onto the Settlement row at
+// creation time — the same lifecycle webhookUrl already follows (#569).
+// Re-validate here (rather than trusting the DB blob) since settings is a
+// loosely-typed JSON column that could have been written before validation
+// existed or hand-edited.
+function extractWebhookHeaders(settings: unknown): Record<string, string> | undefined {
+  if (settings === null || typeof settings !== 'object') return undefined;
+  const raw = (settings as Record<string, unknown>).webhookHeaders;
+  const parsed = WebhookHeadersSchema.safeParse(raw);
+  return parsed.success ? parsed.data : undefined;
+}
+
 // BullMQ has no per-job timeout option in WorkerOptions, so the configurable
 // SETTLEMENT_JOB_TIMEOUT_MS is enforced with a watchdog that races the
 // processor. Jobs that exceed the timeout are failed like any other error.
@@ -384,6 +399,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
         url: updatedSettlement.webhookUrl,
         eventId: crypto.randomUUID(),
         event: { event: 'settlement.completed', data: updatedSettlement as unknown as Record<string, unknown> },
+        headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
       });
     }
   } catch (error) {
@@ -400,6 +416,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
         url: updatedSettlement.webhookUrl,
         eventId: crypto.randomUUID(),
         event: { event: 'settlement.failed', data: updatedSettlement as unknown as Record<string, unknown> },
+        headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
       }).catch((err: unknown) => {
         log.error({ err, settlementId }, 'Failed to enqueue failure webhook');
       });
@@ -587,6 +604,7 @@ fastify.post<{ Params: { id: string } }>(
         asset: original.asset,
         status: 'pending',
         webhookUrl: original.webhookUrl,
+        webhookHeaders: (original.webhookHeaders ?? undefined) as any,
         feeSnapshot: (original.feeSnapshot ?? undefined) as any,
       },
     });
@@ -882,6 +900,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     const maxFeeBps = settings.maxFeeBps as number | undefined;
     const maxFeeThreshold = settings.maxFeeThreshold as string | undefined;
     const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
+    const webhookHeaders = parsedFeeRule.success ? extractWebhookHeaders(parsedFeeRule.data) : undefined;
 
     // Fetch monthly volume for volume-based fee discount (#323).
     // Redis-cached with a 5-min TTL; falls back to DB query on cache miss.
@@ -953,6 +972,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
         asset: d.asset,
         status: 'pending',
         webhookUrl,
+        webhookHeaders: webhookHeaders as any,
         feeSnapshot: feeSnapshot as any,
         idempotencyKey: idempotencyKey ?? undefined,
         idempotencyKeyExpiresAt: idempotencyKey ? new Date(Date.now() + 86400_000) : undefined,
@@ -1040,6 +1060,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     const maxFeeBps = settings_data.maxFeeBps as number | undefined;
     const maxFeeThreshold = settings_data.maxFeeThreshold as string | undefined;
     const webhookUrl = settings_data.webhookUrl as string ?? null;
+    const webhookHeaders = extractWebhookHeaders(settings_data);
 
     // Fetch monthly volume for volume-based fee discount (#323).
     const monthlyVolume = await getMonthlyVolume(d.merchantId);
@@ -1147,6 +1168,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
               asset: item.asset,
               status: 'pending',
               webhookUrl,
+              webhookHeaders: webhookHeaders as any,
               batchId,
             },
           });
