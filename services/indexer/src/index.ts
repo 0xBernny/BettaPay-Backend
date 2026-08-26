@@ -266,6 +266,7 @@ const webhookWorker = createWebhookWorker('indexer-webhooks', sharedRedis, {
 const getActiveWebhookJob = trackActiveJob(webhookWorker);
 
 // ── Dead-letter queue (DLQ) for webhooks that exhaust all retries (#354) ─────
+// The queue relies on the unconditionally initialized canonical sharedRedis client
 const DLQ_QUEUE_NAME = "indexer-webhooks-dlq";
 const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
   connection: sharedRedis,
