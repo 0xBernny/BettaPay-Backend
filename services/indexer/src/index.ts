@@ -249,11 +249,13 @@ export function calculateBackoffAfterError(err: unknown): number {
 
 
 // ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
+// (Resolved previous merge conflict markers here)
 //
 // Queue name kept as 'indexer-webhooks' so any jobs already in Redis from the
 // previous inline implementation are picked up without data loss (migration
 // safety — see shared/webhook-delivery/index.ts for details).
 export const webhookQueue = createWebhookQueue('indexer-webhooks', sharedRedis);
+// Ensure only one webhook worker is created to prevent duplicate deliveries
 const webhookWorker = createWebhookWorker('indexer-webhooks', sharedRedis, {
   logger: {
     info: (obj, msg) => fastify.log.info(obj, msg),
@@ -264,6 +266,7 @@ const webhookWorker = createWebhookWorker('indexer-webhooks', sharedRedis, {
 const getActiveWebhookJob = trackActiveJob(webhookWorker);
 
 // ── Dead-letter queue (DLQ) for webhooks that exhaust all retries (#354) ─────
+// The queue relies on the unconditionally initialized canonical sharedRedis client
 const DLQ_QUEUE_NAME = "indexer-webhooks-dlq";
 const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
   connection: sharedRedis,

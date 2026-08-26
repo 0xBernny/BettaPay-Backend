@@ -424,6 +424,7 @@ async function refreshTick(): Promise<void> {
 
     // HALF_OPEN: one probe is allowed; we log the intent so it is auditable.
     if (cbState === "HALF_OPEN") {
+      // Log the probe intent for auditing purposes
       fastify.log.info(
         { consecutiveFailures: circuitBreaker.consecutiveFailures },
         "Circuit breaker HALF_OPEN: probing CoinGecko",
