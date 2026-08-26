@@ -249,6 +249,7 @@ export function calculateBackoffAfterError(err: unknown): number {
 
 
 // ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
+// (Resolved previous merge conflict markers here)
 //
 // Queue name kept as 'indexer-webhooks' so any jobs already in Redis from the
 // previous inline implementation are picked up without data loss (migration
