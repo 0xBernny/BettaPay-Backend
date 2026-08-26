@@ -756,6 +756,153 @@ test('worker processor — no X-BettaPay-Signature when signingSecret absent', a
   t.end();
 });
 
+// ── Part 6d: Custom header passthrough (#569) ───────────────────────────────
+
+test('worker processor — delivers configured custom headers', async (t) => {
+  let capturedHeaders: Record<string, string> = {};
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    capturedHeaders = Object.fromEntries(
+      Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])
+    );
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — custom header test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    headers: {
+      'Idempotency-Key': 'idem_abc123',
+      'X-Merchant-Auth': 'Bearer merchant-token',
+    },
+  });
+
+  await processor(job as any);
+
+  t.equal(capturedHeaders['Idempotency-Key'], 'idem_abc123', 'idempotency header delivered');
+  t.equal(capturedHeaders['X-Merchant-Auth'], 'Bearer merchant-token', 'auth header delivered');
+  t.equal(capturedHeaders['Content-Type'], 'application/json', 'Content-Type is still set');
+  t.end();
+});
+
+test('worker processor — custom headers are replayed identically across retry attempts', async (t) => {
+  const attemptsSeen: Array<Record<string, string>> = [];
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    attemptsSeen.push(
+      Object.fromEntries(Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])),
+    );
+    // Fail the first two attempts so BullMQ (in prod) would retry; here we
+    // just invoke the processor again ourselves with an incremented
+    // attemptsMade, exactly as BullMQ would when it re-delivers job.data.
+    if (attemptsSeen.length < 3) throw new Error('simulated transient failure');
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — retry header test skipped');
+    t.end();
+    return;
+  }
+
+  const jobData: WebhookJobData = {
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    headers: { 'Idempotency-Key': 'idem_stable_across_retries' },
+  };
+
+  for (let attemptsMade = 0; attemptsMade < 3; attemptsMade++) {
+    try {
+      await processor(makeFakeJob(jobData, attemptsMade) as any);
+    } catch {
+      // expected for the first two simulated attempts
+    }
+  }
+
+  t.equal(attemptsSeen.length, 3, 'processor ran three attempts');
+  for (const [i, headers] of attemptsSeen.entries()) {
+    t.equal(
+      headers['Idempotency-Key'],
+      'idem_stable_across_retries',
+      `attempt ${i + 1} carried the same custom header`,
+    );
+  }
+  t.end();
+});
+
+test('worker processor — custom headers cannot override Content-Type or the signature header', async (t) => {
+  let capturedHeaders: Record<string, string> = {};
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    capturedHeaders = Object.fromEntries(
+      Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])
+    );
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — header override test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    signingSecret: 'my-secret',
+    headers: {
+      'content-type': 'text/plain',
+      'X-BETTAPAY-SIGNATURE': 'forged',
+      'X-Safe-Header': 'kept',
+    },
+  });
+
+  await processor(job as any);
+
+  t.equal(capturedHeaders['Content-Type'], 'application/json', 'Content-Type cannot be overridden (case-insensitive)');
+  t.notEqual(capturedHeaders['X-BettaPay-Signature'], 'forged', 'signature cannot be spoofed via custom headers (case-insensitive)');
+  t.ok(capturedHeaders['X-BettaPay-Signature']?.startsWith('t='), 'real computed signature is sent instead');
+  t.equal(capturedHeaders['X-Safe-Header'], 'kept', 'non-reserved custom headers still pass through');
+  t.end();
+});
+
+test('worker processor — no custom headers means only the defaults are sent', async (t) => {
+  let capturedHeaders: Record<string, string> = {};
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    capturedHeaders = Object.fromEntries(
+      Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])
+    );
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — default headers test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+  });
+
+  await processor(job as any);
+
+  t.same(Object.keys(capturedHeaders), ['Content-Type'], 'only Content-Type is sent when no headers/secret configured');
+  t.end();
+});
+
 // ── Part 7: Webhook deduplication (Redis SET NX) ──────────────────────────
 
 test('worker processor — deliver webhook records eventId in Redis', async (t) => {
