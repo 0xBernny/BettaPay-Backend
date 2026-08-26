@@ -255,6 +255,7 @@ export function calculateBackoffAfterError(err: unknown): number {
 // previous inline implementation are picked up without data loss (migration
 // safety — see shared/webhook-delivery/index.ts for details).
 export const webhookQueue = createWebhookQueue('indexer-webhooks', sharedRedis);
+// Ensure only one webhook worker is created to prevent duplicate deliveries
 const webhookWorker = createWebhookWorker('indexer-webhooks', sharedRedis, {
   logger: {
     info: (obj, msg) => fastify.log.info(obj, msg),
