@@ -408,6 +408,9 @@ const replayWorker = new Worker(
           );
         }
 
+        const processedLedgers = new Set<number>();
+        let currentLedger = -1;
+
         while (cursor <= toLedger) {
           const response = await server.getEvents({
             startLedger: cursor,
@@ -444,7 +447,21 @@ const replayWorker = new Worker(
               );
 
           for (const evt of response.events) {
-            if (evt.ledger > toLedger) break;
+            if (evt.ledger > toLedger) continue;
+            
+            if (currentLedger !== -1 && currentLedger !== evt.ledger) {
+              processedLedgers.add(currentLedger);
+            }
+            currentLedger = evt.ledger;
+
+            if (processedLedgers.has(evt.ledger)) {
+              fastify.log.warn(
+                { ledger: evt.ledger },
+                "[Indexer] Skipping out-of-order or duplicate ledger",
+              );
+              continue;
+            }
+
             cursor = Math.max(cursor, evt.ledger + 1);
 
             const topics = Array.isArray(evt.topic)
