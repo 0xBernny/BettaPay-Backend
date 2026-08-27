@@ -822,6 +822,28 @@ const bullMqConnection = {
   },
 };
 
+const RATE_CLEANUP_LOCK_KEY = "rate_cleanup_lock:global";
+const RATE_CLEANUP_LOCK_TTL_MS = 30_000;
+
+async function acquireCleanupLock(): Promise<string | null> {
+  const token = randomUUID();
+  const result = await redis
+    .set(RATE_CLEANUP_LOCK_KEY, token, "PX", RATE_CLEANUP_LOCK_TTL_MS, "NX")
+    .catch(() => null);
+  return result === "OK" ? token : null;
+}
+
+async function releaseCleanupLock(token: string): Promise<void> {
+  const script = `
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+      return redis.call("del", KEYS[1])
+    else
+      return 0
+    end
+  `;
+  await redis.eval(script, 1, RATE_CLEANUP_LOCK_KEY, token).catch(() => {});
+}
+
 /**
  * Reads RATE_HISTORY_RETENTION_DAYS from the environment each invocation
  * (no restart required when the value changes) and purges rate history
@@ -830,24 +852,34 @@ const bullMqConnection = {
  * @returns Number of entries removed.
  */
 async function runRateHistoryCleanup(): Promise<number> {
-  const retentionDays = parseInt(
-    process.env.RATE_HISTORY_RETENTION_DAYS ?? "7",
-    10,
-  );
-  const effectiveDays =
-    Number.isFinite(retentionDays) && retentionDays >= 1 ? retentionDays : 7;
-  const cutoff = Date.now() - effectiveDays * 24 * 60 * 60 * 1000;
+  const lockToken = await acquireCleanupLock();
+  if (!lockToken) {
+    fastify.log.info("Rate history cleanup skipped (lock held by another instance)");
+    return 0;
+  }
 
-  const purged = await redis.zremrangebyscore(SNAPSHOT_KEY, "-inf", cutoff);
-  fastify.log.info(
-    {
-      purged,
-      retentionDays: effectiveDays,
-      cutoff: new Date(cutoff).toISOString(),
-    },
-    "Rate history cleanup completed",
-  );
-  return purged;
+  try {
+    const retentionDays = parseInt(
+      process.env.RATE_HISTORY_RETENTION_DAYS ?? "7",
+      10,
+    );
+    const effectiveDays =
+      Number.isFinite(retentionDays) && retentionDays >= 1 ? retentionDays : 7;
+    const cutoff = Date.now() - effectiveDays * 24 * 60 * 60 * 1000;
+
+    const purged = await redis.zremrangebyscore(SNAPSHOT_KEY, "-inf", cutoff);
+    fastify.log.info(
+      {
+        purged,
+        retentionDays: effectiveDays,
+        cutoff: new Date(cutoff).toISOString(),
+      },
+      "Rate history cleanup completed",
+    );
+    return purged;
+  } finally {
+    await releaseCleanupLock(lockToken);
+  }
 }
 
 const cleanupQueue = new Queue("rate-history-cleanup", {
