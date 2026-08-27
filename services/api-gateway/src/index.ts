@@ -720,6 +720,11 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantSetti
 }, async (request, reply) => {
   const d = UpdateMerchantSettingsBody.parse(request.body);
 
+  // Return 422 if both feeBps and feeSchedules are provided (per #316)
+  if (d.feeBps !== undefined && d.feeSchedules !== undefined) {
+    return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Cannot provide both feeBps and feeSchedules'));
+  }
+
   const { id } = request.params;
   const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
   if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));

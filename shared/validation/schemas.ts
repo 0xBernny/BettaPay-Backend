@@ -56,6 +56,13 @@ export const merchantSchema = z.object({
   settings: z.record(z.any()).optional()
 });
 
+// Fee schedule item for per-asset fee configuration
+export const FeeScheduleItem = z.object({
+  asset: z.string().min(1),
+  bps: z.number().int().min(0).max(10000),
+});
+export type FeeScheduleItem = z.infer<typeof FeeScheduleItem>;
+
 // Fee rule extracted from merchant settings (feeBps in basis points, 0-10000)
 export const FeeRule = z.object({
   feeBps: z.number().int().min(0).max(10000),
@@ -287,12 +294,16 @@ export type IdempotencyKey = z.infer<typeof IdempotencyKeySchema>;
 
 export const MerchantSettings = z.object({
   feeBps: z.number().int().min(0).max(10000).optional(),
+  feeSchedules: z.array(FeeScheduleItem).optional(),
   webhookUrl: WebhookUrlSchema.optional(),
   preferredAsset: z.string().optional(),
   autoSettle: z.boolean().optional(),
   maxSettlementAmount: z.number().positive().optional(),
   minSettlementAmount: z.number().positive().optional(),
   dailySettlementLimit: z.number().positive().optional(),
+}).refine((data) => !(data.feeBps !== undefined && data.feeSchedules !== undefined), {
+  message: 'Cannot provide both feeBps and feeSchedules',
+  path: ['feeSchedules'],
 });
 
 export type MerchantSettings = z.infer<typeof MerchantSettings>;
@@ -389,11 +400,15 @@ export function isValidTransition(
 // the merchant's existing settings rather than replacing them.
 export const UpdateMerchantSettingsBody = z.object({
   feeBps: z.number().int().min(0).max(10000).optional(),
+  feeSchedules: z.array(FeeScheduleItem).optional(),
   tier: z.string().optional(),
   minSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'minSettlementAmount must be a numeric string').optional(),
   maxSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'maxSettlementAmount must be a numeric string').optional(),
   dailySettlementLimit: z.string().regex(/^\d+(\.\d+)?$/, 'dailySettlementLimit must be a numeric string').optional(),
   webhookUrl: WebhookUrlSchema.optional(),
+}).refine((data) => !(data.feeBps !== undefined && data.feeSchedules !== undefined), {
+  message: 'Cannot provide both feeBps and feeSchedules',
+  path: ['feeSchedules'],
 });
 
 export const UpdateMerchantNameBody = z.object({

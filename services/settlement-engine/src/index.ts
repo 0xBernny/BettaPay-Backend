@@ -33,7 +33,7 @@ import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import BigNumber from 'bignumber.js';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
-import { computeSettlementAmounts } from './settlement-amounts.js';
+import { computeSettlementAmounts, computeSettlementAmountsWithSchedule, FeeScheduleItem } from './settlement-amounts.js';
 import { acquireSemaphore, releaseSemaphore, getActiveCount } from './redis-semaphore.js';
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import {
@@ -610,7 +610,9 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     }
 
     const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
-    const parsedFeeRule = FeeRule.passthrough().safeParse(merchant?.settings);
+    const settings = merchant?.settings as Record<string, unknown> | null;
+    const parsedFeeRule = FeeRule.passthrough().safeParse(settings);
+    const feeSchedules = (settings?.feeSchedules as FeeScheduleItem[] | undefined) ?? undefined;
     let feeBps = env.FEES_DEFAULT_BPS;
     if (parsedFeeRule.success) {
       feeBps = parsedFeeRule.data.feeBps;
@@ -624,7 +626,8 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     }
     const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
 
-    const { grossAmount, feeAmount, netAmount, feeSnapshot } = computeSettlementAmounts(d.amount, feeBps);
+    const { grossAmount, feeAmount, netAmount, feeSnapshot } = computeSettlementAmountsWithSchedule(d.amount, d.asset, feeSchedules, env.FEES_DEFAULT_BPS);
+    feeBps = feeSnapshot.feeBpsApplied;
 
     const rawIdempotencyKey = request.headers['idempotency-key'];
     const idempotencyKey = Array.isArray(rawIdempotencyKey) ? rawIdempotencyKey[0] : rawIdempotencyKey;
@@ -713,10 +716,12 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       minSettlementAmount?: string;
       maxSettlementAmount?: string;
       dailySettlementLimit?: string;
+      feeSchedules?: FeeScheduleItem[];
     } | null | undefined;
 
     const parsedFeeRule = FeeRule.passthrough().safeParse(merchant?.settings);
-    const feeBps = parsedFeeRule.success ? parsedFeeRule.data.feeBps : env.FEES_DEFAULT_BPS;
+    const feeSchedules = settings?.feeSchedules ?? undefined;
+    const defaultFeeBps = parsedFeeRule.success ? parsedFeeRule.data.feeBps : env.FEES_DEFAULT_BPS;
     const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
 
     // Fetch current daily total
@@ -733,7 +738,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     const currentDailyTotal = aggregateResult?.[0]?.sum ? parseFloat(aggregateResult[0].sum) : 0;
 
     let runningBatchTotal = 0;
-    const validItems: Array<{ amount: string; asset: string; id: string; grossAmount: string; feeAmount: string; netAmount: string }> = [];
+    const validItems: Array<{ amount: string; asset: string; id: string; grossAmount: string; feeAmount: string; netAmount: string; feeBps: number }> = [];
     const errors: Array<{ index: number; reason: string }> = [];
 
     for (let i = 0; i < d.settlements.length; i++) {
@@ -780,7 +785,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         }
       }
 
-      const { grossAmount, feeAmount, netAmount } = computeSettlementAmounts(item.amount, feeBps);
+      const { grossAmount, feeAmount, netAmount, feeSnapshot } = computeSettlementAmountsWithSchedule(item.amount, item.asset, feeSchedules, defaultFeeBps);
       const settlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
 
       validItems.push({
@@ -789,7 +794,8 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         asset: item.asset,
         grossAmount,
         feeAmount,
-        netAmount
+        netAmount,
+        feeBps: feeSnapshot.feeBpsApplied
       });
       runningBatchTotal += amount;
     }
@@ -807,7 +813,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
               grossAmount: item.grossAmount,
               feeAmount: item.feeAmount,
               netAmount: item.netAmount,
-              feeBps,
+              feeBps: item.feeBps,
               asset: item.asset,
               status: 'pending',
               webhookUrl,
