@@ -410,6 +410,8 @@ export const EnvSchema = z.object({
     }),
 }).refine((data) => data.QUOTE_MIN_AGE_MS < data.QUOTE_MAX_LIFETIME_MS, {
   message: "QUOTE_MIN_AGE_MS must be less than QUOTE_MAX_LIFETIME_MS",
+}).refine((data) => data.DEFAULT_SLIPPAGE_BPS <= data.MAX_SLIPPAGE_BPS, {
+  message: "DEFAULT_SLIPPAGE_BPS must be less than or equal to MAX_SLIPPAGE_BPS",
 });
 
 export type Env = Omit<

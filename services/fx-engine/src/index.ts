@@ -751,6 +751,7 @@ interface StoredQuote {
   slippageBps: number;
   expiresAt:   number; // Unix ms — quote validity cutoff
   rateBatchId: string;
+  unroundedRate?: number;
 }
 
 export const fastify = Fastify({
@@ -1255,6 +1256,7 @@ fastify.get(
         slippageBps: quote.slippageBps,
         expiresAt: quote.expiresAt,
         rateBatchId: quote.rateBatchId,
+        unroundedRate: resolved.rate,
       };
       await redis.set(
         `${QUOTE_KEY_PREFIX}${quoteId}`,
@@ -1485,7 +1487,7 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
     const currentRate = getOrComputeRate(stored.from, stored.to);
     const slippageBps = stored.slippageBps ?? env.DEFAULT_SLIPPAGE_BPS;
     const rateBatchId = cache.batchIds[stored.from] ?? '';
-    const quotedRate = parseFloat(stored.rate);
+    const quotedRate = stored.unroundedRate ?? parseFloat(stored.rate);
 
     // Fail-open: if market rate is unavailable (fallback mode), accept by expiry
     let valid: boolean;
