@@ -35,6 +35,7 @@ import BigNumber from 'bignumber.js';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { computeSettlementAmounts, SettlementAmountError } from './settlement-amounts.js';
 import type { DiscountTier } from './settlement-amounts.js';
+import { buildSettlementWebhookData } from './webhook-payload.js';
 import { acquireSemaphore, releaseSemaphore, getActiveCount } from './redis-semaphore.js';
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import {
@@ -398,7 +399,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
       await webhookQueue.add('deliver', {
         url: updatedSettlement.webhookUrl,
         eventId: crypto.randomUUID(),
-        event: { event: 'settlement.completed', data: updatedSettlement as unknown as Record<string, unknown> },
+        event: { event: 'settlement.completed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
       });
     }
@@ -415,7 +416,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
       await webhookQueue.add('deliver', {
         url: updatedSettlement.webhookUrl,
         eventId: crypto.randomUUID(),
-        event: { event: 'settlement.failed', data: updatedSettlement as unknown as Record<string, unknown> },
+        event: { event: 'settlement.failed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
       }).catch((err: unknown) => {
         log.error({ err, settlementId }, 'Failed to enqueue failure webhook');
