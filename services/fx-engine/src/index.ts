@@ -228,6 +228,17 @@ let lastSuccessfulFetch: number | null = null;
 let lastOverrideAt: number | null = null;
 let fallbackStartTime: number | null = null;
 
+const fxFallbackEventsTotal = new promClient.Counter({
+  name: "fx_fallback_events_total",
+  help: "Total number of fallback events triggered",
+});
+
+const fxFallbackActive = new promClient.Gauge({
+  name: "fx_fallback_active",
+  help: "Indicates if the system is currently in fallback mode (1 = fallback, 0 = live)",
+});
+fxFallbackActive.set(0);
+
 // Log every 5 minutes when in fallback mode
 const FALLBACK_WARNING_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -372,6 +383,7 @@ async function fetchBaseRates(): Promise<Record<string, number> | null> {
     };
     lastSuccessfulFetch = Date.now();
     fallbackStartTime = null;
+    fxFallbackActive.set(0);
     return fetched;
   } catch (err) {
     const e = err as Error;
@@ -494,6 +506,8 @@ async function refreshTick(): Promise<void> {
           if (fallbackStartTime === null) {
             fallbackStartTime = Date.now();
             fastify.log.warn("Entering fallback FX rate mode");
+            fxFallbackEventsTotal.inc();
+            fxFallbackActive.set(1);
           }
         }
       } finally {
@@ -557,6 +571,8 @@ async function refreshTick(): Promise<void> {
       if (fallbackStartTime === null) {
         fallbackStartTime = Date.now();
         fastify.log.warn("Entering fallback FX rate mode");
+        fxFallbackEventsTotal.inc();
+        fxFallbackActive.set(1);
       }
     }
   } catch (err) {
