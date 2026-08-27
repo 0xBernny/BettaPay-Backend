@@ -753,7 +753,7 @@ interface StoredQuote {
   rateBatchId: string;
 }
 
-const fastify = Fastify({
+export const fastify = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
 });
 
@@ -1220,6 +1220,11 @@ fastify.get(
     const resolved = resolvePairRate(from, to, resolvedAt);
     cacheHit = resolved.source === "cache";
     logRateStalenessIfStale(fastify.log, `${from}_${to}`);
+
+    const stalenessSeconds = Math.floor((resolvedAt - cache.cachedAt) / 1000);
+    if (stalenessSeconds > env.MAX_STALE_SECONDS) {
+      reply.header("X-FX-Stale", "true");
+    }
 
     const quote: ComputedQuote = computeQuote({
       from,
