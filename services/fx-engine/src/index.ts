@@ -75,13 +75,16 @@ interface RateCache {
   rates: Record<string, number>;
   batchIds: Record<string, string>;
   cachedAt: number; // Unix ms timestamp
+  rateCachedAt: Record<string, number>; // Unix ms timestamp per rate
 }
 
 const initialBatchId = randomUUID();
+const initialTime = Date.now();
 let cache: RateCache = {
   rates:    { ...FALLBACK_RATES },
   batchIds: Object.fromEntries(Object.keys(FALLBACK_RATES).map((c) => [c, initialBatchId])),
-  cachedAt: Date.now(),
+  cachedAt: initialTime,
+  rateCachedAt: Object.fromEntries(Object.keys(FALLBACK_RATES).map((c) => [c, initialTime])),
 };
 
 // ── Computed pair-rate cache (issue #55) ───────────────────────────────────
@@ -179,12 +182,16 @@ async function storeRateSnapshot(rates: Record<string, number>): Promise<void> {
     .exec();
 }
 
-function updateBaseRates(updated: Record<string, number>, batchId: string): void {
+function updateBaseRates(updated: Record<string, number>, batchId: string, newlyFetched?: string[]): void {
+  const now = Date.now();
   for (const [currency, value] of Object.entries(updated)) {
     cache.rates[currency] = value;
     cache.batchIds[currency] = batchId;
+    if (!newlyFetched || newlyFetched.includes(currency) || currency === 'NGN') {
+      cache.rateCachedAt[currency] = now;
+    }
   }
-  cache.cachedAt = Date.now();
+  cache.cachedAt = now;
   computedRateCache.clear();
   storeRateSnapshot({ ...cache.rates }).catch(() => {}); // Redis errors are non-fatal
 }
@@ -443,10 +450,12 @@ async function refreshTick(): Promise<void> {
           const maxDeviationBps = env.MAX_DEVIATION_BPS;
           const merged: Record<string, number> = { ...cache.rates };
           const rejected: string[] = [];
+          const newlyFetched: string[] = [];
           for (const [asset, newRate] of Object.entries(fetched)) {
             const oldRate = cache.rates[asset];
             if (oldRate === undefined || oldRate === 0) {
               merged[asset] = newRate;
+              newlyFetched.push(asset);
               continue;
             }
             const deviationBps =
@@ -458,6 +467,7 @@ async function refreshTick(): Promise<void> {
               continue;
             }
             merged[asset] = newRate;
+            newlyFetched.push(asset);
           }
           if (rejected.length > 0) {
             fastify.log.warn(
@@ -465,7 +475,7 @@ async function refreshTick(): Promise<void> {
               "Rate deviation guard rejected rates; old rates preserved",
             );
           }
-          updateBaseRates(merged, batchId);
+          updateBaseRates(merged, batchId, newlyFetched);
           recordCircuitBreakerSuccess(fastify.log);
           fastify.log.info(
             {
@@ -515,10 +525,12 @@ async function refreshTick(): Promise<void> {
       const maxDeviationBps = env.MAX_DEVIATION_BPS;
       const merged: Record<string, number> = { ...cache.rates };
       const rejected: string[] = [];
+      const newlyFetched: string[] = [];
       for (const [asset, newRate] of Object.entries(fetched)) {
         const oldRate = cache.rates[asset];
         if (oldRate === undefined || oldRate === 0) {
           merged[asset] = newRate;
+          newlyFetched.push(asset);
           continue;
         }
         const deviationBps =
@@ -530,6 +542,7 @@ async function refreshTick(): Promise<void> {
           continue;
         }
         merged[asset] = newRate;
+        newlyFetched.push(asset);
       }
       if (rejected.length > 0) {
         fastify.log.warn(
@@ -537,7 +550,7 @@ async function refreshTick(): Promise<void> {
           "Rate deviation guard rejected rates (stampede fallback); old rates preserved",
         );
       }
-      updateBaseRates(merged, batchId);
+      updateBaseRates(merged, batchId, newlyFetched);
       recordCircuitBreakerSuccess(fastify.log);
     } else {
       recordCircuitBreakerFailure(fastify.log, env.CIRCUIT_BREAKER_COOLDOWN_MS);
@@ -869,13 +882,37 @@ function logRateStalenessIfStale(
   pair?: string,
 ): void {
   const now = Date.now();
-  const stalenessSeconds = Math.floor((now - cache.cachedAt) / 1000);
+  let maxStalenessSeconds = 0;
+  let timestamp = cache.cachedAt;
+  
+  if (pair) {
+    const [from, to] = pair.split('_');
+    const fromAge = now - (cache.rateCachedAt[from] ?? cache.cachedAt);
+    const toAge = now - (cache.rateCachedAt[to] ?? cache.cachedAt);
+    if (fromAge > toAge) {
+      maxStalenessSeconds = Math.floor(fromAge / 1000);
+      timestamp = cache.rateCachedAt[from] ?? cache.cachedAt;
+    } else {
+      maxStalenessSeconds = Math.floor(toAge / 1000);
+      timestamp = cache.rateCachedAt[to] ?? cache.cachedAt;
+    }
+  } else {
+    for (const age of Object.values(cache.rateCachedAt)) {
+      const staleness = Math.floor((now - age) / 1000);
+      if (staleness > maxStalenessSeconds) {
+        maxStalenessSeconds = staleness;
+        timestamp = age;
+      }
+    }
+  }
+
+  const stalenessSeconds = maxStalenessSeconds;
   if (stalenessSeconds <= env.MAX_STALE_SECONDS) return;
 
   const source = getRateSource();
   const baseFields = {
     source,
-    rateTimestamp: new Date(cache.cachedAt).toISOString(),
+    rateTimestamp: new Date(timestamp).toISOString(),
     stalenessSeconds,
     threshold: env.MAX_STALE_SECONDS,
   };
@@ -910,7 +947,6 @@ fastify.get("/api/health", async (_request, reply) => {
 
   // Per-pair rate feed freshness (TTL-based status)
   const now = Date.now();
-  const ageMs = now - cache.cachedAt;
   const FEED_TTL_MS = env.RATES_REFRESH_INTERVAL_MS;
 
   const rateFeeds: Record<
@@ -925,14 +961,16 @@ fastify.get("/api/health", async (_request, reply) => {
   const rateKeys = Object.keys(cache.rates);
   if (rateKeys.length === 0) {
     for (const currency of Object.keys(FALLBACK_RATES)) {
+      const ageMs = now - (cache.rateCachedAt[currency] ?? cache.cachedAt);
       rateFeeds[currency] = {
         status: "down",
-        lastUpdated: new Date(cache.cachedAt).toISOString(),
+        lastUpdated: new Date(cache.rateCachedAt[currency] ?? cache.cachedAt).toISOString(),
         ageMs,
       };
     }
   } else {
     for (const currency of rateKeys) {
+      const ageMs = now - (cache.rateCachedAt[currency] ?? cache.cachedAt);
       let status: "healthy" | "stale" | "down";
       if (ageMs >= 2 * FEED_TTL_MS) {
         status = "down";
@@ -943,7 +981,7 @@ fastify.get("/api/health", async (_request, reply) => {
       }
       rateFeeds[currency] = {
         status,
-        lastUpdated: new Date(cache.cachedAt).toISOString(),
+        lastUpdated: new Date(cache.rateCachedAt[currency] ?? cache.cachedAt).toISOString(),
         ageMs,
       };
     }
@@ -1039,16 +1077,16 @@ fastify.get(
 
     // Per-pair rate staleness
     const now = Date.now();
-    const stalenessSeconds = Math.floor((now - cache.cachedAt) / 1000);
     const source = getRateSource();
     const rateStaleness: Record<
       string,
       { source: "live" | "seed"; lastUpdated: string; stalenessSeconds: number; stale: boolean }
     > = {};
     for (const currency of Object.keys(cache.rates)) {
+      const stalenessSeconds = Math.floor((now - (cache.rateCachedAt[currency] ?? cache.cachedAt)) / 1000);
       rateStaleness[currency] = {
         source,
-        lastUpdated: new Date(cache.cachedAt).toISOString(),
+        lastUpdated: new Date(cache.rateCachedAt[currency] ?? cache.cachedAt).toISOString(),
         stalenessSeconds,
         stale: stalenessSeconds > env.MAX_STALE_SECONDS,
       };
@@ -1281,6 +1319,7 @@ fastify.get(
       rate: quote.rate,
       slippageBps: quote.slippageBps,
       slippageLimit: quote.slippageLimit,
+      stale:         Math.floor((resolvedAt - Math.min(cache.rateCachedAt[quote.from] ?? cache.cachedAt, cache.rateCachedAt[quote.to] ?? cache.cachedAt)) / 1000) > env.MAX_STALE_SECONDS,
       cachedAt:      new Date(cache.cachedAt).toISOString(),
       expiresAt:     new Date(quote.expiresAt).toISOString(),
       rateBatchId:   quote.rateBatchId,

@@ -13,12 +13,24 @@ function reset(
     lastSuccessfulFetch?: number | null;
     cacheAgeMs?: number;
     now?: number;
+    rateCachedAt?: Record<string, number>;
   } = {},
 ): void {
   currentTime = opts.now ?? 1_000_000_000_000;
   lastSuccessfulFetch = opts.lastSuccessfulFetch ?? null;
-  cacheCachedAt = currentTime - (opts.cacheAgeMs ?? 0);
+  (global as any).cache = {
+    cachedAt: cacheCachedAt,
+    rateCachedAt: opts.rateCachedAt ?? {
+      USDC: cacheCachedAt,
+      EURT: cacheCachedAt,
+      NGN: cacheCachedAt,
+    },
+    rates: {},
+    batchIds: {},
+  };
 }
+
+const cache = (global as any).cache;
 
 function getRateSource(): "live" | "seed" {
   return lastSuccessfulFetch !== null ? "live" : "seed";
@@ -40,13 +52,38 @@ function logRateStalenessIfStale(
   log: typeof mockLog,
   pair?: string,
 ): void {
-  const stalenessSeconds = Math.floor((currentTime - cacheCachedAt) / 1000);
+  const now = currentTime;
+  let maxStalenessSeconds = 0;
+  let timestamp = cache.cachedAt;
+  
+  if (pair) {
+    const [from, to] = pair.split('_');
+    const fromAge = now - (cache.rateCachedAt[from] ?? cache.cachedAt);
+    const toAge = now - (cache.rateCachedAt[to] ?? cache.cachedAt);
+    if (fromAge > toAge) {
+      maxStalenessSeconds = Math.floor(fromAge / 1000);
+      timestamp = cache.rateCachedAt[from] ?? cache.cachedAt;
+    } else {
+      maxStalenessSeconds = Math.floor(toAge / 1000);
+      timestamp = cache.rateCachedAt[to] ?? cache.cachedAt;
+    }
+  } else {
+    for (const age of Object.values(cache.rateCachedAt) as number[]) {
+      const staleness = Math.floor((now - age) / 1000);
+      if (staleness > maxStalenessSeconds) {
+        maxStalenessSeconds = staleness;
+        timestamp = age;
+      }
+    }
+  }
+
+  const stalenessSeconds = maxStalenessSeconds;
   if (stalenessSeconds <= MAX_STALE_SECONDS) return;
 
   const source = getRateSource();
   const baseFields: Record<string, unknown> = {
     source,
-    rateTimestamp: new Date(cacheCachedAt).toISOString(),
+    rateTimestamp: new Date(timestamp).toISOString(),
     stalenessSeconds,
     threshold: MAX_STALE_SECONDS,
   };
@@ -70,7 +107,7 @@ function logRateStalenessIfStale(
 }
 
 function computeRateStaleness() {
-  const stalenessSeconds = Math.floor((currentTime - cacheCachedAt) / 1000);
+  const stalenessSeconds = Math.floor((currentTime - cache.cachedAt) / 1000); // simplify for admin status test
   const source = getRateSource();
   return {
     source,
