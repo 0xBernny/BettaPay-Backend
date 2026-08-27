@@ -1052,19 +1052,34 @@ fastify.get("/api/health", async (_request, reply) => {
 
   // Degrade to degraded if fallback mode has been active for >1 hour (#236)
   const ONE_HOUR_MS = 60 * 60 * 1000;
+  let fallbackExceeded = false;
   if (
     fallbackStartTime !== null &&
     Date.now() - fallbackStartTime > ONE_HOUR_MS
   ) {
+    fallbackExceeded = true;
     if (health.status !== "unhealthy") {
       health.status = "degraded";
-      const ratesApi = health.upstream?.find((d) => d.name === "rates-api");
-      if (ratesApi) {
-        ratesApi.details = {
-          ...(ratesApi.details ?? {}),
-          fallbackModeDuration: "exceeded 1 hour",
-        };
-      }
+    }
+  }
+
+  const ratesApi = health.upstream?.find((d) => d.name === "rates-api");
+  if (ratesApi) {
+    if (feedStatus === "down") {
+      ratesApi.status = "unhealthy";
+    } else if (feedStatus === "degraded" && ratesApi.status === "healthy") {
+      ratesApi.status = "degraded";
+    }
+    if (fallbackExceeded) {
+      ratesApi.status = ratesApi.status === "healthy" ? "degraded" : ratesApi.status;
+    }
+    ratesApi.details = {
+      ...(ratesApi.details ?? {}),
+      latencyMs: lastRefresh?.durationMs ?? null,
+      circuitBreakerState: circuitBreaker.state,
+    };
+    if (fallbackExceeded) {
+      ratesApi.details.fallbackModeDuration = "exceeded 1 hour";
     }
   }
 
