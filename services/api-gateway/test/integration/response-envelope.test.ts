@@ -1,8 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildApp } from '../../src/index.js';
-import { createMockPrisma, generateTestJwt, createTestApp } from '../../src/test-utils.js';
-import { MOCK_MERCHANT_ACTIVE, MOCK_PAYMENT_INITIATED, MOCK_STELLAR_KEY_1 } from '../../src/test-fixtures.js';
+import {
+  createMockPrisma,
+  generateTestJwt,
+  createMockSettlementClient,
+  createMockFxClient,
+} from '../../src/test-utils.js';
+import { MOCK_MERCHANT_ACTIVE, MOCK_PAYMENT_INITIATED, MOCK_SUPPORTED_ASSET_USDC, MOCK_STELLAR_KEY_1 } from '../../src/test-fixtures.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -10,14 +15,17 @@ function jsonResponse(body: unknown, ok = true, status = 200): Response {
   return { ok, status, json: async () => body } as unknown as Response;
 }
 
-function createTestSetup(data: Record<string, any[]> = {}) {
+async function createTestSetup(data: Record<string, any[]> = {}) {
   const prisma = createMockPrisma({
     merchants: data.merchants || [MOCK_MERCHANT_ACTIVE],
     payments: data.payments || [],
     settlements: data.settlements || [],
     auditLogs: data.auditLogs || [],
+    supportedAssets: data.supportedAssets || [MOCK_SUPPORTED_ASSET_USDC],
   }) as any;
 
+  // fetchImpl only backs the /api/rates proxy route — the settlement and FX
+  // clients are injected from the centralized test-utils mock builders.
   const fetchImpl = async (url: string | URL | Request) => {
     const target = String(url);
     if (target.includes('/api/quote')) {
@@ -26,7 +34,14 @@ function createTestSetup(data: Record<string, any[]> = {}) {
     return jsonResponse({ status: 'ok' });
   };
 
-  const app = buildApp({ prisma, logger: false, fetchImpl: fetchImpl as any });
+  const app = buildApp({
+    prisma,
+    settlementClient: createMockSettlementClient() as any,
+    fxClient: createMockFxClient() as any,
+    logger: false,
+    fetchImpl: fetchImpl as any,
+  });
+  await app.ready();
   const token = generateTestJwt(app, { merchantId: MOCK_STELLAR_KEY_1, ownerId: 'owner-user-active-01' });
 
   return { app, prisma, token };
@@ -35,7 +50,7 @@ function createTestSetup(data: Record<string, any[]> = {}) {
 // ── Response Envelope Contract Tests ─────────────────────────────────────────
 
 test('GET /api/health returns liveness probe', async () => {
-  const { app } = createTestSetup();
+  const { app } = await createTestSetup();
   const res = await app.inject({ method: 'GET', url: '/api/health' });
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
@@ -44,7 +59,7 @@ test('GET /api/health returns liveness probe', async () => {
 });
 
 test('POST /api/merchants returns { data: { merchant, secret } }', async () => {
-  const { app, token } = createTestSetup();
+  const { app, token } = await createTestSetup();
   const res = await app.inject({
     method: 'POST',
     url: '/api/merchants',
@@ -66,7 +81,7 @@ test('POST /api/merchants returns { data: { merchant, secret } }', async () => {
 });
 
 test('GET /api/merchants/:id returns { data: merchant }', async () => {
-  const { app, token } = createTestSetup();
+  const { app, token } = await createTestSetup();
   const res = await app.inject({
     method: 'GET',
     url: `/api/merchants/${MOCK_STELLAR_KEY_1}`,
@@ -81,7 +96,7 @@ test('GET /api/merchants/:id returns { data: merchant }', async () => {
 });
 
 test('GET /api/merchants/:id returns { error } on not found', async () => {
-  const { app, token } = createTestSetup();
+  const { app, token } = await createTestSetup();
   const res = await app.inject({
     method: 'GET',
     url: '/api/merchants/nonexistent',
@@ -96,7 +111,7 @@ test('GET /api/merchants/:id returns { error } on not found', async () => {
 });
 
 test('DELETE /api/merchants/:id soft-deletes and returns { data }', async () => {
-  const { app, token } = createTestSetup();
+  const { app, token } = await createTestSetup();
   const res = await app.inject({
     method: 'DELETE',
     url: `/api/merchants/${MOCK_STELLAR_KEY_1}`,
@@ -115,7 +130,7 @@ test('POST /api/merchants/:id/restore restores soft-deleted merchant', async () 
     id: 'deleted-merchant-001',
     deletedAt: new Date('2026-01-01'),
   };
-  const { app, token } = createTestSetup({ merchants: [deletedMerchant] });
+  const { app, token } = await createTestSetup({ merchants: [deletedMerchant] });
   const res = await app.inject({
     method: 'POST',
     url: '/api/merchants/deleted-merchant-001/restore',
@@ -129,7 +144,7 @@ test('POST /api/merchants/:id/restore restores soft-deleted merchant', async () 
 });
 
 test('PATCH /api/merchants/:id/settings returns { data: { merchant } }', async () => {
-  const { app, token } = createTestSetup();
+  const { app, token } = await createTestSetup();
   const res = await app.inject({
     method: 'PATCH',
     url: `/api/merchants/${MOCK_STELLAR_KEY_1}/settings`,
@@ -145,7 +160,7 @@ test('PATCH /api/merchants/:id/settings returns { data: { merchant } }', async (
 });
 
 test('POST /api/payments returns { data: payment }', async () => {
-  const { app, token } = createTestSetup();
+  const { app, token } = await createTestSetup();
   const res = await app.inject({
     method: 'POST',
     url: '/api/payments',
@@ -168,7 +183,7 @@ test('POST /api/payments returns { data: payment }', async () => {
 });
 
 test('POST /api/payments with FX quote returns { data: { ...payment, fxQuote } }', async () => {
-  const { app, token } = createTestSetup();
+  const { app, token } = await createTestSetup();
   const res = await app.inject({
     method: 'POST',
     url: '/api/payments',
@@ -189,7 +204,7 @@ test('POST /api/payments with FX quote returns { data: { ...payment, fxQuote } }
 });
 
 test('POST /api/payments idempotency returns { data: payment } on cache hit', async () => {
-  const { app, token } = createTestSetup();
+  const { app, token } = await createTestSetup();
 
   // First request — creates payment
   const res1 = await app.inject({
@@ -238,7 +253,7 @@ test('GET /api/payments/:id returns { data: payment }', async () => {
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const { app } = createTestSetup({ payments: [payment] });
+  const { app } = await createTestSetup({ payments: [payment] });
 
   const res = await app.inject({
     method: 'GET',
@@ -252,7 +267,7 @@ test('GET /api/payments/:id returns { data: payment }', async () => {
 });
 
 test('GET /api/payments/:id returns { error } on not found', async () => {
-  const { app } = createTestSetup();
+  const { app } = await createTestSetup();
   const res = await app.inject({
     method: 'GET',
     url: '/api/payments/nonexistent',
@@ -272,7 +287,7 @@ test('PATCH /api/payments/:id/status returns { data: payment }', async () => {
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const { app, token } = createTestSetup({ payments: [payment] });
+  const { app, token } = await createTestSetup({ payments: [payment] });
 
   const res = await app.inject({
     method: 'PATCH',
@@ -296,7 +311,7 @@ test('PATCH /api/payments/:id/status returns 422 on invalid transition', async (
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const { app, token } = createTestSetup({ payments: [payment] });
+  const { app, token } = await createTestSetup({ payments: [payment] });
 
   const res = await app.inject({
     method: 'PATCH',
@@ -311,7 +326,7 @@ test('PATCH /api/payments/:id/status returns 422 on invalid transition', async (
 });
 
 test('GET /api/settlements returns { data: [], pagination: {} }', async () => {
-  const { app, token } = createTestSetup({
+  const { app, token } = await createTestSetup({
     settlements: [
       { id: 'set-001', merchantId: MOCK_STELLAR_KEY_1, status: 'PENDING', totalAmount: '100.00', initiatedAt: new Date() },
       { id: 'set-002', merchantId: MOCK_STELLAR_KEY_1, status: 'COMPLETED', totalAmount: '200.00', initiatedAt: new Date() },
@@ -345,7 +360,7 @@ test('POST /api/settlements creates settlement', async () => {
       dailySettlementLimit: '10000.00',
     },
   };
-  const { app, token, prisma } = createTestSetup({ merchants: [merchantWithLimits] });
+  const { app, token, prisma } = await createTestSetup({ merchants: [merchantWithLimits] });
 
   // Mock $queryRaw for daily limit check
   (prisma as any).$queryRaw = async () => [{ sum: '0' }];
@@ -372,7 +387,7 @@ test('POST /api/settlements returns 422 when below minimum', async () => {
       minSettlementAmount: '100.00',
     },
   };
-  const { app, token, prisma } = createTestSetup({ merchants: [merchantWithLimits] });
+  const { app, token, prisma } = await createTestSetup({ merchants: [merchantWithLimits] });
   (prisma as any).$queryRaw = async () => [{ sum: '0' }];
 
   const res = await app.inject({
@@ -399,7 +414,7 @@ test('POST /api/settlements returns 422 when daily limit exceeded', async () => 
       dailySettlementLimit: '1000.00',
     },
   };
-  const { app, token, prisma } = createTestSetup({ merchants: [merchantWithLimits] });
+  const { app, token, prisma } = await createTestSetup({ merchants: [merchantWithLimits] });
   (prisma as any).$queryRaw = async () => [{ sum: '900' }];
 
   const res = await app.inject({
@@ -419,7 +434,7 @@ test('POST /api/settlements returns 422 when daily limit exceeded', async () => 
 });
 
 test('GET /api/deployments returns { data: deployments }', async () => {
-  const { app } = createTestSetup();
+  const { app } = await createTestSetup();
   const res = await app.inject({ method: 'GET', url: '/api/deployments' });
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
@@ -431,14 +446,14 @@ test('GET /api/deployments returns { data: deployments }', async () => {
 });
 
 test('GET /api/rates proxies to FX engine', async () => {
-  const { app } = createTestSetup();
+  const { app } = await createTestSetup();
   const res = await app.inject({ method: 'GET', url: '/api/rates' });
   assert.equal(res.statusCode, 200);
   await app.close();
 });
 
 test('Unauthenticated request returns 401', async () => {
-  const { app } = createTestSetup();
+  const { app } = await createTestSetup();
   const res = await app.inject({
     method: 'GET',
     url: `/api/merchants/${MOCK_STELLAR_KEY_1}`,
@@ -448,7 +463,7 @@ test('Unauthenticated request returns 401', async () => {
 });
 
 test('POST /api/payments returns 400 for invalid body', async () => {
-  const { app, token } = createTestSetup();
+  const { app, token } = await createTestSetup();
   const res = await app.inject({
     method: 'POST',
     url: '/api/payments',

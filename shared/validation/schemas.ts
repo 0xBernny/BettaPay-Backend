@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { CurrencyCode } from './currency.js';
 import { validateStellarAddress } from '@bettapay/stellar-utils';
-import { WebhookUrlSchema } from './webhookSchema.js';
+import { WebhookUrlSchema, WebhookHeadersSchema } from './webhookSchema.js';
 
 
 // Entity schemas
@@ -15,6 +15,22 @@ export const PositiveAmountString = AmountString.refine(
     return !isNaN(parsed) && parsed > 0;
   },
   { message: 'Amount must be greater than zero' }
+);
+
+/** Settlement amounts must not exceed 10^15 (1,000,000,000,000,000). */
+export const SettlementAmountString = AmountString.refine(
+  (val) => {
+    const max = '1000000000000000';
+    const [intPart, decPart] = val.split('.');
+    if (intPart.length > max.length) return false;
+    if (intPart.length < max.length) return true;
+    // Same integer-part length — compare lexicographically (safe for same-length digit strings)
+    if (intPart > max) return false;
+    if (intPart < max) return true;
+    // Integer parts are identical — decimal part must be all zeros (or absent)
+    return !decPart || /^0+$/.test(decPart);
+  },
+  { message: 'Settlement amount exceeds maximum allowed (1,000,000,000,000,000)' },
 );
 
 export const StellarAddressSchema = z.string().refine(validateStellarAddress, {
@@ -42,8 +58,12 @@ export type WalletChallengeQuery = z.infer<typeof WalletChallengeQuery>;
 
 export const WalletVerifyBody = z.object({
   address: StellarAddressSchema,
-  challenge: z.string().min(1),
-  signature: z.string().min(1)
+  challenge: z.string().min(1).optional(),
+  signature: z.string().min(1),
+  // #task — nonce replay protection: the client signs a fresh nonce, and a
+  // used nonce is rejected with 409 on subsequent attempts.
+  nonce: z.string().min(1).optional(),
+  message: z.string().min(1).optional()
 });
 export type WalletVerifyBody = z.infer<typeof WalletVerifyBody>;
 
@@ -53,6 +73,9 @@ export const merchantSchema = z.object({
   ownerId: StellarAddressSchema,
   createdAt: isoDateString,
   deletedAt: isoDateString.optional(),
+  // #317 — suspension status; 'active' by default. Suspended merchants cannot
+  // create payments or settlements, but existing data remains readable.
+  status: z.enum(['active', 'suspended']).default('active'),
   settings: z.record(z.any()).optional()
 });
 
@@ -128,7 +151,9 @@ export const fxQuoteSchema = z.object({
   fromCurrency: CurrencyCode,
   toCurrency: CurrencyCode,
   rate: z.string(),
-  expiresAt: isoDateString
+  expiresAt: isoDateString,
+  rateBatchId: z.string().uuid(),
+  slippageBps: z.number().int().min(0).optional(),
 });
 
 export const billPaymentSchema = z.object({
@@ -214,8 +239,6 @@ export type FXQuote = z.infer<typeof fxQuoteSchema>;
 export type BillPayment = z.infer<typeof billPaymentSchema>;
 export type AnchorTransfer = z.infer<typeof anchorTransferSchema>;
 export type EventPayloads = z.infer<typeof eventSchemas>;
-export type AmountString = z.infer<typeof AmountString>;
-export type PositiveAmountString = z.infer<typeof PositiveAmountString>;
 
 // Convenience parsers
 export function parseEvent(raw: unknown) {
@@ -294,8 +317,10 @@ export type IdempotencyKey = z.infer<typeof IdempotencyKeySchema>;
 
 export const MerchantSettings = z.object({
   feeBps: z.number().int().min(0).max(10000).optional(),
-  feeSchedules: z.array(FeeScheduleItem).optional(),
+  maxFeeBps: z.number().int().min(0).max(10000).optional(),
+  maxFeeThreshold: z.string().regex(/^\d+(\.\d+)?$/, 'maxFeeThreshold must be a numeric string').optional(),
   webhookUrl: WebhookUrlSchema.optional(),
+  webhookHeaders: WebhookHeadersSchema.optional(),
   preferredAsset: z.string().optional(),
   autoSettle: z.boolean().optional(),
   maxSettlementAmount: z.number().positive().optional(),
@@ -328,10 +353,10 @@ export const CreatePaymentBody = z.object({
 
 export const CreateSettlementBody = z.object({
   merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
-  amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').optional(),
+  amount: SettlementAmountString.optional(),
   asset: CurrencyCode.optional(),
   items: z.array(z.object({
-    amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
+    amount: SettlementAmountString,
     asset: CurrencyCode,
   })).optional(),
   idempotencyKey: IdempotencyKeySchema.optional(),
@@ -347,7 +372,7 @@ export const CreateSettlementBody = z.object({
 export const BulkSettlementBody = z.object({
   merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
   settlements: z.array(z.object({
-    amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string'),
+    amount: SettlementAmountString,
     asset: CurrencyCode,
   })),
 });
@@ -355,6 +380,37 @@ export const BulkSettlementBody = z.object({
 export const AuthTokenBody = z.object({
   merchantId: StellarAddressSchema,
   secret: z.string().min(1, 'secret is required'),
+});
+
+export const AuthIpScoreQuery = z.object({
+  ip: z.string().min(1, 'ip is required'),
+});
+
+export const WebhookTestStatus = z.enum(['success', 'failed']);
+
+export const WebhookTestPayloadSchema = z.object({
+  type: z.literal('test'),
+  timestamp: isoDateString,
+  subscriptionId: idSchema,
+  test: z.literal(true),
+});
+
+export const WebhookTestResultSchema = z.object({
+  success: z.boolean(),
+  statusCode: z.number().int().min(100).max(599).optional(),
+  error: z.string().optional(),
+});
+
+export const WebhookSubscriptionSchema = z.object({
+  id: idSchema,
+  url: z.string().url(),
+  createdAt: isoDateString,
+  signingSecret: z.string().nullable().optional(),
+  merchantId: z.string().nullable().optional(),
+  headers: WebhookHeadersSchema.nullable().optional(),
+  lastTestedAt: isoDateString.nullable().optional(),
+  lastTestStatus: WebhookTestStatus.nullable().optional(),
+  lastTestStatusCode: z.number().int().min(100).max(599).nullable().optional(),
 });
 
 // A payment may only be moved into a terminal state. `initiated` is never an
@@ -400,21 +456,30 @@ export function isValidTransition(
 // the merchant's existing settings rather than replacing them.
 export const UpdateMerchantSettingsBody = z.object({
   feeBps: z.number().int().min(0).max(10000).optional(),
-  feeSchedules: z.array(FeeScheduleItem).optional(),
+  maxFeeBps: z.number().int().min(0).max(10000).optional(),
+  maxFeeThreshold: z.string().regex(/^\d+(\.\d+)?$/, 'maxFeeThreshold must be a numeric string').optional(),
   tier: z.string().optional(),
   minSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'minSettlementAmount must be a numeric string').optional(),
   maxSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'maxSettlementAmount must be a numeric string').optional(),
   dailySettlementLimit: z.string().regex(/^\d+(\.\d+)?$/, 'dailySettlementLimit must be a numeric string').optional(),
   webhookUrl: WebhookUrlSchema.optional(),
-}).refine((data) => !(data.feeBps !== undefined && data.feeSchedules !== undefined), {
-  message: 'Cannot provide both feeBps and feeSchedules',
-  path: ['feeSchedules'],
+  // Custom headers (idempotency keys, auth tokens, etc.) sent with every
+  // settlement webhook delivery attempt, including retries (#569).
+  webhookHeaders: WebhookHeadersSchema.optional(),
 });
 
 export const UpdateMerchantNameBody = z.object({
   name: z.string().min(2, 'Name must be at least 2 characters')
 });
 export type UpdateMerchantNameBody = z.infer<typeof UpdateMerchantNameBody>;
+
+export const KycStatusEnum = z.enum(['unverified', 'pending', 'verified', 'rejected']);
+export type KycStatusEnum = z.infer<typeof KycStatusEnum>;
+
+export const UpdateMerchantKycBody = z.object({
+  kycStatus: KycStatusEnum,
+});
+export type UpdateMerchantKycBody = z.infer<typeof UpdateMerchantKycBody>;
 
 export const SupportedAssetSchema = z.object({
   code: z.string().min(1),
@@ -424,6 +489,11 @@ export const SupportedAssetSchema = z.object({
   isActive: z.boolean(),
 });
 export type SupportedAsset = z.infer<typeof SupportedAssetSchema>;
+
+export const RateOverrideBody = z.object({
+  rates: z.record(z.string(), z.number().positive()),
+});
+export type RateOverrideBody = z.infer<typeof RateOverrideBody>;
 
 export const CreateSupportedAssetBody = z.object({
   code: z.string().min(1),
@@ -448,21 +518,62 @@ export const BulkCancelPaymentsBody = z.object({
 export type BulkCancelPaymentsBody = z.infer<typeof BulkCancelPaymentsBody>;
 
 export const PaginationQuery = z.object({
-  limit: z.coerce.number().max(200).default(50),
-  offset: z.coerce.number().min(0).default(0),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 export type PaginationQuery = z.infer<typeof PaginationQuery>;
+
+export const EventListQuery = PaginationQuery.extend({
+  type: z.string().optional(),
+  topic: z.string().optional(),
+  contractId: z.string().optional(),
+  fromLedger: z.coerce.number().int().min(1).optional(),
+  toLedger: z.coerce.number().int().min(1).optional(),
+}).refine(
+  (data) => {
+    if (data.fromLedger !== undefined && data.toLedger !== undefined) {
+      return data.fromLedger <= data.toLedger;
+    }
+    return true;
+  },
+  { message: "fromLedger must be <= toLedger" }
+);
+export type EventListQuery = z.infer<typeof EventListQuery>;
 
 export const SettlementListQuery = PaginationQuery.extend({
   status: z.enum(['pending', 'processing', 'completed', 'failed']).optional(),
   from: isoDateString.optional(),
   to: isoDateString.optional(),
+  startDate: isoDateString.optional(),
+  endDate: isoDateString.optional(),
   includeDeleted: z.coerce.boolean().default(false),
 }).refine(
-  (data) => !data.from || !data.to || data.from <= data.to,
-  { message: 'from must be before to' }
+  (data) => {
+    const start = data.startDate ?? data.from;
+    const end = data.endDate ?? data.to;
+    if (end && !start) return false;
+    if (start && end && start > end) return false;
+    return true;
+  },
+  { message: 'endDate requires startDate; startDate must be before endDate' }
 );
 export type SettlementListQuery = z.infer<typeof SettlementListQuery>;
+
+export const PaymentListQuery = PaginationQuery.extend({
+  status: z.enum(['initiated', 'completed', 'failed', 'cancelled']).optional(),
+  from: isoDateString.optional(),
+  to: isoDateString.optional(),
+  // Batches on-chain event enrichment across the page instead of querying the
+  // indexer once per payment (#553): see the /api/payments handler.
+  includeEvents: z.coerce.boolean().default(false),
+}).refine(
+  (data) => {
+    if (data.from && data.to) return data.from <= data.to;
+    return true;
+  },
+  { message: 'to must be after from' }
+);
+export type PaymentListQuery = z.infer<typeof PaymentListQuery>;
 
 export const DateRangeQuery = z
   .object({
@@ -480,8 +591,27 @@ export type CreatePaymentBody = z.infer<typeof CreatePaymentBody>;
 export type CreateSettlementBody = z.infer<typeof CreateSettlementBody>;
 export type BulkSettlementBody = z.infer<typeof BulkSettlementBody>;
 export type AuthTokenBody = z.infer<typeof AuthTokenBody>;
+export type AuthIpScoreQuery = z.infer<typeof AuthIpScoreQuery>;
+export type WebhookTestStatus = z.infer<typeof WebhookTestStatus>;
+export type WebhookTestPayload = z.infer<typeof WebhookTestPayloadSchema>;
+export type WebhookTestResult = z.infer<typeof WebhookTestResultSchema>;
+export type WebhookSubscription = z.infer<typeof WebhookSubscriptionSchema>;
 export type UpdatePaymentStatusBody = z.infer<typeof UpdatePaymentStatusBody>;
 export type UpdateMerchantSettingsBody = z.infer<typeof UpdateMerchantSettingsBody>;
+
+// ─── Indexer cleanup query ─────────────────────────────────────────────────────
+
+export const CleanupQuery = z.object({
+  dryRun: z.coerce.boolean().default(false),
+});
+export type CleanupQuery = z.infer<typeof CleanupQuery>;
+
+export interface CleanupDryRunResult {
+  wouldDelete: number;
+  totalSizeBytes: number;
+  retentionDays: number;
+  oldestEventDate: string;
+}
 
 // ─── Indexer types ────────────────────────────────────────────────────────────
 

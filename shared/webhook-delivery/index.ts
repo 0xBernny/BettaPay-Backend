@@ -22,6 +22,12 @@
  *    BullMQ's own exponential back-off handles retry scheduling — no
  *    in-process `setTimeout` sleeping required.
  *
+ *    Custom headers: pass `headers` on `WebhookJobData` to have the worker
+ *    send merchant-specific headers (idempotency keys, bearer tokens, etc.)
+ *    with every attempt.  Because they're part of the persisted job data,
+ *    the same headers are sent on retries — not just the initial attempt.
+ *    `Content-Type` and `X-BettaPay-Signature` can't be overridden this way.
+ *
  * Retry / back-off
  * ────────────────
  *  Default: 5 attempts, exponential back-off starting at 1 000 ms.
@@ -58,6 +64,7 @@
  */
 
 import { Queue, Worker, type ConnectionOptions, type WorkerOptions, type QueueOptions } from 'bullmq';
+import crypto from 'crypto';
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -67,7 +74,32 @@ export interface WebhookJobData {
   url: string;
   /** Arbitrary JSON-serialisable event payload. */
   event: Record<string, unknown>;
+  /** Optional HMAC signing secret.  When present the worker includes an
+   *  X-BettaPay-Signature header so the merchant can verify authenticity. */
+  signingSecret?: string;
+  /** Optional unique event identifier used for Redis-backed deduplication.
+   *  When set together with a redis client on the worker, the worker will
+   *  attempt a SET NX with 1-hour TTL before dispatch.  If the key already
+   *  exists the delivery is skipped (duplicate detected). */
+  eventId?: string;
+  /** Semantic version of the event payload structure. */
+  version?: string;
+  /**
+   * Optional per-subscription custom headers (e.g. merchant-specific
+   * idempotency or auth headers) to send with every delivery attempt.
+   *
+   * Because these live on `WebhookJobData`, BullMQ persists them as part of
+   * the job — the same headers are replayed on every retry attempt, not just
+   * the first.  `Content-Type` and `X-BettaPay-Signature` are reserved and
+   * cannot be overridden this way (checked case-insensitively) so a
+   * misconfigured or malicious header set can't spoof the HMAC signature or
+   * change how the body is interpreted.
+   */
+  headers?: Record<string, string>;
 }
+
+/** Header names the worker always controls; custom headers cannot override them. */
+const RESERVED_HEADER_NAMES = new Set(['content-type', 'x-bettapay-signature']);
 
 /** Subset of a logger that the worker uses for structured output. */
 export interface WebhookLogger {
@@ -80,14 +112,22 @@ export interface WebhookLogger {
 export interface WebhookQueueOptions {
   /** Number of completed jobs to keep in Redis (default 100). */
   removeOnCompleteCount?: number;
-  /** Number of failed jobs to keep in Redis for inspection (default 500). */
-  removeOnFailCount?: number;
+  /**
+   * Number of failed jobs to keep in Redis for inspection (default 500).
+   * Set to `false` to keep ALL failed jobs (useful for dead-letter patterns).
+   */
+  removeOnFail?: false | number;
   /** Number of delivery attempts before the job is marked failed (default 5). */
   attempts?: number;
   /** Initial back-off delay in milliseconds for exponential retry (default 1000). */
   backoffDelay?: number;
   /** Any additional BullMQ QueueOptions to pass through. */
   queueOptions?: Partial<QueueOptions>;
+}
+
+/** Minimal Redis client interface for webhook deduplication. */
+export interface DedupRedis {
+  set(key: string, value: string, mode: string, duration: string, flag: string): Promise<'OK' | null>;
 }
 
 /** Options accepted by createWebhookWorker. */
@@ -100,6 +140,10 @@ export interface WebhookWorkerOptions {
   logger?: WebhookLogger;
   /** Injectable fetch implementation — used by tests to avoid real HTTP. */
   fetchImpl?: typeof fetch;
+  /** Optional Redis client for webhook deduplication.  When set together with
+   *  an eventId on the job, the worker performs a SET NX with 1-hour TTL
+   *  before dispatch.  If the key already exists the delivery is skipped. */
+  redis?: DedupRedis;
   /** Any additional BullMQ WorkerOptions to pass through. */
   workerOptions?: Partial<WorkerOptions>;
 }
@@ -114,6 +158,136 @@ export const WEBHOOK_DEFAULTS = {
   removeOnCompleteCount: 100,
   removeOnFailCount: 500,
 } as const;
+
+// ── Canonical JSON serialization ─────────────────────────────────────────────
+
+/**
+ * Serializes any JSON-serialisable value into a canonical, deterministic string.
+ *
+ * `JSON.stringify` emits object keys in insertion order, so two semantically
+ * identical payloads can produce different byte strings — e.g. after a
+ * parse → log/store → re-stringify round-trip, or when keys were inserted in
+ * a different order.  Signing those strings yields different HMACs, which is
+ * why a signature computed over `JSON.stringify(payload)` breaks the moment
+ * the payload is reserialized anywhere between signing and verification.
+ *
+ * `canonicalize` removes that fragility:
+ *
+ *  - object keys are sorted lexicographically, recursively
+ *  - no insignificant whitespace is emitted
+ *  - array element order is preserved (arrays are ordered by definition)
+ *  - strings/numbers/booleans/null serialize exactly as JSON.stringify does
+ *
+ * Semantically identical payloads therefore always produce byte-identical
+ * output, so signer and verifier can always agree on the exact string the
+ * HMAC was computed over — even after arbitrary reserialization.
+ *
+ * @param value Any JSON-serialisable value (e.g. the result of JSON.parse,
+ *              or an object literal containing only JSON-safe data).
+ * @returns The canonical JSON string.
+ */
+export function canonicalize(value: unknown): string {
+  return serializeCanonical(value);
+}
+
+function serializeCanonical(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => serializeCanonical(isJsonValue(v) ? v : null)).join(',')}]`;
+  }
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj)
+      .filter((k) => isJsonValue(obj[k]))
+      .sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${serializeCanonical(obj[k])}`).join(',')}}`;
+  }
+  if (typeof value === 'number') {
+    // JSON.stringify renders NaN/±Infinity as null; mirror that so the
+    // canonical form stays valid JSON.
+    return Number.isFinite(value) ? JSON.stringify(value) : 'null';
+  }
+  return JSON.stringify(value);
+}
+
+/** True for values JSON.stringify would keep (undefined/functions/symbols are dropped). */
+function isJsonValue(value: unknown): boolean {
+  return value !== undefined && typeof value !== 'function' && typeof value !== 'symbol';
+}
+
+// ── HMAC-SHA256 signing & verification ───────────────────────────────────────
+
+/**
+ * Computes an HMAC-SHA256 signature over a canonical JSON body.
+ *
+ * The returned header format is: `t={unix_seconds},s={hex_hmac}`
+ * Merchants should reject signatures older than 5 minutes to prevent replay.
+ *
+ * Sign the canonical serialization of the payload (see `canonicalize`) — the
+ * exact bytes that will be POSTed.  The worker does this automatically before
+ * delivery.  Signing and verification both use the canonical form, so the
+ * signature survives reserialization.  Use `verifySignature` on the receiving
+ * side.
+ *
+ * @param body   The canonical JSON string that will be POSTed.
+ * @param secret The per-subscription signing secret.
+ * @returns      The value for the X-BettaPay-Signature header.
+ */
+export function signPayload(body: string, secret: string): string {
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const hmac = crypto.createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');
+  return `t=${timestamp},s=${hmac}`;
+}
+
+/** Options accepted by verifySignature. */
+export interface VerifySignatureOptions {
+  /**
+   * Reject signatures whose embedded timestamp is older than this many
+   * seconds.  Recommended: 300 (5 minutes) to prevent replay attacks.
+   */
+  maxAgeSeconds?: number;
+  /** Current unix time in seconds — injectable for deterministic tests. */
+  now?: number;
+}
+
+/**
+ * Verifies an X-BettaPay-Signature header against a payload body.
+ *
+ * The body must be the canonical serialization that was signed: pass the raw
+ * body bytes exactly as received (the worker POSTs the canonical form), or —
+ * if the payload was reserialized in transit (logging, storing, resending) —
+ * canonicalize it first: `canonicalize(JSON.parse(rawBody))`.  Because signing
+ * and verification agree on the canonical form, the signature survives
+ * canonical re-serialization.
+ *
+ * @param body      The (canonical) JSON body that was signed.
+ * @param secret    The per-subscription signing secret.
+ * @param signature The value of the X-BettaPay-Signature header.
+ * @param opts      Optional replay-window enforcement.
+ * @returns true if the signature matches (constant-time comparison).
+ */
+export function verifySignature(
+  body: string,
+  secret: string,
+  signature: string,
+  opts: VerifySignatureOptions = {},
+): boolean {
+  const match = /^t=(\d+),s=([0-9a-f]{64})$/.exec(signature);
+  if (!match) return false;
+
+  const timestamp = Number(match[1]);
+  const providedHmac = match[2];
+
+  if (opts.maxAgeSeconds !== undefined) {
+    const now = opts.now ?? Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(timestamp) || now - timestamp > opts.maxAgeSeconds) return false;
+  }
+
+  const expected = crypto.createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');
+  const expectedBuf = Buffer.from(expected, 'hex');
+  const providedBuf = Buffer.from(providedHmac, 'hex');
+  return expectedBuf.length === providedBuf.length && crypto.timingSafeEqual(expectedBuf, providedBuf);
+}
 
 // ── Factory: Queue ────────────────────────────────────────────────────────────
 
@@ -133,20 +307,23 @@ export function createWebhookQueue(
     attempts = WEBHOOK_DEFAULTS.attempts,
     backoffDelay = WEBHOOK_DEFAULTS.backoffDelay,
     removeOnCompleteCount = WEBHOOK_DEFAULTS.removeOnCompleteCount,
-    removeOnFailCount = WEBHOOK_DEFAULTS.removeOnFailCount,
+    removeOnFail: removeOnFailOpt,
     queueOptions = {},
   } = opts;
 
-  return new Queue<WebhookJobData>(name, {
+  const removeOnFailCount = removeOnFailOpt ?? WEBHOOK_DEFAULTS.removeOnFailCount;
+  const removeOnFailVal = removeOnFailOpt === false ? false : (typeof removeOnFailCount === 'number' ? removeOnFailCount : WEBHOOK_DEFAULTS.removeOnFailCount);
+
+  return new Queue(name, {
     connection,
     defaultJobOptions: {
       attempts,
       backoff: { type: 'exponential', delay: backoffDelay },
       removeOnComplete: { count: removeOnCompleteCount },
-      removeOnFail: { count: removeOnFailCount },
+      removeOnFail: removeOnFailVal,
     },
     ...queueOptions,
-  });
+  }) as unknown as Queue<WebhookJobData>;
 }
 
 // ── Factory: Worker ───────────────────────────────────────────────────────────
@@ -175,13 +352,53 @@ export function createWebhookWorker(
     workerOptions = {},
   } = opts;
 
+  const { redis: redisClient } = opts;
+
   const worker = new Worker<WebhookJobData>(
     queueName,
     async (job) => {
-      const { url, event } = job.data;
+      const { url, event, signingSecret, eventId, version = '1.0', headers: customHeaders } = job.data;
       const attempt = job.attemptsMade + 1; // attemptsMade is 0-indexed
 
+      // ── Deduplication check ─────────────────────────────────────────────
+      if (redisClient && eventId) {
+        try {
+          const dedupKey = `webhook_sent:${eventId}`;
+          const claimed = await redisClient.set(dedupKey, '1', 'PX', '3600000', 'NX');
+          if (claimed === null) {
+            logger?.warn(
+              { url, jobId: job.id, eventId },
+              '[webhook-delivery] Duplicate webhook detected — skipping delivery',
+            );
+            return;
+          }
+        } catch (err) {
+          logger?.warn(
+            { url, jobId: job.id, eventId, err: err instanceof Error ? err.message : String(err) },
+            '[webhook-delivery] Redis dedup check failed — delivering anyway (fail-open)',
+          );
+        }
+      }
+
       logger?.info({ url, jobId: job.id, attempt }, '[webhook-delivery] Delivering webhook');
+
+      const body = canonicalize({ version, event });
+      const headers: Record<string, string> = {};
+
+      // Custom headers first — merchant-configured idempotency/auth headers
+      // are preserved on every attempt because they live on job.data, which
+      // BullMQ persists across retries.  Reserved names are dropped here so
+      // they can't shadow the Content-Type / signature headers set below.
+      for (const [key, value] of Object.entries(customHeaders ?? {})) {
+        if (RESERVED_HEADER_NAMES.has(key.toLowerCase())) continue;
+        headers[key] = value;
+      }
+
+      headers['Content-Type'] = 'application/json';
+
+      if (signingSecret) {
+        headers['X-BettaPay-Signature'] = signPayload(body, signingSecret);
+      }
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -189,8 +406,8 @@ export function createWebhookWorker(
       try {
         const response = await fetchImpl(url, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ event }),
+          headers,
+          body,
           signal: controller.signal,
         });
 

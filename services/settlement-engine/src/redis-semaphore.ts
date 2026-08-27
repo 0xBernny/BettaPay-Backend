@@ -6,7 +6,7 @@
  * via INCR + TTL for lock safety (auto-releases on crash).
  */
 
-import type Redis from 'ioredis';
+import type { Redis } from 'ioredis';
 
 const DEFAULT_MAX_CONCURRENT = 3;
 const DEFAULT_TTL_SECONDS = 60;
@@ -19,6 +19,26 @@ export interface SemaphoreOptions {
   /** Key prefix (default: 'semaphore:settlement') */
   prefix?: string;
 }
+
+const acquireScript = `
+  local key = KEYS[1]
+  local now = tonumber(ARGV[1])
+  local windowMs = tonumber(ARGV[2])
+  local maxConcurrent = tonumber(ARGV[3])
+  local member = ARGV[4]
+  local ttlSeconds = tonumber(ARGV[5])
+
+  redis.call('ZREMRANGEBYSCORE', key, 0, now - windowMs)
+
+  local count = redis.call('ZCARD', key)
+  if count >= maxConcurrent then
+    return 0
+  end
+
+  redis.call('ZADD', key, now, member)
+  redis.call('EXPIRE', key, ttlSeconds)
+  return 1
+`;
 
 /**
  * Try to acquire a semaphore slot for the given merchant.
@@ -33,20 +53,20 @@ export async function acquireSemaphore(
   const key = `${prefix}:${merchantId}`;
   const now = Date.now();
   const windowMs = ttlSeconds * 1000;
+  const member = `${now}:${Math.random().toString(36).slice(2)}`;
 
-  // Clean up expired entries (entries older than TTL window)
-  await redis.zremrangebyscore(key, 0, now - windowMs);
+  const acquired = await redis.eval(
+    acquireScript,
+    1,
+    key,
+    now.toString(),
+    windowMs.toString(),
+    maxConcurrent.toString(),
+    member,
+    ttlSeconds.toString()
+  );
 
-  const count = await redis.zcard(key);
-  if (count >= maxConcurrent) {
-    return false;
-  }
-
-  // Add current timestamp as score and member (unique per acquisition)
-  await redis.zadd(key, now, `${now}:${Math.random().toString(36).slice(2)}`);
-  await redis.expire(key, ttlSeconds);
-
-  return true;
+  return acquired === 1;
 }
 
 /**

@@ -6,6 +6,7 @@ function validEnv(overrides: Record<string, string> = {}): Record<string, string
   return {
     NODE_ENV: 'test',
     JWT_SECRET: 'a'.repeat(32),
+    FIELD_ENCRYPTION_KEY: 'b'.repeat(32),
     GOOGLE_CLIENT_ID: 'test-client-id',
     INTER_SERVICE_SECRET: 'a'.repeat(16),
     DATABASE_URL: 'postgres://user:pass@localhost:5432/db',
