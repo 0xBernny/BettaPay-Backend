@@ -408,6 +408,9 @@ const replayWorker = new Worker(
           );
         }
 
+        const processedLedgers = new Set<number>();
+        let currentLedger = -1;
+
         while (cursor <= toLedger) {
           const response = await server.getEvents({
             startLedger: cursor,
@@ -444,7 +447,21 @@ const replayWorker = new Worker(
               );
 
           for (const evt of response.events) {
-            if (evt.ledger > toLedger) break;
+            if (evt.ledger > toLedger) continue;
+            
+            if (currentLedger !== -1 && currentLedger !== evt.ledger) {
+              processedLedgers.add(currentLedger);
+            }
+            currentLedger = evt.ledger;
+
+            if (processedLedgers.has(evt.ledger)) {
+              fastify.log.warn(
+                { ledger: evt.ledger },
+                "[Indexer] Skipping out-of-order or duplicate ledger",
+              );
+              continue;
+            }
+
             cursor = Math.max(cursor, evt.ledger + 1);
 
             const topics = Array.isArray(evt.topic)
@@ -1382,6 +1399,16 @@ export async function cleanupOldEvents(
       retentionDays,
       oldestEventDate: oldest?.indexedAt.toISOString() ?? "",
     };
+  }
+
+  // Issue 507: Skip cleanup for entries with active webhook jobs
+  const jobs = await webhookQueue.getJobs(['active', 'waiting', 'delayed']);
+  const activeEventIds = jobs
+    .map((j) => (j.data as any)?.event?.id)
+    .filter((id) => typeof id === 'string');
+
+  if (activeEventIds.length > 0) {
+    (where as any).id = { notIn: activeEventIds };
   }
 
   const { count } = await prisma.indexedEvent.deleteMany({ where });
