@@ -1401,6 +1401,16 @@ export async function cleanupOldEvents(
     };
   }
 
+  // Issue 507: Skip cleanup for entries with active webhook jobs
+  const jobs = await webhookQueue.getJobs(['active', 'waiting', 'delayed']);
+  const activeEventIds = jobs
+    .map((j) => (j.data as any)?.event?.id)
+    .filter((id) => typeof id === 'string');
+
+  if (activeEventIds.length > 0) {
+    (where as any).id = { notIn: activeEventIds };
+  }
+
   const { count } = await prisma.indexedEvent.deleteMany({ where });
   return count;
 }
