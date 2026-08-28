@@ -109,6 +109,11 @@ import { Keypair } from "@stellar/stellar-sdk";
 import { OAuth2Client } from "google-auth-library";
 import { registerGatewayHealthRoutes } from "./health.js";
 import {
+  consumeWalletChallenge,
+  storeWalletChallenge,
+  WALLET_CHALLENGE_TTL_MS,
+} from "./wallet-auth-challenge.js";
+import {
   startAbandonedPaymentsCron,
   stopAbandonedPaymentsCron,
 } from "./abandoned-payments-cron.js";
@@ -866,10 +871,6 @@ export function buildApp(opts: AppOptions = {}) {
     return count;
   }
 
-  async function isNonceUsed(nonce: string): Promise<boolean> {
-    return (await redis.exists(usedNonceKey(nonce))) === 1;
-  }
-
   async function markNonceUsed(nonce: string): Promise<boolean> {
     return (
       (await redis.set(
@@ -897,13 +898,6 @@ export function buildApp(opts: AppOptions = {}) {
     }
   }
 
-  function walletChallenge(d: {
-    challenge?: string;
-    message?: string;
-    nonce?: string;
-  }): string {
-    return d.challenge ?? d.message ?? d.nonce ?? "";
-  }
 
   // Signs a merchant JWT with a fresh jti and registers the matching session in
   // Redis so the authenticate hook can keep the session index fresh and the
@@ -1040,13 +1034,14 @@ export function buildApp(opts: AppOptions = {}) {
       const { address } = WalletChallengeQuery.parse(request.query);
       const nonce = crypto.randomBytes(32).toString("hex");
       const challenge = `BettaPay:${address}:${nonce}`;
-      const expiresAt = Date.now() + 2 * 60 * 1000; // 2 minutes
+      const expiresAt = Date.now() + WALLET_CHALLENGE_TTL_MS;
       try {
-        await redis.set(
-          `wallet_challenge:${address}`,
-          JSON.stringify({ challenge, expiresAt }),
-          "PX",
-          120000,
+        // Bind the nonce to this address, server-side, with a TTL. Consumed
+        // atomically on verify so it can be used at most once (#469).
+        await storeWalletChallenge(
+          redis,
+          { challenge, nonce, address, expiresAt },
+          WALLET_CHALLENGE_TTL_MS,
         );
       } catch (err) {
         request.log.error({ err }, "Failed to set wallet challenge in Redis");
@@ -1114,24 +1109,48 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
     throw err;
   }
 
-  if (d.nonce && (await isNonceUsed(d.nonce))) {
+  // Atomically claim the server-issued challenge for this address. This is the
+  // replay control: a captured, already-verified signed challenge finds
+  // nothing here on a second attempt (#469).
+  let stored;
+  try {
+    stored = await consumeWalletChallenge(redis, d.address);
+  } catch (err) {
+    request.log.error({ err }, 'Failed to read wallet challenge from Redis');
+    return reply.code(503).send({ error: 'Authentication service unavailable' });
+  }
+
+  if (!stored) {
     await recordAuthIpFailure(request);
     return reply
       .code(409)
-      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Nonce has already been used'));
+      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
   }
 
-  if (!verifyWalletSignature(d.address, walletChallenge(d), d.signature)) {
+  if (stored.address !== d.address || Date.now() > stored.expiresAt) {
+    await recordAuthIpFailure(request);
+    return reply
+      .code(409)
+      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
+  }
+
+  // If the client echoed a challenge, it must be the one we issued.
+  if (d.challenge && d.challenge !== stored.challenge) {
+    await recordAuthIpFailure(request);
+    return reply
+      .code(409)
+      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge does not match the one issued'));
+  }
+
+  // Verify against the *stored* challenge string, never the client-supplied one.
+  if (!verifyWalletSignature(d.address, stored.challenge, d.signature)) {
     await recordAuthIpFailure(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid wallet signature'));
   }
 
-  if (d.nonce && !(await markNonceUsed(d.nonce))) {
-    await recordAuthIpFailure(request);
-    return reply
-      .code(409)
-      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Nonce has already been used'));
-  }
+  // Defence in depth: also burn the raw nonce (challenge consume already made
+  // replay impossible, but a used-nonce record survives a challenge-store flush).
+  await markNonceUsed(stored.nonce).catch(() => {});
 
   await recordAuthIpSuccess(request);
 
