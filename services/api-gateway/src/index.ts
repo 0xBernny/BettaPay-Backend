@@ -104,7 +104,7 @@ import { PrismaClient } from "@prisma/client";
 import pg from "pg";
 import helmet from "@fastify/helmet";
 import { PrismaPg } from "@prisma/adapter-pg";
-import { fetchUpstream, UpstreamTimeoutError } from "./upstream-fetch.js";
+import { fetchUpstream, UpstreamTimeoutError, SsrfRejectedError, validateUpstreamUrl } from "./upstream-fetch.js";
 import { Keypair } from "@stellar/stellar-sdk";
 import { OAuth2Client } from "google-auth-library";
 import { registerGatewayHealthRoutes } from "./health.js";
@@ -2699,7 +2699,35 @@ fastify.get('/api/admin/auth/ip-score', {
     reply: FastifyReply,
     path: string,
   ) {
-    const targetUrl = new URL(path, env.FX_ENGINE_URL).toString();
+    if (path.startsWith('//') || path.includes('://')) {
+      return reply
+        .code(400)
+        .send(
+          createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            "Invalid upstream path",
+          ),
+        );
+    }
+
+    let targetUrl: string;
+    try {
+      targetUrl = new URL(path, env.FX_ENGINE_URL).toString();
+      validateUpstreamUrl(targetUrl);
+    } catch (err) {
+      if (err instanceof SsrfRejectedError) {
+        request.log.warn({ path, err: err.message }, "SSRF attempt rejected");
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              "Request to internal host is not allowed",
+            ),
+          );
+      }
+      throw err;
+    }
 
     try {
       const response = await fetchUpstream(request, targetUrl, {}, request.log);
