@@ -135,6 +135,22 @@ model IndexedEvent {
   @@index([indexedAt])
 }
 
+model IndexedEventWebhookDelivery {
+  id             String   @id
+  indexedEventId String
+  subscriptionId String
+  url            String
+  event          Json
+  signingSecret  String?
+  headers        Json?
+  status         String   @default("pending")
+  processedAt    DateTime?
+  createdAt      DateTime @default(now())
+
+  @@unique([indexedEventId, subscriptionId])
+  @@index([status, createdAt])
+}
+
 model WebhookSubscription {
   id                 String    @id
   url                String
