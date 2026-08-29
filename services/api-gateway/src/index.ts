@@ -547,8 +547,9 @@ export function buildApp(opts: AppOptions = {}) {
 
   // --- Same-origin enforcement --------------------------------------------------
   // Reject cross-origin mutations that lack an explicit CORS preflight.
-  // Server-to-server calls (no Origin header, authenticated via x-service-token)
-  // are exempt. GET/HEAD are also exempt since they cannot cause state changes.
+  // State-changing requests without an Origin header must include an
+  // `x-csrf-check` header to prove the caller is aware of the mutation.
+  // GET/HEAD/OPTIONS are exempt since they cannot cause state changes.
   const ALLOWED_ORIGINS_SET = new Set(
     env.ALLOWED_ORIGINS.map((o) => o.toLowerCase()),
   );
@@ -560,26 +561,42 @@ export function buildApp(opts: AppOptions = {}) {
       if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
 
       const origin = request.headers.origin;
-      if (!origin) return;
-
-      const normalised = origin.trim().replace(/\/+$/, "").toLowerCase();
-      const isAllowed = [...ALLOWED_ORIGINS_SET].some((allowed) =>
-        timingSafeStrEqual(normalised, allowed),
-      );
-
-      if (!isAllowed) {
-        request.log.warn(
-          { origin, method, url: request.url },
-          "Rejected cross-origin mutation",
+      if (origin) {
+        const normalised = origin.trim().replace(/\/+$/, "").toLowerCase();
+        const isAllowed = [...ALLOWED_ORIGINS_SET].some((allowed) =>
+          timingSafeStrEqual(normalised, allowed),
         );
-        return reply
-          .code(403)
-          .send(
-            createErrorResponse(
-              ErrorCodes.INVALID_ORIGIN,
-              "Request origin is not allowed",
-            ),
+
+        if (!isAllowed) {
+          request.log.warn(
+            { origin, method, url: request.url },
+            "Rejected cross-origin mutation",
           );
+          return reply
+            .code(403)
+            .send(
+              createErrorResponse(
+                ErrorCodes.INVALID_ORIGIN,
+                "Request origin is not allowed",
+              ),
+            );
+        }
+      } else {
+        const csrfCheck = request.headers["x-csrf-check"];
+        if (!csrfCheck) {
+          request.log.warn(
+            { method, url: request.url },
+            "Rejected mutation without Origin or CSRF header",
+          );
+          return reply
+            .code(403)
+            .send(
+              createErrorResponse(
+                ErrorCodes.INVALID_ORIGIN,
+                "Missing Origin or x-csrf-check header",
+              ),
+            );
+        }
       }
     },
   );
