@@ -58,12 +58,10 @@ export type WalletChallengeQuery = z.infer<typeof WalletChallengeQuery>;
 
 export const WalletVerifyBody = z.object({
   address: StellarAddressSchema,
+  nonce: z.string().min(1, 'nonce is required').max(512, 'nonce is too long'),
+  signature: z.string().min(1, 'signature is required'),
   challenge: z.string().min(1).optional(),
-  signature: z.string().min(1),
-  // #task — nonce replay protection: the client signs a fresh nonce, and a
-  // used nonce is rejected with 409 on subsequent attempts.
-  nonce: z.string().min(1).optional(),
-  message: z.string().min(1).optional()
+  message: z.string().min(1).optional(),
 });
 export type WalletVerifyBody = z.infer<typeof WalletVerifyBody>;
 
