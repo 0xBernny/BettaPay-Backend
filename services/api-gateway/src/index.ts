@@ -79,14 +79,13 @@ import {
   UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
   UpdateMerchantNameBody,
-  WalletChallengeQuery,
   WalletVerifyBody,
+  AuthIpScoreQuery,
   SettlementListQuery,
   PaymentListQuery,
   PaginationQuery,
   BulkCancelPaymentsBody,
   UpdateMerchantKycBody,
-  AuthIpScoreQuery,
   PAYMENT_STATUS_TRANSITIONS,
   SETTLEMENT_STATUS_TRANSITIONS,
   isValidTransition,
@@ -899,6 +898,14 @@ export function buildApp(opts: AppOptions = {}) {
     );
   }
 
+  function decodeWalletSignature(signature: string): Buffer {
+    const trimmed = signature.trim();
+    if (/^[0-9a-f]+$/i.test(trimmed) && trimmed.length % 2 === 0) {
+      return Buffer.from(trimmed, "hex");
+    }
+    return Buffer.from(trimmed, "base64");
+  }
+
   function verifyWalletSignature(
     address: string,
     challenge: string,
@@ -907,7 +914,7 @@ export function buildApp(opts: AppOptions = {}) {
     try {
       return Keypair.fromPublicKey(address).verify(
         Buffer.from(challenge, "utf8"),
-        Buffer.from(signature, "base64"),
+        decodeWalletSignature(signature),
       );
     } catch (err) {
       return false;
@@ -1048,36 +1055,9 @@ export function buildApp(opts: AppOptions = {}) {
       .catch(() => {});
   }
 
-  fastify.get<{ Querystring: WalletChallengeQuery }>(
-    "/api/auth/wallet/challenge",
-    {
-      config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
-    },
-    async (request, reply) => {
-      const { address } = WalletChallengeQuery.parse(request.query);
-      const nonce = crypto.randomBytes(32).toString("hex");
-      const challenge = `BettaPay:${address}:${nonce}`;
-      const expiresAt = Date.now() + 2 * 60 * 1000; // 2 minutes
-      try {
-        await redis.set(
-          `wallet_challenge:${address}`,
-          JSON.stringify({ challenge, expiresAt }),
-          "PX",
-          120000,
-        );
-      } catch (err) {
-        request.log.error({ err }, "Failed to set wallet challenge in Redis");
-        return reply
-          .code(503)
-          .send({ error: "Authentication service unavailable" });
-      }
-      return reply.send({ challenge, expiresAt });
-    },
-  );
-
   fastify.post('/api/auth/refresh', {
-  preHandler: [enforceAuthIpReputation]
-}, async (request, reply) => {
+    preHandler: [enforceAuthIpReputation]
+  }, async (request, reply) => {
   try {
     await request.jwtVerify();
   } catch (err) {
@@ -1434,7 +1414,10 @@ fastify.get('/api/admin/auth/ip-score', {
 
         const deviceInfo = `${request.ip || "unknown"} ${request.headers["user-agent"] ?? "unknown"}`;
         const jti = await createAuthSession(merchant.id, deviceInfo);
-        const jwtToken = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId, jti });
+        const jwtToken = fastify.jwt.sign(
+          { merchantId: merchant.id, ownerId: merchant.ownerId },
+          { jti },
+        );
         return reply.send({ token: jwtToken });
       } catch (err: any) {
         request.log.error({ err }, "[Auth] Google OAuth failed");
