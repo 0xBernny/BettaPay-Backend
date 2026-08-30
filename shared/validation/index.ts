@@ -49,9 +49,6 @@ export const ErrorCodes = {
   // #317 — returned when a suspended merchant attempts to create a payment
   // or settlement. Distinct from INVALID_REQUEST so clients can branch on it.
   MERCHANT_SUSPENDED: 'MERCHANT_SUSPENDED',
-  // FX Engine — quote age validation (#253): served quotes are rejected when
-  // they are too fresh (quoteAge < QUOTE_MIN_AGE_MS) or too old
-  // (quoteAge > QUOTE_MAX_LIFETIME_MS).
   QUOTE_TOO_YOUNG: 'QUOTE_TOO_YOUNG',
   QUOTE_TOO_OLD: 'QUOTE_TOO_OLD',
 } as const;
@@ -186,10 +183,6 @@ export const EnvSchema = z.object({
     .string()
     .transform((s) => parseInt(s, 10))
     .default("15"),
-  AUTH_IP_THRESHOLD: z
-    .string()
-    .transform((s) => parseInt(s, 10))
-    .default("20"),
 
   // Indexer RPC backoff ceiling. Doubles the wait interval on 429s up to
   // this maximum value.
@@ -310,9 +303,7 @@ export const EnvSchema = z.object({
     .transform((s) => parseInt(s, 10))
     .default("2000"),
 
-  // FX Engine — staleness threshold (seconds). Rates older than this trigger
-  // structured WARN (live source) or ERROR (seed source) logs when served.
-  // Default: 300 (5 minutes).
+  // FX Engine — staleness threshold (seconds)
   MAX_STALE_SECONDS: z
     .string()
     .transform((s) => parseInt(s, 10))
@@ -399,8 +390,7 @@ export const EnvSchema = z.object({
     .transform((s) => parseInt(s, 10))
     .default("100000"),
 
-  // Settlement Engine — worker job timeout (ms). Jobs exceeding this duration
-  // are automatically failed by BullMQ. Default: 30000 (30 seconds).
+  // Settlement Engine — worker job timeout (ms)
   SETTLEMENT_JOB_TIMEOUT_MS: z
     .string()
     .transform((s) => parseInt(s, 10))
@@ -408,6 +398,76 @@ export const EnvSchema = z.object({
     .refine((val) => Number.isFinite(val) && val > 0, {
       message: "SETTLEMENT_JOB_TIMEOUT_MS must be a positive integer",
     }),
+}).superRefine((data, ctx) => {
+  if (data.QUOTE_MIN_AGE_MS >= data.QUOTE_MAX_LIFETIME_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "QUOTE_MIN_AGE_MS must be less than QUOTE_MAX_LIFETIME_MS",
+      path: ["QUOTE_MIN_AGE_MS"],
+    });
+  }
+
+  if (data.NODE_ENV === "production") {
+    const secret = data.JWT_SECRET;
+    if (!secret) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "JWT_SECRET is required in production",
+        path: ["JWT_SECRET"],
+      });
+      return;
+    }
+
+    const defaults = [
+      "change-me-to-a-long-random-secret-before-production",
+      "super-secret-development-key-please-change",
+    ];
+    if (defaults.includes(secret)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "JWT_SECRET cannot be a default development value in production",
+        path: ["JWT_SECRET"],
+      });
+      return;
+    }
+
+    const lowerSecret = secret.toLowerCase();
+    if (
+      lowerSecret.includes("please-change") ||
+      lowerSecret.includes("change-me") ||
+      lowerSecret.includes("development")
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "JWT_SECRET cannot contain development placeholders (e.g., 'change-me', 'please-change', 'development')",
+        path: ["JWT_SECRET"],
+      });
+      return;
+    }
+
+    const uniqueChars = new Set(secret).size;
+    if (uniqueChars < 8) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "JWT_SECRET is too weak: must contain at least 8 unique characters",
+        path: ["JWT_SECRET"],
+      });
+      return;
+    }
+
+    const hasLower = /[a-z]/.test(secret);
+    const hasUpper = /[A-Z]/.test(secret);
+    const hasDigit = /[0-9]/.test(secret);
+    const hasSpecial = /[^a-zA-Z0-9]/.test(secret);
+
+    if (!hasLower || !hasUpper || (!hasDigit && !hasSpecial)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "JWT_SECRET is too weak: must include a mix of uppercase letters, lowercase letters, and digits or special characters",
+        path: ["JWT_SECRET"],
+      });
+    }
+  }
 }).refine((data) => data.QUOTE_MIN_AGE_MS < data.QUOTE_MAX_LIFETIME_MS, {
   message: "QUOTE_MIN_AGE_MS must be less than QUOTE_MAX_LIFETIME_MS",
 }).refine((data) => data.DEFAULT_SLIPPAGE_BPS <= data.MAX_SLIPPAGE_BPS, {

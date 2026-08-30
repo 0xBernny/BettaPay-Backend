@@ -58,12 +58,10 @@ export type WalletChallengeQuery = z.infer<typeof WalletChallengeQuery>;
 
 export const WalletVerifyBody = z.object({
   address: StellarAddressSchema,
+  nonce: z.string().min(1, 'nonce is required').max(512, 'nonce is too long'),
+  signature: z.string().min(1, 'signature is required'),
   challenge: z.string().min(1).optional(),
-  signature: z.string().min(1),
-  // #task — nonce replay protection: the client signs a fresh nonce, and a
-  // used nonce is rejected with 409 on subsequent attempts.
-  nonce: z.string().min(1).optional(),
-  message: z.string().min(1).optional()
+  message: z.string().min(1).optional(),
 });
 export type WalletVerifyBody = z.infer<typeof WalletVerifyBody>;
 
@@ -78,6 +76,13 @@ export const merchantSchema = z.object({
   status: z.enum(['active', 'suspended']).default('active'),
   settings: z.record(z.any()).optional()
 });
+
+// Fee schedule item for per-asset fee configuration
+export const FeeScheduleItem = z.object({
+  asset: z.string().min(1),
+  bps: z.number().int().min(0).max(10000),
+});
+export type FeeScheduleItem = z.infer<typeof FeeScheduleItem>;
 
 // Fee rule extracted from merchant settings (feeBps in basis points, 0-10000)
 export const FeeRule = z.object({
@@ -319,6 +324,9 @@ export const MerchantSettings = z.object({
   maxSettlementAmount: z.number().positive().optional(),
   minSettlementAmount: z.number().positive().optional(),
   dailySettlementLimit: z.number().positive().optional(),
+}).refine((data) => !(data.feeBps !== undefined && data.feeSchedules !== undefined), {
+  message: 'Cannot provide both feeBps and feeSchedules',
+  path: ['feeSchedules'],
 });
 
 export type MerchantSettings = z.infer<typeof MerchantSettings>;

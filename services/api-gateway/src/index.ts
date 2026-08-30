@@ -66,6 +66,10 @@ import {
 } from "./clients/indexer-client.js";
 import { UpstreamReadTimeoutError } from "./upstream-fetch.js";
 import {
+  WalletChallengeStore,
+  WALLET_CHALLENGE_TTL_MS,
+} from "./wallet-challenge-store.js";
+import {
   createSettlementClient,
   SettlementEngineUnavailableError,
 } from "./clients/settlement-client.js";
@@ -79,14 +83,13 @@ import {
   UpdateSettlementStatusBody,
   UpdateMerchantSettingsBody,
   UpdateMerchantNameBody,
-  WalletChallengeQuery,
   WalletVerifyBody,
+  AuthIpScoreQuery,
   SettlementListQuery,
   PaymentListQuery,
   PaginationQuery,
   BulkCancelPaymentsBody,
   UpdateMerchantKycBody,
-  AuthIpScoreQuery,
   PAYMENT_STATUS_TRANSITIONS,
   SETTLEMENT_STATUS_TRANSITIONS,
   isValidTransition,
@@ -104,7 +107,7 @@ import { PrismaClient } from "@prisma/client";
 import pg from "pg";
 import helmet from "@fastify/helmet";
 import { PrismaPg } from "@prisma/adapter-pg";
-import { fetchUpstream, UpstreamTimeoutError } from "./upstream-fetch.js";
+import { fetchUpstream, UpstreamTimeoutError, SsrfRejectedError, validateUpstreamUrl } from "./upstream-fetch.js";
 import { Keypair } from "@stellar/stellar-sdk";
 import { OAuth2Client } from "google-auth-library";
 import { registerGatewayHealthRoutes } from "./health.js";
@@ -552,8 +555,9 @@ export function buildApp(opts: AppOptions = {}) {
 
   // --- Same-origin enforcement --------------------------------------------------
   // Reject cross-origin mutations that lack an explicit CORS preflight.
-  // Server-to-server calls (no Origin header, authenticated via x-service-token)
-  // are exempt. GET/HEAD are also exempt since they cannot cause state changes.
+  // State-changing requests without an Origin header must include an
+  // `x-csrf-check` header to prove the caller is aware of the mutation.
+  // GET/HEAD/OPTIONS are exempt since they cannot cause state changes.
   const ALLOWED_ORIGINS_SET = new Set(
     env.ALLOWED_ORIGINS.map((o) => o.toLowerCase()),
   );
@@ -565,26 +569,42 @@ export function buildApp(opts: AppOptions = {}) {
       if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
 
       const origin = request.headers.origin;
-      if (!origin) return;
-
-      const normalised = origin.trim().replace(/\/+$/, "").toLowerCase();
-      const isAllowed = [...ALLOWED_ORIGINS_SET].some((allowed) =>
-        timingSafeStrEqual(normalised, allowed),
-      );
-
-      if (!isAllowed) {
-        request.log.warn(
-          { origin, method, url: request.url },
-          "Rejected cross-origin mutation",
+      if (origin) {
+        const normalised = origin.trim().replace(/\/+$/, "").toLowerCase();
+        const isAllowed = [...ALLOWED_ORIGINS_SET].some((allowed) =>
+          timingSafeStrEqual(normalised, allowed),
         );
-        return reply
-          .code(403)
-          .send(
-            createErrorResponse(
-              ErrorCodes.INVALID_ORIGIN,
-              "Request origin is not allowed",
-            ),
+
+        if (!isAllowed) {
+          request.log.warn(
+            { origin, method, url: request.url },
+            "Rejected cross-origin mutation",
           );
+          return reply
+            .code(403)
+            .send(
+              createErrorResponse(
+                ErrorCodes.INVALID_ORIGIN,
+                "Request origin is not allowed",
+              ),
+            );
+        }
+      } else {
+        const csrfCheck = request.headers["x-csrf-check"];
+        if (!csrfCheck) {
+          request.log.warn(
+            { method, url: request.url },
+            "Rejected mutation without Origin or CSRF header",
+          );
+          return reply
+            .code(403)
+            .send(
+              createErrorResponse(
+                ErrorCodes.INVALID_ORIGIN,
+                "Missing Origin or x-csrf-check header",
+              ),
+            );
+        }
       }
     },
   );
@@ -883,6 +903,14 @@ export function buildApp(opts: AppOptions = {}) {
     );
   }
 
+  function decodeWalletSignature(signature: string): Buffer {
+    const trimmed = signature.trim();
+    if (/^[0-9a-f]+$/i.test(trimmed) && trimmed.length % 2 === 0) {
+      return Buffer.from(trimmed, "hex");
+    }
+    return Buffer.from(trimmed, "base64");
+  }
+
   function verifyWalletSignature(
     address: string,
     challenge: string,
@@ -891,7 +919,7 @@ export function buildApp(opts: AppOptions = {}) {
     try {
       return Keypair.fromPublicKey(address).verify(
         Buffer.from(challenge, "utf8"),
-        Buffer.from(signature, "base64"),
+        decodeWalletSignature(signature),
       );
     } catch (err) {
       return false;
@@ -1025,37 +1053,9 @@ export function buildApp(opts: AppOptions = {}) {
       .catch(() => {});
   }
 
-  fastify.get<{ Querystring: WalletChallengeQuery }>(
-    "/api/auth/wallet/challenge",
-    {
-      config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
-    },
-    async (request, reply) => {
-      const { address } = WalletChallengeQuery.parse(request.query);
-      const nonce = crypto.randomBytes(32).toString("hex");
-      const challenge = `BettaPay:${address}:${nonce}`;
-      const expiresAt = Date.now() + WALLET_CHALLENGE_TTL_MS;
-      try {
-        // Bind the nonce to this address, server-side, with a TTL. Consumed
-        // atomically on verify so it can be used at most once (#469).
-        await storeWalletChallenge(
-          redis,
-          { challenge, nonce, address, expiresAt },
-          WALLET_CHALLENGE_TTL_MS,
-        );
-      } catch (err) {
-        request.log.error({ err }, "Failed to set wallet challenge in Redis");
-        return reply
-          .code(503)
-          .send({ error: "Authentication service unavailable" });
-      }
-      return reply.send({ challenge, expiresAt });
-    },
-  );
-
   fastify.post('/api/auth/refresh', {
-  preHandler: [enforceAuthIpReputation]
-}, async (request, reply) => {
+    preHandler: [enforceAuthIpReputation]
+  }, async (request, reply) => {
   try {
     await request.jwtVerify();
   } catch (err) {
@@ -1181,10 +1181,12 @@ fastify.get('/api/admin/auth/ip-score', {
   return { ip, score: await getAuthIpScore(ip) };
 });
 
-  const walletChallenges = new Map<
-    string,
-    { challenge: string; expiresAt: number }
-  >();
+  // Wallet auth challenges are stored in Redis under a TTL (#554), so they
+  // expire on their own, are visible to every gateway instance, and are
+  // consumed by the first verification attempt.
+  const walletChallenges = new WalletChallengeStore(redis, {
+    ttlMs: WALLET_CHALLENGE_TTL_MS,
+  });
 
   interface WalletChallengeRouteBody {
     address?: unknown;
@@ -1198,12 +1200,28 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/auth/challenge",
     async (request, reply) => {
       const d = WalletChallengeBody.parse(request.body);
-      const challenge = crypto.randomBytes(32).toString("hex");
-      const expiresAt = Date.now() + 5 * 60 * 1000; // 5 mins
-      walletChallenges.set(d.address, { challenge, expiresAt });
+
+      let issued;
+      try {
+        issued = await walletChallenges.issue(d.address);
+      } catch (err) {
+        request.log.error(
+          { err, address: d.address },
+          "[Auth] Unable to store wallet challenge",
+        );
+        return reply
+          .code(503)
+          .send(
+            createErrorResponse(
+              ErrorCodes.INTERNAL_ERROR,
+              "Authentication service unavailable",
+            ),
+          );
+      }
+
       return reply.send({
-        challenge,
-        expiresAt: new Date(expiresAt).toISOString(),
+        challenge: issued.challenge,
+        expiresAt: new Date(issued.expiresAt).toISOString(),
       });
     },
   );
@@ -1222,9 +1240,29 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/auth/verify",
     async (request, reply) => {
       const d = LegacyWalletVerifyBody.parse(request.body);
-      const challengeInfo = walletChallenges.get(d.address);
 
-      if (!challengeInfo) {
+      // Consuming is atomic: the challenge is gone whatever happens next, so
+      // it is single-use and a signature cannot be guessed at repeatedly
+      // against one outstanding challenge (#554).
+      let consumed;
+      try {
+        consumed = await walletChallenges.consume(d.address);
+      } catch (err) {
+        request.log.error(
+          { err, address: d.address },
+          "[Auth] Unable to read wallet challenge",
+        );
+        return reply
+          .code(503)
+          .send(
+            createErrorResponse(
+              ErrorCodes.INTERNAL_ERROR,
+              "Authentication service unavailable",
+            ),
+          );
+      }
+
+      if (consumed.status === "not_found") {
         return reply
           .code(400)
           .send(
@@ -1235,8 +1273,7 @@ fastify.get('/api/admin/auth/ip-score', {
           );
       }
 
-      if (Date.now() > challengeInfo.expiresAt) {
-        walletChallenges.delete(d.address);
+      if (consumed.status === "expired") {
         return reply
           .code(400)
           .send(
@@ -1246,6 +1283,8 @@ fastify.get('/api/admin/auth/ip-score', {
             ),
           );
       }
+
+      const challengeInfo = consumed.challenge;
 
       try {
         const keypair = Keypair.fromPublicKey(d.address);
@@ -1267,8 +1306,6 @@ fastify.get('/api/admin/auth/ip-score', {
             createErrorResponse(ErrorCodes.UNAUTHORIZED, "Invalid signature"),
           );
       }
-
-      walletChallenges.delete(d.address);
 
       let merchant;
       try {
@@ -1436,7 +1473,10 @@ fastify.get('/api/admin/auth/ip-score', {
 
         const deviceInfo = `${request.ip || "unknown"} ${request.headers["user-agent"] ?? "unknown"}`;
         const jti = await createAuthSession(merchant.id, deviceInfo);
-        const jwtToken = fastify.jwt.sign({ merchantId: merchant.id, ownerId: merchant.ownerId, jti });
+        const jwtToken = fastify.jwt.sign(
+          { merchantId: merchant.id, ownerId: merchant.ownerId },
+          { jti },
+        );
         return reply.send({ token: jwtToken });
       } catch (err: any) {
         request.log.error({ err }, "[Auth] Google OAuth failed");
@@ -2718,7 +2758,35 @@ fastify.get('/api/admin/auth/ip-score', {
     reply: FastifyReply,
     path: string,
   ) {
-    const targetUrl = new URL(path, env.FX_ENGINE_URL).toString();
+    if (path.startsWith('//') || path.includes('://')) {
+      return reply
+        .code(400)
+        .send(
+          createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            "Invalid upstream path",
+          ),
+        );
+    }
+
+    let targetUrl: string;
+    try {
+      targetUrl = new URL(path, env.FX_ENGINE_URL).toString();
+      validateUpstreamUrl(targetUrl);
+    } catch (err) {
+      if (err instanceof SsrfRejectedError) {
+        request.log.warn({ path, err: err.message }, "SSRF attempt rejected");
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              "Request to internal host is not allowed",
+            ),
+          );
+      }
+      throw err;
+    }
 
     try {
       const response = await fetchUpstream(request, targetUrl, {}, request.log);
