@@ -168,3 +168,44 @@ export function computeSettlementAmounts(
     feeSnapshot,
   };
 }
+
+/**
+ * Computes the applicable fee BPS for a given asset based on fee schedules.
+ * Falls back to defaultBps if no matching schedule is found.
+ *
+ * @param asset       The asset code (e.g., 'USDC', 'EURT')
+ * @param feeSchedules  Array of fee schedule items [{ asset, bps }]
+ * @param defaultBps    Default fee BPS to use if no schedule matches
+ * @returns           The applicable fee BPS for the asset
+ */
+export function resolveFeeBpsForAsset(
+  asset: string,
+  feeSchedules: FeeScheduleItem[] | undefined,
+  defaultBps: number
+): number {
+  if (!feeSchedules || feeSchedules.length === 0) {
+    return defaultBps;
+  }
+  const schedule = feeSchedules.find((s) => s.asset === asset);
+  return schedule ? schedule.bps : defaultBps;
+}
+
+/**
+ * Computes fee and net amounts with full decimal precision using BigNumber,
+ * resolving the fee BPS from fee schedules based on the asset.
+ *
+ * @param grossAmountStr  Validated numeric string from the request body.
+ * @param asset           The asset code (e.g., 'USDC', 'EURT')
+ * @param feeSchedules    Array of fee schedule items [{ asset, bps }]
+ * @param defaultBps      Default fee BPS to use if no schedule matches
+ * @returns               { grossAmount, feeAmount, netAmount } as full-precision strings.
+ */
+export function computeSettlementAmountsWithSchedule(
+  grossAmountStr: Amount,
+  asset: string,
+  feeSchedules: FeeScheduleItem[] | undefined,
+  defaultBps: number
+): SettlementAmounts {
+  const feeBps = resolveFeeBpsForAsset(asset, feeSchedules, defaultBps);
+  return computeSettlementAmounts(grossAmountStr, feeBps);
+}

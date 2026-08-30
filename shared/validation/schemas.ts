@@ -77,6 +77,13 @@ export const merchantSchema = z.object({
   settings: z.record(z.any()).optional()
 });
 
+// Fee schedule item for per-asset fee configuration
+export const FeeScheduleItem = z.object({
+  asset: z.string().min(1),
+  bps: z.number().int().min(0).max(10000),
+});
+export type FeeScheduleItem = z.infer<typeof FeeScheduleItem>;
+
 // Fee rule extracted from merchant settings (feeBps in basis points, 0-10000)
 export const FeeRule = z.object({
   feeBps: z.number().int().min(0).max(10000),
@@ -317,6 +324,9 @@ export const MerchantSettings = z.object({
   maxSettlementAmount: z.number().positive().optional(),
   minSettlementAmount: z.number().positive().optional(),
   dailySettlementLimit: z.number().positive().optional(),
+}).refine((data) => !(data.feeBps !== undefined && data.feeSchedules !== undefined), {
+  message: 'Cannot provide both feeBps and feeSchedules',
+  path: ['feeSchedules'],
 });
 
 export type MerchantSettings = z.infer<typeof MerchantSettings>;

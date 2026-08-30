@@ -1053,6 +1053,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       minSettlementAmount?: string;
       maxSettlementAmount?: string;
       dailySettlementLimit?: string;
+      feeSchedules?: FeeScheduleItem[];
     } | null | undefined;
 
     const parsedFeeRule = FeeRule.passthrough().safeParse(merchant?.settings);
@@ -1081,7 +1082,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     const currentDailyTotal = aggregateResult?.[0]?.sum ? parseFloat(aggregateResult[0].sum) : 0;
 
     let runningBatchTotal = 0;
-    const validItems: Array<{ amount: string; asset: string; id: string; grossAmount: string; feeAmount: string; netAmount: string }> = [];
+    const validItems: Array<{ amount: string; asset: string; id: string; grossAmount: string; feeAmount: string; netAmount: string; feeBps: number }> = [];
     const errors: Array<{ index: number; reason: string }> = [];
 
     for (let i = 0; i < d.settlements.length; i++) {
@@ -1147,7 +1148,8 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         asset: item.asset,
         grossAmount,
         feeAmount,
-        netAmount
+        netAmount,
+        feeBps: feeSnapshot.feeBpsApplied
       });
       runningBatchTotal += amount;
     }
@@ -1165,7 +1167,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
               grossAmount: item.grossAmount,
               feeAmount: item.feeAmount,
               netAmount: item.netAmount,
-              feeBps,
+              feeBps: item.feeBps,
               asset: item.asset,
               status: 'pending',
               webhookUrl,
