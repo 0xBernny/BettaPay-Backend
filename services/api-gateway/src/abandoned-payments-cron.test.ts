@@ -1,5 +1,5 @@
 import test from 'tape';
-import { autoExpireAbandonedPayments } from './abandoned-payments-cron.js';
+import { autoExpireAbandonedPayments, getCronIntervalMs } from './abandoned-payments-cron.js';
 
 interface MockPayment {
   id: string;
@@ -105,5 +105,41 @@ test('autoExpireAbandonedPayments - handles zero expired payments', async (t) =>
   t.ok(lastFindManyArgs, 'findMany should still be called');
   t.equal(lastUpdateManyArgs, null, 'updateMany should not be called when nothing is stale');
 
+  t.end();
+});
+
+test('getCronIntervalMs - reads options or environment variable', (t) => {
+  t.equal(getCronIntervalMs({ intervalMs: 30000 }), 30000, 'reads intervalMs option');
+
+  const originalEnv = process.env.ABANDONED_PAYMENTS_CRON_INTERVAL_MS;
+  process.env.ABANDONED_PAYMENTS_CRON_INTERVAL_MS = '120000';
+  t.equal(getCronIntervalMs(), 120000, 'reads env variable');
+
+  delete process.env.ABANDONED_PAYMENTS_CRON_INTERVAL_MS;
+  t.equal(getCronIntervalMs(), 3600000, 'defaults to 1 hour (3600000ms)');
+
+  process.env.ABANDONED_PAYMENTS_CRON_INTERVAL_MS = originalEnv;
+  t.end();
+});
+
+test('autoExpireAbandonedPayments - skips execution when Redis lock cannot be acquired', async (t) => {
+  lastFindManyArgs = null;
+  const mockPrisma = createMockPrisma([stalePayment('pay_1')], 1);
+  const mockLogger = createMockLogger();
+
+  const mockRedisLocked = {
+    set: async () => null,
+  };
+
+  const count = await autoExpireAbandonedPayments(
+    mockPrisma as any,
+    mockLogger as any,
+    24,
+    undefined,
+    mockRedisLocked,
+  );
+
+  t.equal(count, 0, 'returns 0 when lock fails');
+  t.equal(lastFindManyArgs, null, 'findMany is not called when lock is unavailable');
   t.end();
 });

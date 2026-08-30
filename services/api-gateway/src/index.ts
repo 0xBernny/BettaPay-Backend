@@ -289,7 +289,7 @@ function sanitizeString(value: string): string {
     .normalize("NFC");
 }
 
-function sanitizeInput(value: unknown, seen = new WeakSet<object>()): unknown {
+export function sanitizeInput(value: unknown, seen = new WeakSet<object>()): unknown {
   if (typeof value === "string") {
     return sanitizeString(value);
   }
@@ -488,9 +488,13 @@ export function buildApp(opts: AppOptions = {}) {
   });
 
   // Rate limiting: global default and route overrides
+  const isRateLimitDisabled = () =>
+    process.env.RATE_LIMIT_ENABLED === 'false' || process.env.RATE_LIMIT_ENABLED === '0';
+
   fastify.register(rateLimit, {
     max: 1000,
     timeWindow: "1 minute",
+    skip: () => isRateLimitDisabled(),
     addHeaders: {
       "x-ratelimit-limit": true,
       "x-ratelimit-remaining": true,
@@ -513,6 +517,30 @@ export function buildApp(opts: AppOptions = {}) {
     object,
     ReturnType<typeof fastify.createRateLimit>
   >();
+
+  function parseWindowToSeconds(window: string | number | undefined): number {
+    if (typeof window === 'number') {
+      return Math.max(1, Math.floor(window / 1000));
+    }
+    if (!window || typeof window !== 'string') {
+      return 60;
+    }
+    const str = window.trim().toLowerCase();
+    if (str.includes('minute') || str.includes('m')) {
+      const num = parseInt(str, 10);
+      return (isNaN(num) ? 1 : num) * 60;
+    }
+    if (str.includes('hour') || str.includes('h')) {
+      const num = parseInt(str, 10);
+      return (isNaN(num) ? 1 : num) * 3600;
+    }
+    if (str.includes('second') || str.includes('s')) {
+      const num = parseInt(str, 10);
+      return isNaN(num) ? 1 : num;
+    }
+    const num = parseInt(str, 10);
+    return isNaN(num) ? 60 : Math.max(1, Math.floor(num / 1000));
+  }
 
   fastify.addHook(
     "onSend",
@@ -540,14 +568,30 @@ export function buildApp(opts: AppOptions = {}) {
         ttlInSeconds?: number;
       };
 
-      if (typeof result.max === "number") {
-        reply.header("X-RateLimit-Limit", result.max);
-        reply.header("X-RateLimit-Remaining", result.remaining ?? 0);
-        reply.header(
-          "X-RateLimit-Reset",
-          Math.ceil(Date.now() / 1000) + (result.ttlInSeconds ?? 0),
-        );
-      }
+      const max =
+        typeof result.max === "number"
+          ? result.max
+          : typeof routeConfig.rateLimit === "object" &&
+              typeof (routeConfig.rateLimit as any).max === "number"
+            ? (routeConfig.rateLimit as any).max
+            : 1000;
+      const windowStr =
+        (typeof routeConfig.rateLimit === "object" &&
+          (routeConfig.rateLimit as any).timeWindow) ||
+        "1 minute";
+      const windowSeconds = parseWindowToSeconds(windowStr);
+
+      const disabled = isRateLimitDisabled();
+      const remaining = disabled ? max : (result.remaining ?? 0);
+      const ttl = result.ttlInSeconds ?? windowSeconds;
+
+      reply.header("X-RateLimit-Limit", max);
+      reply.header("X-RateLimit-Remaining", remaining);
+      reply.header(
+        "X-RateLimit-Reset",
+        Math.ceil(Date.now() / 1000) + ttl,
+      );
+      reply.header("X-RateLimit-Policy", `${max};w=${windowSeconds}`);
 
       return payload;
     },
@@ -1348,6 +1392,35 @@ fastify.get('/api/admin/auth/ip-score', {
     },
   );
 
+export function normalizeAndValidateEmail(
+  rawEmail: unknown,
+): { email: string; domain: string } | null {
+  if (typeof rawEmail !== "string") return null;
+
+  const trimmed = rawEmail.trim().replace(/[\uFF0E\u3002\uFF61]/g, ".");
+  if (!trimmed || trimmed.length > 320) return null;
+
+  const parsed = z.string().email().safeParse(trimmed);
+  if (!parsed.success) return null;
+
+  const normalized = trimmed.toLowerCase();
+  const parts = normalized.split("@");
+  if (parts.length !== 2) return null;
+
+  const [localPart, domainPart] = parts;
+  if (!localPart || !domainPart) return null;
+
+  if (
+    domainPart.startsWith(".") ||
+    domainPart.endsWith(".") ||
+    domainPart.includes("..")
+  ) {
+    return null;
+  }
+
+  return { email: normalized, domain: domainPart };
+}
+
   interface GoogleAuthRouteBody {
     token?: unknown;
   }
@@ -1378,8 +1451,8 @@ fastify.get('/api/admin/auth/ip-score', {
               ),
             );
         }
-        const email = payload.email;
-        if (!email) {
+        const rawEmail = payload.email;
+        if (!rawEmail) {
           return reply
             .code(400)
             .send(
@@ -1389,6 +1462,20 @@ fastify.get('/api/admin/auth/ip-score', {
               ),
             );
         }
+
+        const validated = normalizeAndValidateEmail(rawEmail);
+        if (!validated) {
+          return reply
+            .code(400)
+            .send(
+              createErrorResponse(
+                ErrorCodes.INVALID_REQUEST,
+                "Invalid Google email address format",
+              ),
+            );
+        }
+
+        const { email, domain } = validated;
 
         const lockoutCount = await getGoogleAuthLockoutCount(email);
         if (lockoutCount >= env.AUTH_MAX_FAILED_ATTEMPTS) {
@@ -1407,7 +1494,6 @@ fastify.get('/api/admin/auth/ip-score', {
         }
 
         if (env.ALLOWED_EMAIL_DOMAINS.length > 0) {
-          const domain = email.split("@")[1]?.toLowerCase();
           if (!domain || !env.ALLOWED_EMAIL_DOMAINS.includes(domain)) {
             await incrementGoogleAuthLockout(email);
             request.log.info(
