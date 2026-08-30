@@ -657,7 +657,20 @@ interface ReconcileQuery {
   merchantId?: string;
   from?: string;
   to?: string;
+  detail?: string;
 }
+
+const RECONCILE_DIFF_CAP = 100;
+
+const COMPARE_FIELDS = [
+  'status',
+  'grossAmount',
+  'feeAmount',
+  'netAmount',
+  'asset',
+  'feeBps',
+  'merchantId',
+] as const;
 
 /**
  * Local Consistency Check for Settlements
@@ -668,12 +681,14 @@ interface ReconcileQuery {
  * - Fee calculation accuracy: feeAmount matches feeBps applied to grossAmount
  * - Merchant reference validity: all settlements reference existing merchants
  *
- * This is a LOCAL consistency check - it does not make external HTTP calls.
- * All validation is performed against the settlement engine's own database.
+ * When `detail=true`, also performs a pairwise comparison of settlement IDs
+ * between local (engine) and gateway records, returning per-field mismatches.
+ * Capped at 100 diffs; a `truncated` flag indicates if more exist.
  */
 fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async (request, reply) => {
   try {
     const { merchantId, from, to } = request.query;
+    const detailMode = request.query.detail === 'true';
 
     const where: Record<string, unknown> = {};
     if (merchantId) {
@@ -737,10 +752,16 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       gatewayMap.set(r.id, r);
     }
 
-    const matchedIds = new Set<string>();
     const missing: any[] = []; // In gateway, but missing in local
     const extra: any[] = [];   // In local, but missing in gateway
-    const mismatched: any[] = []; // In both, but fields differ
+
+    // Per-record diff details (only populated when detail=true)
+    const diffs: Array<{
+      id: string;
+      field: string;
+      gatewayValue: unknown;
+      engineValue: unknown;
+    }> = [];
 
     let localGrossTotal = new BigNumber(0);
     let localFeeTotal = new BigNumber(0);
@@ -775,6 +796,25 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
 
     const merchants = await prisma.merchant.findMany({ select: { id: true } });
     const existingMerchantIds = new Set(merchants.map(m => m.id));
+
+    // Accumulate gateway totals for the summary
+    for (const gr of gatewayRecords) {
+      gatewayGrossTotal = gatewayGrossTotal.plus(parseBN(gr.grossAmount));
+      gatewayFeeTotal = gatewayFeeTotal.plus(parseBN(gr.feeAmount));
+      gatewayNetTotal = gatewayNetTotal.plus(parseBN(gr.netAmount));
+    }
+
+    // Identify missing (in gateway, not in local) and extra (in local, not in gateway)
+    for (const [id] of gatewayMap) {
+      if (!localMap.has(id)) {
+        missing.push({ id, source: 'gateway' });
+      }
+    }
+    for (const [id] of localMap) {
+      if (!gatewayMap.has(id)) {
+        extra.push({ id, source: 'engine' });
+      }
+    }
 
     for (const settlement of settlements) {
       const gross = parseBN(settlement.grossAmount);
@@ -836,11 +876,56 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       validCount++;
     }
 
+    // ── Pairwise field-level diff (detail mode) ──────────────────────────────
+    let truncated = false;
+
+    if (detailMode) {
+      for (const [id, localRecord] of localMap) {
+        const gwRecord = gatewayMap.get(id);
+        if (!gwRecord) continue; // missing-in-gateway already captured above
+
+        for (const field of COMPARE_FIELDS) {
+          const engineVal = String((localRecord as Record<string, unknown>)[field] ?? '');
+          const gwVal = String(gwRecord[field] ?? '');
+          if (engineVal !== gwVal) {
+            diffs.push({ id, field, gatewayValue: gwVal, engineValue: engineVal });
+          }
+        }
+
+        if (diffs.length >= RECONCILE_DIFF_CAP) {
+          truncated = true;
+          break;
+        }
+      }
+
+      // Also check gateway records not in local (missing = field diff with null engine side)
+      if (!truncated) {
+        for (const [id, gwRecord] of gatewayMap) {
+          if (localMap.has(id)) continue; // already compared above
+
+          for (const field of COMPARE_FIELDS) {
+            const gwVal = String(gwRecord[field] ?? '');
+            diffs.push({ id, field, gatewayValue: gwVal, engineValue: null });
+            if (diffs.length >= RECONCILE_DIFF_CAP) {
+              truncated = true;
+              break;
+            }
+          }
+          if (truncated) break;
+        }
+      }
+
+      // Cap at exactly the limit
+      diffs.length = Math.min(diffs.length, RECONCILE_DIFF_CAP);
+    }
+
     return {
       summary: {
         total: settlements.length,
         valid: validCount,
         inconsistent: inconsistencies.length,
+        missingInEngine: missing.length,
+        missingInGateway: extra.length,
       },
       statusBreakdown: statusCounts,
       totals: {
@@ -848,7 +933,13 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
         fee: totalFee.toString(),
         net: totalNet.toString(),
       },
+      gatewayTotals: {
+        gross: gatewayGrossTotal.toString(),
+        fee: gatewayFeeTotal.toString(),
+        net: gatewayNetTotal.toString(),
+      },
       inconsistencies,
+      ...(detailMode ? { diffs, truncated } : {}),
       reconciliationType: 'local_consistency_check',
     };
   } catch (error) {
