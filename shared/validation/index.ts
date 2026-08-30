@@ -381,6 +381,12 @@ export const EnvSchema = z.object({
     .string()
     .transform((s) => parseInt(s, 10))
     .default("2"),
+  // Settlement Batching — optional per-asset gross amount threshold that
+  // triggers a batch even when count < BATCH_MIN_COUNT.  Set to 0 to disable.
+  BATCH_VOLUME_THRESHOLD: z
+    .string()
+    .transform((s) => parseFloat(s))
+    .default("0"),
 
   // Settlement Engine — optional daily volume limit for pre-validation.
   // When set, the settlement engine rejects settlement creation requests
