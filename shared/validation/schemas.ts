@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { CurrencyCode } from './currency.js';
 import { validateStellarAddress } from '@bettapay/stellar-utils';
-import { WebhookUrlSchema } from './webhookSchema.js';
+import { WebhookUrlSchema, WebhookHeadersSchema } from './webhookSchema.js';
 
 
 // Entity schemas
@@ -311,6 +311,7 @@ export const MerchantSettings = z.object({
   maxFeeBps: z.number().int().min(0).max(10000).optional(),
   maxFeeThreshold: z.string().regex(/^\d+(\.\d+)?$/, 'maxFeeThreshold must be a numeric string').optional(),
   webhookUrl: WebhookUrlSchema.optional(),
+  webhookHeaders: WebhookHeadersSchema.optional(),
   preferredAsset: z.string().optional(),
   autoSettle: z.boolean().optional(),
   maxSettlementAmount: z.number().positive().optional(),
@@ -392,6 +393,9 @@ export const WebhookSubscriptionSchema = z.object({
   id: idSchema,
   url: z.string().url(),
   createdAt: isoDateString,
+  signingSecret: z.string().nullable().optional(),
+  merchantId: z.string().nullable().optional(),
+  headers: WebhookHeadersSchema.nullable().optional(),
   lastTestedAt: isoDateString.nullable().optional(),
   lastTestStatus: WebhookTestStatus.nullable().optional(),
   lastTestStatusCode: z.number().int().min(100).max(599).nullable().optional(),
@@ -447,6 +451,9 @@ export const UpdateMerchantSettingsBody = z.object({
   maxSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'maxSettlementAmount must be a numeric string').optional(),
   dailySettlementLimit: z.string().regex(/^\d+(\.\d+)?$/, 'dailySettlementLimit must be a numeric string').optional(),
   webhookUrl: WebhookUrlSchema.optional(),
+  // Custom headers (idempotency keys, auth tokens, etc.) sent with every
+  // settlement webhook delivery attempt, including retries (#569).
+  webhookHeaders: WebhookHeadersSchema.optional(),
 });
 
 export const UpdateMerchantNameBody = z.object({
@@ -539,6 +546,22 @@ export const SettlementListQuery = PaginationQuery.extend({
   { message: 'endDate requires startDate; startDate must be before endDate' }
 );
 export type SettlementListQuery = z.infer<typeof SettlementListQuery>;
+
+export const PaymentListQuery = PaginationQuery.extend({
+  status: z.enum(['initiated', 'completed', 'failed', 'cancelled']).optional(),
+  from: isoDateString.optional(),
+  to: isoDateString.optional(),
+  // Batches on-chain event enrichment across the page instead of querying the
+  // indexer once per payment (#553): see the /api/payments handler.
+  includeEvents: z.coerce.boolean().default(false),
+}).refine(
+  (data) => {
+    if (data.from && data.to) return data.from <= data.to;
+    return true;
+  },
+  { message: 'to must be after from' }
+);
+export type PaymentListQuery = z.infer<typeof PaymentListQuery>;
 
 export const DateRangeQuery = z
   .object({

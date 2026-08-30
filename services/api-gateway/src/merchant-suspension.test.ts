@@ -29,7 +29,7 @@ function authHeader() {
 }
 
 test('POST /api/merchants/:id/suspend flips status to suspended', async (t) => {
-  const { app, mockPrisma } = createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const { app, mockPrisma } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -52,7 +52,7 @@ test('POST /api/merchants/:id/suspend flips status to suspended', async (t) => {
 });
 
 test('POST /api/merchants/:id/suspend returns 409 when already suspended', async (t) => {
-  const { app } = createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
+  const { app } = await createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -72,7 +72,7 @@ test('POST /api/merchants/:id/suspend returns 409 when already suspended', async
 });
 
 test('POST /api/merchants/:id/suspend returns 404 for unknown merchant', async (t) => {
-  const { app } = createTestApp({}, { merchants: [] });
+  const { app } = await createTestApp({}, { merchants: [] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -91,7 +91,7 @@ test('POST /api/merchants/:id/suspend returns 404 for unknown merchant', async (
 });
 
 test('POST /api/merchants/:id/suspend returns 404 for soft-deleted merchant', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_DELETED }] });
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_DELETED }] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -108,7 +108,7 @@ test('POST /api/merchants/:id/suspend returns 404 for soft-deleted merchant', as
 });
 
 test('POST /api/merchants/:id/suspend requires service-auth', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -125,7 +125,7 @@ test('POST /api/merchants/:id/suspend requires service-auth', async (t) => {
 });
 
 test('POST /api/merchants/:id/suspend rejects wrong service-auth token (401)', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -142,7 +142,7 @@ test('POST /api/merchants/:id/suspend rejects wrong service-auth token (401)', a
 });
 
 test('POST /api/merchants/:id/unsuspend flips status back to active', async (t) => {
-  const { app, mockPrisma } = createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
+  const { app, mockPrisma } = await createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -164,7 +164,7 @@ test('POST /api/merchants/:id/unsuspend flips status back to active', async (t) 
 });
 
 test('POST /api/merchants/:id/unsuspend returns 409 when already active', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -183,7 +183,7 @@ test('POST /api/merchants/:id/unsuspend returns 409 when already active', async 
 });
 
 test('POST /api/merchants/:id/unsuspend requires service-auth', async (t) => {
-  const { app } = createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
+  const { app } = await createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -200,7 +200,7 @@ test('POST /api/merchants/:id/unsuspend requires service-auth', async (t) => {
 });
 
 test('Suspended merchant cannot create a payment (403)', async (t) => {
-  const { app } = createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
+  const { app } = await createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
   const token = generateTestJwt(app);
   try {
     const res = await app.inject({
@@ -226,7 +226,7 @@ test('Suspended merchant cannot create a payment (403)', async (t) => {
 });
 
 test('Suspended merchant cannot create a settlement (403)', async (t) => {
-  const { app } = createTestApp({}, {
+  const { app } = await createTestApp({}, {
     merchants: [MOCK_MERCHANT_SUSPENDED],
   });
   const token = generateTestJwt(app);
@@ -253,7 +253,7 @@ test('Suspended merchant cannot create a settlement (403)', async (t) => {
 });
 
 test('After unsuspend, merchant can create a payment again', async (t) => {
-  const { app } = createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
+  const { app } = await createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
   const token = generateTestJwt(app);
 
   try {
@@ -286,7 +286,7 @@ test('After unsuspend, merchant can create a payment again', async (t) => {
 });
 
 test('Full suspend → block payment → unsuspend → allow payment flow', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
   const token = generateTestJwt(app);
 
   try {
@@ -333,7 +333,7 @@ test('Full suspend → block payment → unsuspend → allow payment flow', asyn
 });
 
 test('Suspend writes an audit log entry', async (t) => {
-  const { app, mockPrisma } = createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const { app, mockPrisma } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -356,7 +356,7 @@ test('Suspend writes an audit log entry', async (t) => {
 });
 
 test('Unsuspend writes an audit log entry', async (t) => {
-  const { app, mockPrisma } = createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
+  const { app, mockPrisma } = await createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -378,7 +378,7 @@ test('Unsuspend writes an audit log entry', async (t) => {
 });
 
 test('Existing data remains readable for suspended merchant (GET /api/merchants/:id → 200)', async (t) => {
-  const { app } = createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
+  const { app } = await createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
   const token = generateTestJwt(app);
   try {
     const res = await app.inject({
@@ -399,7 +399,7 @@ test('Existing data remains readable for suspended merchant (GET /api/merchants/
 });
 
 test('Existing payments remain readable for suspended merchant (GET /api/payments/:id → 200)', async (t) => {
-  const { app } = createTestApp({}, {
+  const { app } = await createTestApp({}, {
     merchants: [MOCK_MERCHANT_SUSPENDED],
     payments: [{
       id: 'pay_existing_001',
@@ -430,7 +430,7 @@ test('Existing payments remain readable for suspended merchant (GET /api/payment
 });
 
 test('PATCH /api/payments/:id/status is allowed for suspended merchant (in-flight state transitions)', async (t) => {
-  const { app } = createTestApp({}, {
+  const { app } = await createTestApp({}, {
     merchants: [MOCK_MERCHANT_SUSPENDED],
     payments: [{
       id: 'pay_inflight_001',
@@ -464,7 +464,7 @@ test('PATCH /api/payments/:id/status is allowed for suspended merchant (in-fligh
 });
 
 test('Suspend response strips secretHash', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
   try {
     const res = await app.inject({
       method: 'POST',
@@ -483,14 +483,14 @@ test('Suspend response strips secretHash', async (t) => {
 });
 
 test('POST /api/payments returns 404 for unknown merchant', async (t) => {
-  const { app } = createTestApp({}, { merchants: [] });
+  const { app } = await createTestApp({}, { merchants: [] });
   const token = generateTestJwt(app);
   try {
     const res = await app.inject({
       method: 'POST',
       url: '/api/payments',
       headers: { authorization: `Bearer ${token}` },
-      payload: { merchantId: 'GNOTREALAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', amount: '10.00', asset: 'USDC' },
+      payload: { merchantId: 'GC566BRQU6NGBBAJXT3V7HGF7TX44DCNJNKCA4UCIA3FVFENJIQ6WYWG', amount: '10.00', asset: 'USDC' },
     });
     t.equal(res.statusCode, 404, 'returns 404 for unknown merchant');
     const body = JSON.parse(res.body);

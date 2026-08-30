@@ -2,7 +2,7 @@ import test from 'tape';
 import { createTestApp, generateTestJwt } from './test-utils.js';
 
 test('authorization: PATCH /api/merchants/:id/settings returns 401 without JWT', async (t) => {
-  const { app } = createTestApp({}, {
+  const { app } = await createTestApp({}, {
     merchants: [{ id: 'm1', settings: { tier: 'silver', autoSettle: true } }],
   });
 
@@ -18,7 +18,7 @@ test('authorization: PATCH /api/merchants/:id/settings returns 401 without JWT',
 });
 
 test('updating feeBps merges into existing settings and persists in DB', async (t) => {
-  const { app, mockPrisma } = createTestApp({}, {
+  const { app, mockPrisma } = await createTestApp({}, {
     merchants: [{ id: 'm1', settings: { tier: 'silver', autoSettle: true } }],
   });
   const token = generateTestJwt(app);
@@ -31,7 +31,7 @@ test('updating feeBps merges into existing settings and persists in DB', async (
   });
 
   t.equal(res.statusCode, 200, 'returns 200');
-  const settings = JSON.parse(res.body as string).merchant.settings;
+  const settings = JSON.parse(res.body as string).data.merchant.settings;
   t.equal(settings.feeBps, 75, 'feeBps is set');
   t.equal(settings.autoSettle, true, 'unrelated settings are preserved');
 
@@ -43,7 +43,7 @@ test('updating feeBps merges into existing settings and persists in DB', async (
 });
 
 test('updating a missing merchant returns 404', async (t) => {
-  const { app } = createTestApp({}, { merchants: [] });
+  const { app } = await createTestApp({}, { merchants: [] });
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -59,7 +59,7 @@ test('updating a missing merchant returns 404', async (t) => {
 });
 
 test('an out-of-range feeBps is rejected', async (t) => {
-  const { app } = createTestApp({}, {
+  const { app } = await createTestApp({}, {
     merchants: [{ id: 'm1', settings: {} }],
   });
   const token = generateTestJwt(app);

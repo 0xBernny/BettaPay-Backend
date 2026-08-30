@@ -15,6 +15,7 @@
  *   POST   /api/merchants/:id/unsuspend — unsuspend merchant (service-auth, #317)
  *   PATCH  /api/merchants/:id/settings — update merchant fee rules / settings (protected)
  *   POST   /api/payments             — initiate payment session (protected)
+ *   GET    /api/payments             — list payments, merchant-scoped (protected, #553)
  *   GET    /api/payments/:id         — fetch payment session
  *   PATCH  /api/payments/:id/status  — transition payment status (protected)
  *   POST   /api/settlements          — trigger settlement (protected)
@@ -58,10 +59,6 @@ import {
   decryptSensitiveFields,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
-import {
-  checkDownstreamReadiness,
-  type DownstreamService,
-} from "./downstream-readiness.js";
 import { createFxClient } from "./clients/fx-client.js";
 import {
   createIndexerClient,
@@ -69,14 +66,9 @@ import {
 } from "./clients/indexer-client.js";
 import { UpstreamReadTimeoutError } from "./upstream-fetch.js";
 import {
-  resolveClientIp,
-  rateLimitIdentityOf,
-  buildRateLimitKey,
-  buildIpRateLimitKey,
-  needsNestedIpLimit,
-  type RateLimitIdentity,
-  type RateLimitRequestLike,
-} from "./rate-limit-key.js";
+  WalletChallengeStore,
+  WALLET_CHALLENGE_TTL_MS,
+} from "./wallet-challenge-store.js";
 import {
   createSettlementClient,
   SettlementEngineUnavailableError,
@@ -94,6 +86,7 @@ import {
   WalletVerifyBody,
   AuthIpScoreQuery,
   SettlementListQuery,
+  PaymentListQuery,
   PaginationQuery,
   BulkCancelPaymentsBody,
   UpdateMerchantKycBody,
@@ -114,7 +107,7 @@ import { PrismaClient } from "@prisma/client";
 import pg from "pg";
 import helmet from "@fastify/helmet";
 import { PrismaPg } from "@prisma/adapter-pg";
-import { fetchUpstream, UpstreamTimeoutError } from "./upstream-fetch.js";
+import { fetchUpstream, UpstreamTimeoutError, SsrfRejectedError, validateUpstreamUrl } from "./upstream-fetch.js";
 import { Keypair } from "@stellar/stellar-sdk";
 import { OAuth2Client } from "google-auth-library";
 import { registerGatewayHealthRoutes } from "./health.js";
@@ -136,39 +129,10 @@ declare module "fastify" {
       reply: FastifyReply,
     ) => Promise<void>;
   }
-
-  export interface FastifyRequest {
-    /** Memoized rate-limit identity for this request (#559). */
-    rateLimitIdentity?: RateLimitIdentity;
-  }
 }
 
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-// --- Auth hardening constants (#254, #319 task list) -------------------------
-const AUTH_IP_SCORE_WINDOW_SECONDS = 15 * 60;
-const AUTH_IP_RETRY_AFTER_SECONDS = 5 * 60;
-const USED_NONCE_TTL_SECONDS = 5 * 60;
-const REFRESH_RATE_LIMIT_SECONDS = 60;
-const REFRESH_RATE_LIMIT_MAX = 10;
-
-// --- Two-dimensional rate limiting (#559) -----------------------------------
-// Requests are bucketed per authenticated merchant, falling back to the client
-// IP for anonymous traffic. RATE_LIMIT_IP_MAX is the nested ceiling that still
-// applies to authenticated traffic, so a single address cannot multiply its
-// allowance by rotating merchant tokens. It is deliberately well above the
-// per-merchant limit: a shared NAT is expected to carry several merchants.
-const RATE_LIMIT_WINDOW = "1 minute";
-const RATE_LIMIT_MAX = 1000;
-const RATE_LIMIT_IP_MAX = 5000;
-
-interface MerchantJwtPayload {
-  merchantId?: string;
-  ownerId?: string;
-  jti?: string;
-  exp?: number;
-}
 
 // Caps decompressed request bodies. Fastify's own bodyLimit only sees the
 // compressed (on-the-wire) byte count, so a small gzip payload can otherwise
@@ -260,6 +224,14 @@ export interface AppOptions {
   redis?: ReturnType<typeof createRedisClient>;
   logger?: any;
   fetchImpl?: typeof fetch;
+}
+
+export interface MerchantJwtPayload {
+  merchantId?: string;
+  ownerId?: string;
+  jti?: string;
+  iat?: number;
+  exp?: number;
 }
 
 let defaultPrisma: PrismaClient | null = null;
@@ -510,26 +482,10 @@ export function buildApp(opts: AppOptions = {}) {
     },
   });
 
-  // --- Rate limiting: per merchant, per IP (#559) --------------------------
-  // The limiter keys on the authenticated merchant when the request carries a
-  // valid bearer token, and on the client IP otherwise. Merchants sharing a
-  // NAT therefore no longer share a bucket.
-  //
-  // The identity is resolved from the token rather than from `request.user`,
-  // because rate limiting runs in onRequest, before the routes' preValidation
-  // authentication. The result is memoized on the request so the primary
-  // bucket and the nested per-IP ceiling agree on one identity per request.
-  function rateLimitIdentityFor(request: FastifyRequest): RateLimitIdentity {
-    return rateLimitIdentityOf(request as RateLimitRequestLike, (token) =>
-      fastify.jwt.verify(token),
-    );
-  }
-
+  // Rate limiting: global default and route overrides
   fastify.register(rateLimit, {
-    max: RATE_LIMIT_MAX,
-    timeWindow: RATE_LIMIT_WINDOW,
-    keyGenerator: (request: FastifyRequest) =>
-      buildRateLimitKey(rateLimitIdentityFor(request)),
+    max: 1000,
+    timeWindow: "1 minute",
     addHeaders: {
       "x-ratelimit-limit": true,
       "x-ratelimit-remaining": true,
@@ -538,92 +494,46 @@ export function buildApp(opts: AppOptions = {}) {
     },
   });
 
-  // The limiter's own per-route hook is installed by an onRoute listener that
-  // only exists once the plugin has finished loading. `register` defers that to
-  // boot, while every route below is declared synchronously, so that listener
-  // never sees them. The limits are therefore driven from a single onRequest
-  // hook built on `createRateLimit`, which additionally lets us emit the
-  // standard X-RateLimit-* headers the plugin otherwise keeps private, and
-  // return the gateway's own error envelope on 429.
-  //
-  // One checker is cached per route config so its counter persists and
-  // accumulates across requests, and each request increments exactly one
-  // primary counter. Routes opted out via `config: { rateLimit: false }`
-  // (e.g. health checks) are skipped.
-  type RateLimitChecker = ReturnType<typeof fastify.createRateLimit>;
-
-  const routeRateLimitCheckers = new WeakMap<object, RateLimitChecker>();
-  let globalRateLimitChecker: RateLimitChecker | undefined;
-  let ipRateLimitChecker: RateLimitChecker | undefined;
-
-  function primaryRateLimitChecker(
-    routeConfig: { rateLimit?: Record<string, unknown> } | undefined,
-  ): RateLimitChecker {
-    if (!routeConfig || typeof routeConfig.rateLimit !== "object") {
-      globalRateLimitChecker ??= fastify.createRateLimit({});
-      return globalRateLimitChecker;
-    }
-
-    let checker = routeRateLimitCheckers.get(routeConfig);
-    if (!checker) {
-      checker = fastify.createRateLimit(routeConfig.rateLimit);
-      routeRateLimitCheckers.set(routeConfig, checker);
-    }
-    return checker;
-  }
-
-  interface RateLimitResult {
-    max?: number;
-    remaining?: number;
-    ttlInSeconds?: number;
-    isExceeded?: boolean;
-  }
+  // Exposes standard X-RateLimit-* response headers on every rate-limited
+  // route. The installed @fastify/rate-limit version tracks hit counts in a
+  // store that's private to its own onRequest hook, with no read-only "peek"
+  // API, so we mirror it with our own counter built from the same
+  // `createRateLimit` helper and the route's own (global or overridden) limit
+  // config. One `checkRateLimit` instance is cached per route so its counter
+  // persists (and accumulates) across requests exactly like the real one —
+  // both increment exactly once per request against the same max/window, so
+  // they always agree on the numbers. Routes opted out via
+  // `config: { rateLimit: false }` (e.g. health checks) are skipped.
+  const rateLimitCheckers = new WeakMap<
+    object,
+    ReturnType<typeof fastify.createRateLimit>
+  >();
 
   fastify.addHook(
-    "onRequest",
-    async (request: FastifyRequest, reply: FastifyReply) => {
+    "onSend",
+    async (request: FastifyRequest, reply: FastifyReply, payload) => {
       const routeConfig = request.routeOptions?.config as
         | { rateLimit?: false | Record<string, unknown> }
         | undefined;
-      if (routeConfig?.rateLimit === false) return;
-
-      const identity = rateLimitIdentityFor(request);
-
-      // Nested per-IP ceiling. Anonymous traffic is already counted in the IP
-      // bucket by the primary key, so only authenticated requests are checked
-      // here — otherwise one request would be counted twice against it.
-      if (needsNestedIpLimit(identity)) {
-        ipRateLimitChecker ??= fastify.createRateLimit({
-          max: RATE_LIMIT_IP_MAX,
-          timeWindow: RATE_LIMIT_WINDOW,
-          keyGenerator: (req: FastifyRequest) =>
-            buildIpRateLimitKey(rateLimitIdentityFor(req)),
-        });
-
-        // `isAllowed` is true only for allow-listed keys; every counted
-        // request reports `isExceeded`, which is what gates the ceiling.
-        const ipResult = (await ipRateLimitChecker(request)) as RateLimitResult;
-        if (ipResult.isExceeded === true) {
-          request.log.warn(
-            { ip: identity.ip, merchantId: identity.merchantId },
-            "Nested per-IP rate limit exceeded",
-          );
-          return reply
-            .code(429)
-            .header("Retry-After", String(ipResult.ttlInSeconds ?? 60))
-            .send(
-              createErrorResponse(
-                ErrorCodes.RATE_LIMITED,
-                "Too many requests from this address",
-              ),
-            );
-        }
+      if (!routeConfig || routeConfig.rateLimit === false) {
+        return payload;
       }
 
-      // Primary bucket: per merchant when authenticated, per IP otherwise.
-      const result = (await primaryRateLimitChecker(
-        routeConfig as { rateLimit?: Record<string, unknown> } | undefined,
-      )(request)) as RateLimitResult;
+      let checkRateLimit = rateLimitCheckers.get(routeConfig);
+      if (!checkRateLimit) {
+        checkRateLimit = fastify.createRateLimit(
+          typeof routeConfig.rateLimit === "object"
+            ? routeConfig.rateLimit
+            : {},
+        );
+        rateLimitCheckers.set(routeConfig, checkRateLimit);
+      }
+
+      const result = (await checkRateLimit(request)) as {
+        max?: number;
+        remaining?: number;
+        ttlInSeconds?: number;
+      };
 
       if (typeof result.max === "number") {
         reply.header("X-RateLimit-Limit", result.max);
@@ -634,28 +544,15 @@ export function buildApp(opts: AppOptions = {}) {
         );
       }
 
-      if (result.isExceeded === true) {
-        request.log.warn(
-          { dimension: identity.dimension, merchantId: identity.merchantId, ip: identity.ip },
-          "Rate limit exceeded",
-        );
-        return reply
-          .code(429)
-          .header("Retry-After", String(result.ttlInSeconds ?? 60))
-          .send(
-            createErrorResponse(
-              ErrorCodes.RATE_LIMITED,
-              "Too many requests",
-            ),
-          );
-      }
+      return payload;
     },
   );
 
   // --- Same-origin enforcement --------------------------------------------------
   // Reject cross-origin mutations that lack an explicit CORS preflight.
-  // Server-to-server calls (no Origin header, authenticated via x-service-token)
-  // are exempt. GET/HEAD are also exempt since they cannot cause state changes.
+  // State-changing requests without an Origin header must include an
+  // `x-csrf-check` header to prove the caller is aware of the mutation.
+  // GET/HEAD/OPTIONS are exempt since they cannot cause state changes.
   const ALLOWED_ORIGINS_SET = new Set(
     env.ALLOWED_ORIGINS.map((o) => o.toLowerCase()),
   );
@@ -667,26 +564,42 @@ export function buildApp(opts: AppOptions = {}) {
       if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
 
       const origin = request.headers.origin;
-      if (!origin) return;
-
-      const normalised = origin.trim().replace(/\/+$/, "").toLowerCase();
-      const isAllowed = [...ALLOWED_ORIGINS_SET].some((allowed) =>
-        timingSafeStrEqual(normalised, allowed),
-      );
-
-      if (!isAllowed) {
-        request.log.warn(
-          { origin, method, url: request.url },
-          "Rejected cross-origin mutation",
+      if (origin) {
+        const normalised = origin.trim().replace(/\/+$/, "").toLowerCase();
+        const isAllowed = [...ALLOWED_ORIGINS_SET].some((allowed) =>
+          timingSafeStrEqual(normalised, allowed),
         );
-        return reply
-          .code(403)
-          .send(
-            createErrorResponse(
-              ErrorCodes.INVALID_ORIGIN,
-              "Request origin is not allowed",
-            ),
+
+        if (!isAllowed) {
+          request.log.warn(
+            { origin, method, url: request.url },
+            "Rejected cross-origin mutation",
           );
+          return reply
+            .code(403)
+            .send(
+              createErrorResponse(
+                ErrorCodes.INVALID_ORIGIN,
+                "Request origin is not allowed",
+              ),
+            );
+        }
+      } else {
+        const csrfCheck = request.headers["x-csrf-check"];
+        if (!csrfCheck) {
+          request.log.warn(
+            { method, url: request.url },
+            "Rejected mutation without Origin or CSRF header",
+          );
+          return reply
+            .code(403)
+            .send(
+              createErrorResponse(
+                ErrorCodes.INVALID_ORIGIN,
+                "Missing Origin or x-csrf-check header",
+              ),
+            );
+        }
       }
     },
   );
@@ -708,12 +621,19 @@ export function buildApp(opts: AppOptions = {}) {
     }
   }
 
-  // Authentication hook
+  // Authentication hook — verifies the JWT, rejects revoked tokens (jti
+  // blocklist), and keeps the per-merchant session index fresh.
   fastify.decorate(
     "authenticate",
     async function (request: FastifyRequest, reply: FastifyReply) {
       try {
         await request.jwtVerify();
+        const payload = request.user as MerchantJwtPayload;
+        if (payload.jti && (await isJtiRevoked(payload.jti))) {
+          return reply
+            .code(401)
+            .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
+        }
       } catch (err) {
         request.log.error(err);
         return reply
@@ -725,12 +645,6 @@ export function buildApp(opts: AppOptions = {}) {
       const merchantId = (request.user as any)?.merchantId;
       if (!jti || !merchantId) {
         return;
-      }
-
-      if (await isJtiRevoked(jti)) {
-        return reply
-          .code(401)
-          .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
       }
 
       try {
@@ -846,25 +760,25 @@ export function buildApp(opts: AppOptions = {}) {
   const redis = createRedisClient(env.REDIS_URL, fastify.log);
   sharedRedis = redis;
 
-  // Close the Redis client with the app so test processes don't leak sockets.
-  // disconnect() (not quit()) because with enableOfflineQueue: false a QUIT
-  // issued while the client is still connecting is silently dropped and the
-  // socket stays open, keeping the process alive after app.close().
+  // Release the Redis connection when the app closes so tests (and workers)
+  // don't leak sockets and hang the process.
   fastify.addHook("onClose", async () => {
+    await redis.quit().catch(() => {});
     redis.disconnect();
   });
 
-  // Auth hardening helpers (#254, #319 task list) — IP reputation scoring,
-  // JWT refresh/revocation, and nonce replay protection.
-  function signMerchantJwt(merchantId: string, ownerId: string): string {
-    return fastify.jwt.sign({ merchantId, ownerId, jti: crypto.randomUUID() });
-  }
-
-  // Shared with the rate limiter (#559) so a client is the same "who" to the
-  // IP-reputation scorer as it is to the per-IP rate-limit ceiling.
-  function getRequestIp(request: FastifyRequest): string {
-    return resolveClientIp(request.headers["x-forwarded-for"], request.ip);
-  }
+  // --- Auth IP reputation, token refresh & nonce replay (#task.md) -------------
+  // IPs accumulate a score in Redis on failed auth attempts and decay on
+  // success. Above the threshold the IP is blocked with a 5-minute Retry-After.
+  const AUTH_IP_THRESHOLD = parseInt(
+    process.env.AUTH_IP_THRESHOLD || "20",
+    10,
+  );
+  const AUTH_IP_SCORE_TTL_SECONDS = 15 * 60;
+  const AUTH_IP_RETRY_AFTER_SECONDS = 300;
+  const REFRESH_RATE_LIMIT_MAX = 10;
+  const REFRESH_RATE_LIMIT_SECONDS = 60;
+  const NONCE_TTL_SECONDS = 5 * 60;
 
   function authIpScoreKey(ip: string): string {
     return "auth_ip_score:" + ip;
@@ -882,109 +796,110 @@ export function buildApp(opts: AppOptions = {}) {
     return "auth_refresh_rate:" + merchantId;
   }
 
-  function toNonNegativeInt(value: unknown): number {
-    const parsed = Number(value ?? 0);
-    if (!Number.isFinite(parsed) || parsed < 0) return 0;
-    return Math.floor(parsed);
-  }
-
   async function getAuthIpScore(ip: string): Promise<number> {
     try {
-      return toNonNegativeInt(await redis.get(authIpScoreKey(ip)));
+      return Number((await redis.get(authIpScoreKey(ip))) ?? "0");
     } catch (err) {
-      fastify.log.warn({ err, ip }, "Unable to read auth IP score");
+      fastify.log.warn(
+        { err: (err as Error).message, ip },
+        "Failed to read auth IP score from Redis — treating as 0",
+      );
       return 0;
     }
   }
 
   async function updateAuthIpScore(ip: string, delta: number): Promise<number> {
+    // Best-effort: auth-IP scoring is advisory. If Redis is unavailable we log
+    // and carry on rather than turning an auth validation failure into a 500.
     const key = authIpScoreKey(ip);
     try {
       if (delta > 0) {
         const score = await redis.incrby(key, delta);
-        await redis.expire(key, AUTH_IP_SCORE_WINDOW_SECONDS);
-        return toNonNegativeInt(score);
+        await redis.expire(key, AUTH_IP_SCORE_TTL_SECONDS);
+        return score;
       }
-      const current = toNonNegativeInt(await redis.get(key));
+      const current = Number((await redis.get(key)) ?? "0");
       const next = Math.max(0, current + delta);
-      if (next === 0) {
-        await redis.del(key);
-      } else {
-        await redis.set(key, String(next), "EX", AUTH_IP_SCORE_WINDOW_SECONDS);
-      }
+      if (next === 0) await redis.del(key);
+      else await redis.set(key, String(next), "EX", AUTH_IP_SCORE_TTL_SECONDS);
       return next;
     } catch (err) {
-      fastify.log.warn({ err, ip, delta }, "Unable to update auth IP score");
+      fastify.log.warn(
+        { err: (err as Error).message, ip },
+        "Failed to update auth IP score in Redis",
+      );
       return 0;
     }
   }
 
-  async function enforceAuthIpReputation(request: FastifyRequest, reply: FastifyReply): Promise<void> {
-    const ip = getRequestIp(request);
-    const score = await getAuthIpScore(ip);
-    if (score >= env.AUTH_IP_THRESHOLD) {
+  async function enforceAuthIpReputation(
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<void> {
+    let score = 0;
+    try {
+      score = await getAuthIpScore(request.ip);
+    } catch (err) {
+      // Redis is unavailable — cannot verify reputation, so allow the request.
+      request.log.warn(
+        { err: (err as Error).message, ip: request.ip },
+        "Auth IP reputation check skipped (Redis unavailable)",
+      );
+    }
+    if (score >= AUTH_IP_THRESHOLD) {
       await reply
         .header("Retry-After", String(AUTH_IP_RETRY_AFTER_SECONDS))
         .code(429)
-        .send(createErrorResponse(ErrorCodes.RATE_LIMITED, "Too many failed authentication attempts"));
+        .send(
+          createErrorResponse(
+            ErrorCodes.RATE_LIMITED,
+            "Too many failed authentication attempts",
+          ),
+        );
     }
   }
 
-  async function recordAuthIpFailure(request: FastifyRequest): Promise<void> {
-    await updateAuthIpScore(getRequestIp(request), 1);
+  async function recordAuthIpFailure(
+    request: FastifyRequest,
+  ): Promise<void> {
+    await updateAuthIpScore(request.ip, 1);
   }
 
-  async function recordAuthIpSuccess(request: FastifyRequest): Promise<void> {
-    await updateAuthIpScore(getRequestIp(request), -1);
+  async function recordAuthIpSuccess(
+    request: FastifyRequest,
+  ): Promise<void> {
+    await updateAuthIpScore(request.ip, -1);
   }
 
   async function isJtiRevoked(jti: string): Promise<boolean> {
-    try {
-      return (await redis.exists(revokedJtiKey(jti))) === 1;
-    } catch (err) {
-      fastify.log.warn({ err, jti }, "Unable to read JWT blocklist");
-      return false;
-    }
+    return (await redis.exists(revokedJtiKey(jti))) === 1;
   }
 
   async function revokeJti(jti: string, ttlSeconds: number): Promise<void> {
-    if (ttlSeconds <= 0) return;
-    try {
-      await redis.set(revokedJtiKey(jti), "1", "EX", ttlSeconds);
-    } catch (err) {
-      fastify.log.warn({ err, jti }, "Unable to write JWT blocklist");
-    }
+    await redis.set(revokedJtiKey(jti), "1", "EX", ttlSeconds);
   }
 
   async function incrementRefreshRate(merchantId: string): Promise<number> {
-    try {
-      const key = refreshRateKey(merchantId);
-      const count = await redis.incr(key);
-      if (count === 1) await redis.expire(key, REFRESH_RATE_LIMIT_SECONDS);
-      return count;
-    } catch (err) {
-      fastify.log.warn({ err, merchantId }, "Unable to update refresh rate limit");
-      return 1;
-    }
+    const rateKey = refreshRateKey(merchantId);
+    const count = await redis.incr(rateKey);
+    if (count === 1) await redis.expire(rateKey, REFRESH_RATE_LIMIT_SECONDS);
+    return count;
   }
 
   async function isNonceUsed(nonce: string): Promise<boolean> {
-    try {
-      return (await redis.exists(usedNonceKey(nonce))) === 1;
-    } catch (err) {
-      fastify.log.warn({ err }, "Unable to read used nonce");
-      return true;
-    }
+    return (await redis.exists(usedNonceKey(nonce))) === 1;
   }
 
   async function markNonceUsed(nonce: string): Promise<boolean> {
-    try {
-      const result = await redis.set(usedNonceKey(nonce), "1", "EX", USED_NONCE_TTL_SECONDS, "NX");
-      return result === "OK";
-    } catch (err) {
-      fastify.log.warn({ err }, "Unable to write used nonce");
-      return false;
-    }
+    return (
+      (await redis.set(
+        usedNonceKey(nonce),
+        "1",
+        "EX",
+        NONCE_TTL_SECONDS,
+        "NX",
+      )) === "OK"
+    );
   }
 
   function decodeWalletSignature(signature: string): Buffer {
@@ -995,19 +910,38 @@ export function buildApp(opts: AppOptions = {}) {
     return Buffer.from(trimmed, "base64");
   }
 
-  function walletChallenge(body: { nonce: string; challenge?: string; message?: string }): string {
-    return body.challenge ?? body.message ?? body.nonce;
-  }
-
-  function verifyWalletSignature(address: string, challenge: string, signature: string): boolean {
+  function verifyWalletSignature(
+    address: string,
+    challenge: string,
+    signature: string,
+  ): boolean {
     try {
       return Keypair.fromPublicKey(address).verify(
         Buffer.from(challenge, "utf8"),
         decodeWalletSignature(signature),
       );
-    } catch {
+    } catch (err) {
       return false;
     }
+  }
+
+  function walletChallenge(d: {
+    challenge?: string;
+    message?: string;
+    nonce?: string;
+  }): string {
+    return d.challenge ?? d.message ?? d.nonce ?? "";
+  }
+
+  // Signs a merchant JWT with a fresh jti and registers the matching session in
+  // Redis so the authenticate hook can keep the session index fresh and the
+  // refresh flow can revoke the old token.
+  async function signMerchantJwt(
+    merchantId: string,
+    ownerId: string,
+  ): Promise<string> {
+    const jti = await createAuthSession(merchantId, "unknown");
+    return fastify.jwt.sign({ merchantId, ownerId, jti });
   }
 
   const GOOGLE_AUTH_GRACE_PERIOD_MS = 30_000;
@@ -1125,10 +1059,9 @@ export function buildApp(opts: AppOptions = {}) {
       .catch(() => {});
   }
 
-
-fastify.post('/api/auth/refresh', {
-  preHandler: [enforceAuthIpReputation]
-}, async (request, reply) => {
+  fastify.post('/api/auth/refresh', {
+    preHandler: [enforceAuthIpReputation]
+  }, async (request, reply) => {
   try {
     await request.jwtVerify();
   } catch (err) {
@@ -1165,14 +1098,16 @@ fastify.post('/api/auth/refresh', {
   await revokeJti(payload.jti, remainingLifetime);
   await recordAuthIpSuccess(request);
 
-  return reply.send({ token: signMerchantJwt(payload.merchantId, payload.ownerId) });
+  return reply.send({
+    token: await signMerchantJwt(payload.merchantId, payload.ownerId),
+  });
 });
 
-fastify.post<{ Body: WalletVerifyRouteBody }>('/api/auth/wallet/verify', {
+fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verify', {
   preHandler: [enforceAuthIpReputation],
   config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
 }, async (request, reply) => {
-  let d;
+  let d: z.infer<typeof WalletVerifyBody>;
   try {
     d = WalletVerifyBody.parse(request.body);
   } catch (err) {
@@ -1180,7 +1115,7 @@ fastify.post<{ Body: WalletVerifyRouteBody }>('/api/auth/wallet/verify', {
     throw err;
   }
 
-  if (await isNonceUsed(d.nonce)) {
+  if (d.nonce && (await isNonceUsed(d.nonce))) {
     await recordAuthIpFailure(request);
     return reply
       .code(409)
@@ -1192,7 +1127,7 @@ fastify.post<{ Body: WalletVerifyRouteBody }>('/api/auth/wallet/verify', {
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid wallet signature'));
   }
 
-  if (!await markNonceUsed(d.nonce)) {
+  if (d.nonce && !(await markNonceUsed(d.nonce))) {
     await recordAuthIpFailure(request);
     return reply
       .code(409)
@@ -1210,7 +1145,7 @@ fastify.post<{ Body: WalletVerifyRouteBody }>('/api/auth/wallet/verify', {
 
   const response: Record<string, unknown> = { success: true, address: d.address };
   if (merchant) {
-    response.token = signMerchantJwt(merchant.id, merchant.ownerId);
+    response.token = await signMerchantJwt(merchant.id, merchant.ownerId);
   }
 
   return reply.send(response);
@@ -1228,10 +1163,12 @@ fastify.get('/api/admin/auth/ip-score', {
   return { ip, score: await getAuthIpScore(ip) };
 });
 
-  const walletChallenges = new Map<
-    string,
-    { challenge: string; expiresAt: number }
-  >();
+  // Wallet auth challenges are stored in Redis under a TTL (#554), so they
+  // expire on their own, are visible to every gateway instance, and are
+  // consumed by the first verification attempt.
+  const walletChallenges = new WalletChallengeStore(redis, {
+    ttlMs: WALLET_CHALLENGE_TTL_MS,
+  });
 
   interface WalletChallengeRouteBody {
     address?: unknown;
@@ -1245,12 +1182,28 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/auth/challenge",
     async (request, reply) => {
       const d = WalletChallengeBody.parse(request.body);
-      const challenge = crypto.randomBytes(32).toString("hex");
-      const expiresAt = Date.now() + 5 * 60 * 1000; // 5 mins
-      walletChallenges.set(d.address, { challenge, expiresAt });
+
+      let issued;
+      try {
+        issued = await walletChallenges.issue(d.address);
+      } catch (err) {
+        request.log.error(
+          { err, address: d.address },
+          "[Auth] Unable to store wallet challenge",
+        );
+        return reply
+          .code(503)
+          .send(
+            createErrorResponse(
+              ErrorCodes.INTERNAL_ERROR,
+              "Authentication service unavailable",
+            ),
+          );
+      }
+
       return reply.send({
-        challenge,
-        expiresAt: new Date(expiresAt).toISOString(),
+        challenge: issued.challenge,
+        expiresAt: new Date(issued.expiresAt).toISOString(),
       });
     },
   );
@@ -1269,9 +1222,29 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/auth/verify",
     async (request, reply) => {
       const d = LegacyWalletVerifyBody.parse(request.body);
-      const challengeInfo = walletChallenges.get(d.address);
 
-      if (!challengeInfo) {
+      // Consuming is atomic: the challenge is gone whatever happens next, so
+      // it is single-use and a signature cannot be guessed at repeatedly
+      // against one outstanding challenge (#554).
+      let consumed;
+      try {
+        consumed = await walletChallenges.consume(d.address);
+      } catch (err) {
+        request.log.error(
+          { err, address: d.address },
+          "[Auth] Unable to read wallet challenge",
+        );
+        return reply
+          .code(503)
+          .send(
+            createErrorResponse(
+              ErrorCodes.INTERNAL_ERROR,
+              "Authentication service unavailable",
+            ),
+          );
+      }
+
+      if (consumed.status === "not_found") {
         return reply
           .code(400)
           .send(
@@ -1282,8 +1255,7 @@ fastify.get('/api/admin/auth/ip-score', {
           );
       }
 
-      if (Date.now() > challengeInfo.expiresAt) {
-        walletChallenges.delete(d.address);
+      if (consumed.status === "expired") {
         return reply
           .code(400)
           .send(
@@ -1293,6 +1265,8 @@ fastify.get('/api/admin/auth/ip-score', {
             ),
           );
       }
+
+      const challengeInfo = consumed.challenge;
 
       try {
         const keypair = Keypair.fromPublicKey(d.address);
@@ -1314,8 +1288,6 @@ fastify.get('/api/admin/auth/ip-score', {
             createErrorResponse(ErrorCodes.UNAUTHORIZED, "Invalid signature"),
           );
       }
-
-      walletChallenges.delete(d.address);
 
       let merchant;
       try {
@@ -1485,7 +1457,7 @@ fastify.get('/api/admin/auth/ip-score', {
         const jti = await createAuthSession(merchant.id, deviceInfo);
         const jwtToken = fastify.jwt.sign(
           { merchantId: merchant.id, ownerId: merchant.ownerId },
-{ jti },
+          { jti },
         );
         return reply.send({ token: jwtToken });
       } catch (err: any) {
@@ -1498,6 +1470,54 @@ fastify.get('/api/admin/auth/ip-score', {
               "Google token verification failed",
             ),
           );
+      }
+    },
+  );
+
+  fastify.post<{ Params: { id: string } }>(
+    "/api/webhooks/:id/test",
+    { preValidation: [fastify.authenticate] },
+    async (request, reply) => {
+      const { id } = request.params;
+      const payload = request.user as MerchantJwtPayload;
+
+      const existing = await prisma.webhookSubscription.findUnique({
+        where: { id },
+      });
+
+      if (!existing) {
+        return reply
+          .code(404)
+          .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Webhook subscription not found"));
+      }
+
+      if (existing.merchantId !== payload.merchantId) {
+        return reply
+          .code(403)
+          .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Forbidden"));
+      }
+
+      try {
+        const testResult = await indexerClient.testWebhook(
+          id,
+          request.headers as Record<string, string | string[] | undefined>
+        );
+        if (!testResult) {
+          return reply
+            .code(503)
+            .send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, "Indexer service unavailable"));
+        }
+        return reply.send(testResult);
+      } catch (err) {
+        if (err instanceof Error && err.message === 'NOT_FOUND') {
+          return reply
+            .code(404)
+            .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Webhook subscription not found in indexer"));
+        }
+        request.log.error({ err, id }, "Failed to test webhook");
+        return reply
+          .code(500)
+          .send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, "Failed to test webhook"));
       }
     },
   );
@@ -1736,6 +1756,76 @@ fastify.get('/api/admin/auth/ip-score', {
     },
   );
 
+  // #317 — Merchant account suspension without data deletion. A suspended
+  // merchant stays readable (GET endpoints still work) but cannot create new
+  // payments or settlements. Suspension/unsuspension is a service-to-service
+  // operation, so it is guarded by service-auth (x-service-token).
+  const suspendMerchant = async (id: string, status: "suspended" | "active", request: any) => {
+    const merchant = await prisma.merchant.findFirst({
+      where: { id, deletedAt: null },
+    });
+    if (!merchant)
+      return {
+        code: 404 as const,
+        body: createErrorResponse(ErrorCodes.NOT_FOUND, "Merchant not found"),
+      };
+
+    const conflictMessage =
+      status === "suspended"
+        ? "Merchant is already suspended"
+        : "Merchant is already active";
+    if (merchant.status === status)
+      return {
+        code: 409 as const,
+        body: createErrorResponse(ErrorCodes.INVALID_REQUEST, conflictMessage),
+      };
+
+    await prisma.$transaction(async (tx) => {
+      const updated = await tx.merchant.update({
+        where: { id },
+        data: { status },
+      });
+      await logAuditEvent(
+        status === "suspended" ? "merchant.suspended" : "merchant.unsuspended",
+        "merchant",
+        updated.id,
+        { before: merchant, after: updated },
+        request,
+        tx as unknown as Parameters<typeof logAuditEvent>[5],
+      );
+    });
+
+    const updated = await prisma.merchant.findUnique({ where: { id } });
+    const { secretHash: _hash, ...safeMerchant } = updated!;
+    return { code: 200 as const, body: { data: safeMerchant } };
+  };
+
+  fastify.post<{ Params: { id: string } }>(
+    "/api/merchants/:id/suspend",
+    {
+      preValidation: [fastify.serviceAuth],
+      config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      const result = await suspendMerchant(id, "suspended", request);
+      return reply.code(result.code).send(result.body);
+    },
+  );
+
+  fastify.post<{ Params: { id: string } }>(
+    "/api/merchants/:id/unsuspend",
+    {
+      preValidation: [fastify.serviceAuth],
+      config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      const result = await suspendMerchant(id, "active", request);
+      return reply.code(result.code).send(result.body);
+    },
+  );
+
   // Update per-merchant settings (fee rules, tier). Merges into existing settings so
   // a partial update does not wipe unrelated keys. The settlement engine reads
   // settings.feeBps from here when computing fees.
@@ -1861,6 +1951,26 @@ fastify.get('/api/admin/auth/ip-score', {
       // ── 1. Parse and validate request body ──────────────────────────────────────
       const d = CreatePaymentBody.parse(request.body);
 
+      // ── 1b. Merchant must exist, be active (not soft-deleted) and not suspended ──
+      const merchant = await prisma.merchant.findFirst({
+        where: { id: d.merchantId, deletedAt: null },
+      });
+      if (!merchant) {
+        return reply
+          .code(404)
+          .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Merchant not found"));
+      }
+      if (merchant.status === "suspended") {
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.MERCHANT_SUSPENDED,
+              "Merchant is suspended",
+            ),
+          );
+      }
+
       // ── 2. Read and validate optional Idempotency-Key header ────────────────────
       const idempotencyKey = readIdempotencyKey(request);
 
@@ -1966,6 +2076,102 @@ fastify.get('/api/admin/auth/ip-score', {
       }
 
       return reply.code(201).send({ data: payment });
+    },
+  );
+
+  // Payments listing — merchant-scoped and paginated, mirroring /api/settlements.
+  //
+  // Authorization: service-to-service callers (x-service-token) may pass
+  // merchantId to filter across merchants. Merchant-authenticated callers
+  // (JWT) are always scoped to their own merchantId.
+  //
+  // Optional bulk event enrichment (?includeEvents=true, #553): the naive
+  // approach of enriching each payment individually calls the indexer once
+  // per payment, so listing latency scales with page size. Instead this
+  // batches the lookup by the *unique* merchantIds present on the page —
+  // for the common merchant-scoped case that's a single indexer call no
+  // matter how many payments are returned — and reuses each result across
+  // every payment for that merchant.
+  fastify.get<{
+    Querystring: z.infer<typeof PaymentListQuery> & { merchantId?: string };
+  }>(
+    "/api/payments",
+    {
+      preValidation: async (request: FastifyRequest, reply: FastifyReply) => {
+        if (request.headers["x-service-token"]) {
+          await fastify.serviceAuth(request, reply);
+          return;
+        }
+        await fastify.authenticate(request, reply);
+      },
+      config: { rateLimit: { max: 100, timeWindow: "1 minute" } },
+    },
+    async (request, reply) => {
+      const query = PaymentListQuery.parse(request.query);
+      const { status, from, to, limit, page, includeEvents } = query;
+      const requestedMerchantId = (request.query as { merchantId?: string })
+        .merchantId;
+
+      const isServiceAuth = Boolean(request.headers["x-service-token"]);
+      const scopedMerchantId = isServiceAuth
+        ? requestedMerchantId
+        : (request.user as { merchantId?: string } | undefined)?.merchantId;
+
+      const where: any = {};
+      if (scopedMerchantId) {
+        where.merchantId = scopedMerchantId;
+      }
+      if (status) {
+        where.status = status;
+      }
+      if (from || to) {
+        where.createdAt = {};
+        if (from) where.createdAt.gte = new Date(from);
+        if (to) where.createdAt.lte = new Date(to);
+      }
+
+      const [records, total] = await Promise.all([
+        prisma.payment.findMany({
+          where,
+          orderBy: { createdAt: "desc" },
+          take: limit,
+          skip: (page - 1) * limit,
+        }),
+        prisma.payment.count({ where }),
+      ]);
+
+      if (!includeEvents || records.length === 0) {
+        return reply.send({
+          data: records,
+          pagination: buildPaginationMeta(page, limit, total),
+        });
+      }
+
+      // One indexer call per unique merchantId on the page, not per payment.
+      const uniqueMerchantIds = [
+        ...new Set(records.map((p: { merchantId: string }) => p.merchantId)),
+      ];
+      const eventsByMerchant = new Map(
+        await Promise.all(
+          uniqueMerchantIds.map(async (merchantId) => {
+            const events = await indexerClient.getPaymentEvents(
+              merchantId,
+              request.headers,
+            );
+            return [merchantId, events] as const;
+          }),
+        ),
+      );
+
+      const data = records.map((payment: { merchantId: string }) => ({
+        ...payment,
+        events: eventsByMerchant.get(payment.merchantId) ?? null,
+      }));
+
+      return reply.send({
+        data,
+        pagination: buildPaginationMeta(page, limit, total),
+      });
     },
   );
 
@@ -2300,6 +2506,18 @@ fastify.get('/api/admin/auth/ip-score', {
           );
       }
 
+      // #317 — suspended merchants cannot create new settlements
+      if (merchant.status === "suspended") {
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.MERCHANT_SUSPENDED,
+              "Merchant is suspended",
+            ),
+          );
+      }
+
       const settings = merchant.settings as
         | {
             webhookUrl?: string;
@@ -2522,7 +2740,35 @@ fastify.get('/api/admin/auth/ip-score', {
     reply: FastifyReply,
     path: string,
   ) {
-    const targetUrl = new URL(path, env.FX_ENGINE_URL).toString();
+    if (path.startsWith('//') || path.includes('://')) {
+      return reply
+        .code(400)
+        .send(
+          createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            "Invalid upstream path",
+          ),
+        );
+    }
+
+    let targetUrl: string;
+    try {
+      targetUrl = new URL(path, env.FX_ENGINE_URL).toString();
+      validateUpstreamUrl(targetUrl);
+    } catch (err) {
+      if (err instanceof SsrfRejectedError) {
+        request.log.warn({ path, err: err.message }, "SSRF attempt rejected");
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              "Request to internal host is not allowed",
+            ),
+          );
+      }
+      throw err;
+    }
 
     try {
       const response = await fetchUpstream(request, targetUrl, {}, request.log);
@@ -2588,7 +2834,7 @@ fastify.get('/api/admin/auth/ip-score', {
       preValidation: [fastify.serviceAuth],
     },
     async (request, reply) => {
-      const body = request.body as z.infer<typeof CreateSupportedAssetBody>;
+      const body = CreateSupportedAssetBody.parse(request.body);
 
       try {
         const asset = await prisma.supportedAsset.create({
@@ -2636,7 +2882,7 @@ fastify.get('/api/admin/auth/ip-score', {
     },
     async (request, reply) => {
       const { code } = request.params as { code: string };
-      const body = request.body as z.infer<typeof UpdateSupportedAssetBody>;
+      const body = UpdateSupportedAssetBody.parse(request.body);
 
       try {
         const asset = await prisma.supportedAsset.update({
@@ -2727,37 +2973,23 @@ fastify.get('/api/admin/auth/ip-score', {
 
 // ─── Warmup ─────────────────────────────────────────────────────────────────
 
+interface DownstreamService {
+  name: string;
+  healthUrl: string;
+}
+
 function getDownstreamServices(env: Env): DownstreamService[] {
   return [
-    {
-      name: "fx-engine",
-      healthUrl: `${env.FX_ENGINE_URL}/api/health`,
-      capabilityUrl: `${env.FX_ENGINE_URL}/api/currencies`,
-      validateBody: (body) =>
-        typeof body === "object" && body !== null && Array.isArray((body as { currencies?: unknown }).currencies),
-    },
-    {
-      name: "indexer",
-      healthUrl: `${env.INDEXER_URL}/api/health`,
-      capabilityUrl: `${env.INDEXER_URL}/api/events?limit=1`,
-      // Internal endpoint — requires the inter-service token (#117).
-      serviceToken: env.INTER_SERVICE_SECRET,
-      validateBody: (body) =>
-        typeof body === "object" && body !== null && Array.isArray((body as { data?: unknown }).data),
-    },
+    { name: "fx-engine", healthUrl: `${env.FX_ENGINE_URL}/api/health` },
+    { name: "indexer", healthUrl: `${env.INDEXER_URL}/api/health` },
   ];
 }
 
 /**
  * Make best-effort warmup requests to downstream services so their caches,
  * connection pools, and health state are ready before the gateway accepts
- * traffic.
- *
- * Readiness is capability-aware (#556): each service is only considered ready
- * when both its `/api/health` ping succeeds AND a real, work-bearing endpoint
- * responds with the expected contract. This catches schema/DB drift in a
- * downstream that a bare ping would miss until traffic. Per-service probe
- * detail is logged so operators can see exactly what failed.
+ * traffic. Each call carries a unique x-trace-id so operators can correlate
+ * startup events across services.
  *
  * Errors are logged but never thrown — a downstream that is still warming up
  * should not prevent the gateway from starting.
@@ -2766,7 +2998,37 @@ async function warmupDownstreamServices(
   env: Env,
   logger: FastifyBaseLogger,
 ): Promise<void> {
-  await checkDownstreamReadiness(getDownstreamServices(env), { logger });
+  const services = getDownstreamServices(env);
+
+  await Promise.allSettled(
+    services.map(async (svc) => {
+      const traceId = crypto.randomUUID();
+      const startTime = Date.now();
+
+      try {
+        const response = await fetch(svc.healthUrl, {
+          headers: { "x-trace-id": traceId },
+          signal: AbortSignal.timeout(5_000),
+        });
+        const durationMs = Date.now() - startTime;
+        logger.info(
+          {
+            traceId,
+            targetService: svc.name,
+            statusCode: response.status,
+            durationMs,
+          },
+          "Warmup completed",
+        );
+      } catch (err) {
+        const durationMs = Date.now() - startTime;
+        logger.warn(
+          { traceId, targetService: svc.name, durationMs, err },
+          "Warmup failed — downstream may not be ready",
+        );
+      }
+    }),
+  );
 }
 
 // Graceful shutdown

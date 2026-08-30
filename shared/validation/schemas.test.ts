@@ -19,6 +19,7 @@ import {
   SETTLEMENT_STATUS_TRANSITIONS,
   isValidTransition,
 } from './schemas.js';
+import { CurrencyCode, validateAmountPrecision, ASSET_DECIMALS } from './currency.js';
 
 const VALID_STELLAR_PUBLIC_KEY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const INVALID_STELLAR_PUBLIC_KEY = 'merchant-1';
@@ -474,5 +475,57 @@ test('StellarAddressSchema validation', async (t) => {
       status: 'initiated',
       createdAt: new Date().toISOString(),
     }).merchantId, VALID_STELLAR_PUBLIC_KEY);
+  });
+});
+
+// ─── CurrencyCode schema tests ────────────────────────────────────────────
+test('CurrencyCode schema', async (t) => {
+  await t.test('accepts supported currencies', () => {
+    assert.strictEqual(CurrencyCode.parse('USDC'), 'USDC');
+    assert.strictEqual(CurrencyCode.parse('EURT'), 'EURT');
+    assert.strictEqual(CurrencyCode.parse('NGN'), 'NGN');
+  });
+
+  await t.test('rejects unknown currency codes', () => {
+    assert.throws(() => CurrencyCode.parse('BTC'));
+    assert.throws(() => CurrencyCode.parse(''));
+    assert.throws(() => CurrencyCode.parse('usdc'));
+  });
+
+  await t.test('CreatePaymentBody rejects invalid currency', () => {
+    assert.throws(() => CreatePaymentBody.parse({
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
+      amount: '100',
+      asset: 'INVALID',
+    }));
+  });
+
+  await t.test('ASSET_DECIMALS covers all supported currencies', () => {
+    for (const code of ['USDC', 'EURT', 'NGN']) {
+      assert.ok(code in ASSET_DECIMALS, `${code} should have decimals defined`);
+      assert.ok(ASSET_DECIMALS[code] >= 0, `${code} decimals should be non-negative`);
+    }
+  });
+});
+
+// ─── Amount precision validation tests ────────────────────────────────────
+test('validateAmountPrecision', async (t) => {
+  await t.test('accepts integer amounts', () => {
+    assert.strictEqual(validateAmountPrecision('100', 'USDC'), true);
+    assert.strictEqual(validateAmountPrecision('0', 'NGN'), true);
+  });
+
+  await t.test('accepts amounts within decimal limit', () => {
+    assert.strictEqual(validateAmountPrecision('1.1234567', 'USDC'), true);
+    assert.strictEqual(validateAmountPrecision('1.12', 'NGN'), true);
+  });
+
+  await t.test('rejects amounts exceeding decimal limit', () => {
+    assert.strictEqual(validateAmountPrecision('1.12345678', 'USDC'), false);
+    assert.strictEqual(validateAmountPrecision('1.123', 'NGN'), false);
+  });
+
+  await t.test('rejects unknown asset', () => {
+    assert.strictEqual(validateAmountPrecision('1.00', 'UNKNOWN'), false);
   });
 });
