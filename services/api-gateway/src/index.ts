@@ -1670,6 +1670,37 @@ export function normalizeAndValidateEmail(
     },
   );
 
+  // Logout revokes the caller's own access token immediately: its jti is added
+  // to the Redis blocklist (TTL = the token's remaining lifetime) and its
+  // session record is dropped, so the authenticate hook rejects any further
+  // use of that token well before its natural expiry (#478).
+  fastify.post(
+    "/api/auth/logout",
+    {
+      preValidation: [fastify.authenticate],
+    },
+    async (request, reply) => {
+      const payload = request.user as MerchantJwtPayload;
+      const jti = payload.jti;
+      const merchantId = payload.merchantId;
+
+      if (!jti || !merchantId) {
+        return reply
+          .code(401)
+          .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
+      }
+
+      const remainingLifetime =
+        (payload.exp ?? 0) - Math.floor(Date.now() / 1000);
+      if (remainingLifetime > 0) {
+        await revokeJti(jti, remainingLifetime);
+      }
+      await revokeAuthSession(merchantId, jti);
+
+      return reply.send({ status: "logged_out" });
+    },
+  );
+
   // Merchants
   fastify.post<{ Body: z.infer<typeof CreateMerchantBody> }>(
     "/api/merchants",
@@ -2697,17 +2728,20 @@ export function normalizeAndValidateEmail(
 
       // Check daily settlement limit (aggregate all assets)
       if (settings?.dailySettlementLimit) {
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
         const startTimeMs = Date.now();
 
+        // The daily window boundary is derived from the database's own clock
+        // (date_trunc('day', now())) and the aggregate is filtered on the
+        // authoritative "initiatedAt" column, rather than a JS Date computed
+        // from the gateway's wall clock. A process restart or server clock
+        // skew therefore cannot shift, bypass, or curtail the window (#472).
         const aggregateResult = await prisma.$queryRaw<
           [{ sum: string | null }]
         >`
         SELECT COALESCE(SUM(CAST("totalAmount" AS DECIMAL)), 0)::text as sum
         FROM "Settlement"
         WHERE "merchantId" = ${d.merchantId}
-        AND "initiatedAt" >= ${todayStart}
+        AND "initiatedAt" >= date_trunc('day', now())
       `;
 
         const currentDailyTotal = aggregateResult?.[0]?.sum

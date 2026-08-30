@@ -109,6 +109,47 @@ test('property: settlement status transitions are valid and terminal states are 
   );
 });
 
+// ─── Shared status vocabulary consistency (#473) ──────────────────────────────
+// PAYMENT_STATUS_TRANSITIONS / SETTLEMENT_STATUS_TRANSITIONS are the single
+// status map consumed by the api-gateway and the settlement-engine (which
+// re-exports SETTLEMENT_STATUS_TRANSITIONS as SettlementStatusTransitions).
+// These assertions fail the moment the shared vocabulary drifts from the
+// canonical Prisma enums or stops being internally closed.
+test('shared status maps match the canonical status vocabulary and are self-consistent', async (t) => {
+  const PAYMENT_STATUSES = ['cancelled', 'completed', 'failed', 'initiated'];
+  const SETTLEMENT_STATUSES = ['completed', 'failed', 'pending', 'processing'];
+
+  await t.test('payment status vocabulary is exactly the Prisma PaymentStatus set', () => {
+    assert.deepStrictEqual(Object.keys(PAYMENT_STATUS_TRANSITIONS).sort(), PAYMENT_STATUSES);
+  });
+
+  await t.test('settlement status vocabulary is exactly the Prisma SettlementStatus set', () => {
+    assert.deepStrictEqual(Object.keys(SETTLEMENT_STATUS_TRANSITIONS).sort(), SETTLEMENT_STATUSES);
+  });
+
+  await t.test('every payment transition target is itself a known status', () => {
+    for (const [from, targets] of Object.entries(PAYMENT_STATUS_TRANSITIONS)) {
+      for (const to of targets) {
+        assert.ok(
+          PAYMENT_STATUS_TRANSITIONS[to] !== undefined,
+          `payment status "${from}" -> unknown status "${to}"`,
+        );
+      }
+    }
+  });
+
+  await t.test('every settlement transition target is itself a known status', () => {
+    for (const [from, targets] of Object.entries(SETTLEMENT_STATUS_TRANSITIONS)) {
+      for (const to of targets) {
+        assert.ok(
+          SETTLEMENT_STATUS_TRANSITIONS[to] !== undefined,
+          `settlement status "${from}" -> unknown status "${to}"`,
+        );
+      }
+    }
+  });
+});
+
 test('PaginationQuery validation', async (t) => {
   await t.test('Default limit is 50', () => {
     const result = PaginationQuery.parse({});
