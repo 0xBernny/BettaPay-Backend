@@ -488,9 +488,13 @@ export function buildApp(opts: AppOptions = {}) {
   });
 
   // Rate limiting: global default and route overrides
+  const isRateLimitDisabled = () =>
+    process.env.RATE_LIMIT_ENABLED === 'false' || process.env.RATE_LIMIT_ENABLED === '0';
+
   fastify.register(rateLimit, {
     max: 1000,
     timeWindow: "1 minute",
+    skip: () => isRateLimitDisabled(),
     addHeaders: {
       "x-ratelimit-limit": true,
       "x-ratelimit-remaining": true,
@@ -513,6 +517,30 @@ export function buildApp(opts: AppOptions = {}) {
     object,
     ReturnType<typeof fastify.createRateLimit>
   >();
+
+  function parseWindowToSeconds(window: string | number | undefined): number {
+    if (typeof window === 'number') {
+      return Math.max(1, Math.floor(window / 1000));
+    }
+    if (!window || typeof window !== 'string') {
+      return 60;
+    }
+    const str = window.trim().toLowerCase();
+    if (str.includes('minute') || str.includes('m')) {
+      const num = parseInt(str, 10);
+      return (isNaN(num) ? 1 : num) * 60;
+    }
+    if (str.includes('hour') || str.includes('h')) {
+      const num = parseInt(str, 10);
+      return (isNaN(num) ? 1 : num) * 3600;
+    }
+    if (str.includes('second') || str.includes('s')) {
+      const num = parseInt(str, 10);
+      return isNaN(num) ? 1 : num;
+    }
+    const num = parseInt(str, 10);
+    return isNaN(num) ? 60 : Math.max(1, Math.floor(num / 1000));
+  }
 
   fastify.addHook(
     "onSend",
@@ -540,14 +568,30 @@ export function buildApp(opts: AppOptions = {}) {
         ttlInSeconds?: number;
       };
 
-      if (typeof result.max === "number") {
-        reply.header("X-RateLimit-Limit", result.max);
-        reply.header("X-RateLimit-Remaining", result.remaining ?? 0);
-        reply.header(
-          "X-RateLimit-Reset",
-          Math.ceil(Date.now() / 1000) + (result.ttlInSeconds ?? 0),
-        );
-      }
+      const max =
+        typeof result.max === "number"
+          ? result.max
+          : typeof routeConfig.rateLimit === "object" &&
+              typeof (routeConfig.rateLimit as any).max === "number"
+            ? (routeConfig.rateLimit as any).max
+            : 1000;
+      const windowStr =
+        (typeof routeConfig.rateLimit === "object" &&
+          (routeConfig.rateLimit as any).timeWindow) ||
+        "1 minute";
+      const windowSeconds = parseWindowToSeconds(windowStr);
+
+      const disabled = isRateLimitDisabled();
+      const remaining = disabled ? max : (result.remaining ?? 0);
+      const ttl = result.ttlInSeconds ?? windowSeconds;
+
+      reply.header("X-RateLimit-Limit", max);
+      reply.header("X-RateLimit-Remaining", remaining);
+      reply.header(
+        "X-RateLimit-Reset",
+        Math.ceil(Date.now() / 1000) + ttl,
+      );
+      reply.header("X-RateLimit-Policy", `${max};w=${windowSeconds}`);
 
       return payload;
     },
