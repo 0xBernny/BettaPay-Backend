@@ -681,6 +681,19 @@ export const cacheState: {
   subscriptions: { data: WebhookSubscription[]; cachedAt: number } | null;
 } = { subscriptions: null };
 
+export async function dispatchPendingWebhookDeliveries(): Promise<void> {
+  const store = (prisma as any).indexedEventWebhookDelivery;
+  let pending: any[];
+  try { pending = await store.findMany({ where: { status: 'pending' }, orderBy: { createdAt: 'asc' }, take: 100 }); }
+  catch (err) { fastify.log.warn({ err: String(err) }, '[Indexer] Unable to load pending webhook deliveries'); return; }
+  for (const delivery of pending) {
+    try {
+      await webhookQueue.add('deliver', { url: delivery.url, event: delivery.event, version: '1.0', signingSecret: delivery.signingSecret ?? undefined, headers: delivery.headers ?? undefined }, { jobId: `indexed-event-delivery-${delivery.id}` });
+      await store.update({ where: { id: delivery.id }, data: { status: 'processed', processedAt: new Date() } });
+    } catch (err) { fastify.log.warn({ deliveryId: delivery.id, err: String(err) }, '[Indexer] Webhook enqueue failed; delivery remains pending'); }
+  }
+}
+
 export async function persistEvent(
   stellarId: string | null,
   topics: string[],
@@ -743,15 +756,8 @@ export async function persistEvent(
   }
 
   const subs = cacheState.subscriptions.data;
-  for (const sub of subs) {
-    await webhookQueue.add("deliver", {
-      url: sub.url,
-      event: record as Record<string, unknown>,
-      version: "1.0",
-      signingSecret: sub.signingSecret ?? undefined,
-      headers: (sub.headers as Record<string, string> | null) ?? undefined,
-    });
-  }
+  if (subs.length) await (prisma as any).indexedEventWebhookDelivery.createMany({ data: subs.map((sub) => ({ id: `whd_${crypto.randomUUID().replace(/-/g, '')}`, indexedEventId: id, subscriptionId: sub.id, url: sub.url, event: record, signingSecret: sub.signingSecret ?? undefined, headers: (sub.headers as Record<string, string> | null) ?? undefined })), skipDuplicates: true });
+  await dispatchPendingWebhookDeliveries();
 
   return record as Record<string, unknown>;
 }
