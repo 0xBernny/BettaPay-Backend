@@ -289,7 +289,7 @@ function sanitizeString(value: string): string {
     .normalize("NFC");
 }
 
-function sanitizeInput(value: unknown, seen = new WeakSet<object>()): unknown {
+export function sanitizeInput(value: unknown, seen = new WeakSet<object>()): unknown {
   if (typeof value === "string") {
     return sanitizeString(value);
   }
