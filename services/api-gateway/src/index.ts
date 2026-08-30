@@ -1392,6 +1392,35 @@ fastify.get('/api/admin/auth/ip-score', {
     },
   );
 
+export function normalizeAndValidateEmail(
+  rawEmail: unknown,
+): { email: string; domain: string } | null {
+  if (typeof rawEmail !== "string") return null;
+
+  const trimmed = rawEmail.trim().replace(/[\uFF0E\u3002\uFF61]/g, ".");
+  if (!trimmed || trimmed.length > 320) return null;
+
+  const parsed = z.string().email().safeParse(trimmed);
+  if (!parsed.success) return null;
+
+  const normalized = trimmed.toLowerCase();
+  const parts = normalized.split("@");
+  if (parts.length !== 2) return null;
+
+  const [localPart, domainPart] = parts;
+  if (!localPart || !domainPart) return null;
+
+  if (
+    domainPart.startsWith(".") ||
+    domainPart.endsWith(".") ||
+    domainPart.includes("..")
+  ) {
+    return null;
+  }
+
+  return { email: normalized, domain: domainPart };
+}
+
   interface GoogleAuthRouteBody {
     token?: unknown;
   }
@@ -1422,8 +1451,8 @@ fastify.get('/api/admin/auth/ip-score', {
               ),
             );
         }
-        const email = payload.email;
-        if (!email) {
+        const rawEmail = payload.email;
+        if (!rawEmail) {
           return reply
             .code(400)
             .send(
@@ -1433,6 +1462,20 @@ fastify.get('/api/admin/auth/ip-score', {
               ),
             );
         }
+
+        const validated = normalizeAndValidateEmail(rawEmail);
+        if (!validated) {
+          return reply
+            .code(400)
+            .send(
+              createErrorResponse(
+                ErrorCodes.INVALID_REQUEST,
+                "Invalid Google email address format",
+              ),
+            );
+        }
+
+        const { email, domain } = validated;
 
         const lockoutCount = await getGoogleAuthLockoutCount(email);
         if (lockoutCount >= env.AUTH_MAX_FAILED_ATTEMPTS) {
@@ -1451,7 +1494,6 @@ fastify.get('/api/admin/auth/ip-score', {
         }
 
         if (env.ALLOWED_EMAIL_DOMAINS.length > 0) {
-          const domain = email.split("@")[1]?.toLowerCase();
           if (!domain || !env.ALLOWED_EMAIL_DOMAINS.includes(domain)) {
             await incrementGoogleAuthLockout(email);
             request.log.info(
