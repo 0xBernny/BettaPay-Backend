@@ -36,7 +36,12 @@ import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-deliv
 import { computeSettlementAmounts, SettlementAmountError } from './settlement-amounts.js';
 import type { DiscountTier } from './settlement-amounts.js';
 import { buildSettlementWebhookData } from './webhook-payload.js';
-import { acquireSemaphore, releaseSemaphore, getActiveCount } from './redis-semaphore.js';
+import {
+  acquireSemaphore,
+  releaseSemaphore,
+  startSemaphoreRenewal,
+  getActiveCount,
+} from './redis-semaphore.js';
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import {
   validateEnvOrExit,
@@ -341,7 +346,9 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
   // ── Per-merchant concurrency semaphore ──────────────────────────────────────
   const maxRetries = 3;
   const requeueDelayMs = 5000;
-  let acquired = false;
+  // The member token this job holds; used to renew and to release exactly its
+  // own slot (#487). null until acquired.
+  let semaphoreToken: string | null = null;
 
   log.info({
     jobId: job.id,
@@ -352,8 +359,8 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
   }, 'Processing settlement job');
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    acquired = await acquireSemaphore(redis, merchantId);
-    if (acquired) break;
+    semaphoreToken = await acquireSemaphore(redis, merchantId);
+    if (semaphoreToken) break;
 
     if (attempt < maxRetries) {
       log.info({
@@ -379,6 +386,18 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
     }, 'Settlement failed: merchant concurrency limit exceeded after max retries');
     throw new Error(`Merchant ${merchantId} at concurrency limit after ${maxRetries} retries`);
   }
+
+  // Keep the slot reserved for as long as this job runs, even past the
+  // semaphore TTL — otherwise a slow settlement's slot ages out and a 4th
+  // concurrent job for the merchant slips through (#486).
+  const renewal = semaphoreToken
+    ? startSemaphoreRenewal(redis, merchantId, semaphoreToken, {
+        onLost: () =>
+          log.warn({ merchantId, settlementId }, 'Settlement semaphore slot lost mid-job'),
+        onError: (err) =>
+          log.warn({ err, merchantId, settlementId }, 'Settlement semaphore renewal failed'),
+      })
+    : undefined;
 
   try {
     // Transition to processing first
@@ -425,8 +444,11 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
 
     throw error;
   } finally {
-    if (acquired) {
-      await releaseSemaphore(redis, merchantId).catch(() => {});
+    renewal?.stop();
+    if (semaphoreToken) {
+      // Release exactly this job's slot; a double-release or a crashed
+      // sibling's release can never drop it (#487).
+      await releaseSemaphore(redis, merchantId, semaphoreToken).catch(() => {});
     }
   }
 };
