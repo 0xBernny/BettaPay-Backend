@@ -127,4 +127,35 @@ export const WebhookPayloadSchema = z.object({
   event: z.record(z.unknown()).describe('The indexed event data'),
 });
 
+// ─── Custom webhook headers (#569) ─────────────────────────────────────────
+//
+// Merchants can configure custom headers (idempotency keys, bearer tokens,
+// etc.) to be sent with every webhook delivery attempt, including retries.
+// `Content-Type` and `X-BettaPay-Signature` are reserved: the delivery worker
+// (@bettapay/webhook-delivery) always controls those two, but we also reject
+// them at the API boundary so misconfiguration surfaces immediately instead
+// of silently being dropped at delivery time.
+
+const HTTP_TOKEN_PATTERN = /^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/;
+const RESERVED_WEBHOOK_HEADER_NAMES = new Set(['content-type', 'x-bettapay-signature']);
+const MAX_CUSTOM_WEBHOOK_HEADERS = 20;
+
+export const WebhookHeadersSchema = z
+  .record(z.string(), z.string().max(4096, 'Header value must not exceed 4096 characters'))
+  .refine((headers) => Object.keys(headers).length <= MAX_CUSTOM_WEBHOOK_HEADERS, {
+    message: `A maximum of ${MAX_CUSTOM_WEBHOOK_HEADERS} custom headers is allowed`,
+  })
+  .refine((headers) => Object.keys(headers).every((name) => HTTP_TOKEN_PATTERN.test(name)), {
+    message: 'Header names must contain only valid HTTP token characters',
+  })
+  .refine(
+    (headers) => Object.keys(headers).every((name) => !RESERVED_WEBHOOK_HEADER_NAMES.has(name.toLowerCase())),
+    { message: 'Content-Type and X-BettaPay-Signature are reserved and cannot be set as custom headers' },
+  )
+  .refine((headers) => Object.values(headers).every((value) => !/[\r\n]/.test(value)), {
+    message: 'Header values must not contain line breaks',
+  });
+
+export type WebhookHeaders = z.infer<typeof WebhookHeadersSchema>;
+
 export type WebhookPayload = z.infer<typeof WebhookPayloadSchema>;

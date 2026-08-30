@@ -27,6 +27,8 @@ enum KycStatus {
   rejected
 }
 
+// #317 — Merchant suspension status. Backfilled to 'active' for existing rows
+// by the add_merchant_status migration.
 enum MerchantStatus {
   active
   suspended
@@ -88,6 +90,9 @@ model Settlement {
   asset                   String
   status                  SettlementStatus @default(pending)
   webhookUrl              String?
+  // Custom headers (idempotency keys, auth tokens, etc.) sent with every
+  // webhook delivery attempt for this settlement, including retries (#569).
+  webhookHeaders          Json?
   batchId                 String?
   initiatedAt             DateTime         @default(now())
   completedAt             DateTime?
@@ -131,11 +136,17 @@ model IndexedEvent {
 }
 
 model WebhookSubscription {
-  id            String   @id
-  url           String
-  createdAt     DateTime @default(now())
-  signingSecret String?
-  merchantId    String?
+  id                 String    @id
+  url                String
+  createdAt          DateTime  @default(now())
+  signingSecret      String?
+  merchantId         String?
+  // Custom headers (idempotency keys, auth tokens, etc.) sent with every
+  // delivery attempt for this subscription, including retries (#569).
+  headers            Json?
+  lastTestedAt       DateTime?
+  lastTestStatus     String?
+  lastTestStatusCode Int?
 }
 
 model AuditLog {

@@ -84,6 +84,24 @@ export function redactPiiFromDetails(details: unknown): unknown {
   });
 }
 
+const LEAK_PATTERNS = [
+  /node_modules[/\\]/g,
+  /\/[a-zA-Z0-9_/.-]+\.(ts|js|json)/g,
+  /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|ECONNRESET/gi,
+  /postgres(ql)?(ql)?|mysql|redis|mongodb/gi,
+  /at\s+\S+\s+\([^)]*\)/g,
+  /\/home\/|\/usr\/|\/var\/|\/etc\//g,
+  /password|secret|token|credential/gi,
+];
+
+export function sanitizeErrorMessage(message: string): string {
+  let sanitized = message;
+  for (const pattern of LEAK_PATTERNS) {
+    sanitized = sanitized.replace(pattern, '[FILTERED]');
+  }
+  return sanitized;
+}
+
 export function registerErrorHandler(fastify: FastifyInstance, customLogger?: FastifyBaseLogger) {
   fastify.setErrorHandler((error, request, reply) => {
     const logger = customLogger || request.log || fastify.log;
@@ -97,7 +115,7 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
       const fastifyErr = error as FastifyError & { validation?: unknown };
       const code = fastifyErr.code || ErrorCodes.INVALID_REQUEST;
       const details = fastifyErr.validation ? redactPiiFromDetails(fastifyErr.validation) : undefined;
-      const response = createErrorResponse(code, fastifyErr.message, details);
+      const response = createErrorResponse(code, sanitizeErrorMessage(fastifyErr.message), details);
       return reply.code(fastifyErr.statusCode!).send(response);
     }
 

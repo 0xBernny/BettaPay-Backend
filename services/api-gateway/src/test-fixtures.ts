@@ -8,6 +8,15 @@
  * to ensure that Zod validation schemas and route logic are thoroughly tested.
  */
 
+// Supported asset seed used by settlement tests (mirrors the #319 seed data).
+export const MOCK_SUPPORTED_ASSET_USDC = {
+  code: 'USDC',
+  contractId: 'C_USDC_TEST_CONTRACT_ID',
+  decimals: 6,
+  name: 'USD Coin',
+  isActive: true,
+};
+
 export const MOCK_STELLAR_KEY_1 = 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H';
 export const MOCK_STELLAR_KEY_2 = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 export const MOCK_STELLAR_KEY_3 = 'GC3O6JFSB7N66H4XEQNZG3EXK72CS2W4D5LSLG2R7EXXEZBXZZZZZZZZ'; // Custom boundary mock key

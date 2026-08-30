@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert';
 import Fastify from 'fastify';
 import { z } from 'zod';
-import { registerErrorHandler, registerServiceAuth, redactPiiFromDetails } from './plugins.js';
+import { registerErrorHandler, registerServiceAuth, redactPiiFromDetails, sanitizeErrorMessage } from './plugins.js';
 
 test('Zod validation error returns 400', async (t) => {
   const fastify = Fastify({ logger: false });
@@ -177,4 +177,42 @@ test('error handler does not leak PII in message', async (t) => {
   const body = JSON.parse(response.body);
   assert.strictEqual(body.error.details[0].message, '[REDACTED]');
   assert.strictEqual(response.body.includes('user@example.com'), false);
+});
+
+test('sanitizeErrorMessage strips file paths', () => {
+  const result = sanitizeErrorMessage('Error at /home/user/app/src/index.ts:42');
+  assert.ok(!result.includes('/home/user/app/src/index.ts'), 'file path should be filtered');
+});
+
+test('sanitizeErrorMessage strips connection strings', () => {
+  const result = sanitizeErrorMessage('ECONNREFUSED 127.0.0.1:5432');
+  assert.ok(!result.includes('ECONNREFUSED'), 'connection error should be filtered');
+});
+
+test('sanitizeErrorMessage strips node_modules paths', () => {
+  const result = sanitizeErrorMessage('Error in node_modules/zod/src/index.ts');
+  assert.ok(!result.includes('node_modules'), 'node_modules path should be filtered');
+});
+
+test('sanitizeErrorMessage preserves safe messages', () => {
+  const result = sanitizeErrorMessage('Rate limit exceeded');
+  assert.strictEqual(result, 'Rate limit exceeded');
+});
+
+test('Fastify error handler sanitizes internal messages', async (t) => {
+  const fastify = Fastify({ logger: false });
+  registerErrorHandler(fastify);
+
+  fastify.get('/', () => {
+    const err: any = new Error('Connection to postgresql://user:password@host:5432/db refused');
+    err.statusCode = 503;
+    err.code = 'UPSTREAM_ERROR';
+    throw err;
+  });
+
+  const response = await fastify.inject({ method: 'GET', url: '/' });
+  assert.strictEqual(response.statusCode, 503);
+  const body = JSON.parse(response.body);
+  assert.ok(!body.error.message.includes('postgresql'), 'connection string should be sanitized');
+  assert.ok(!body.error.message.includes('password'), 'password should be sanitized');
 });
