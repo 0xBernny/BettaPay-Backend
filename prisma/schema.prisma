@@ -135,6 +135,13 @@ model IndexedEvent {
   @@index([indexedAt])
 }
 
+enum WebhookDeliveryStatus {
+  pending
+  delivered
+  failed
+  expired
+}
+
 model IndexedEventWebhookDelivery {
   id             String   @id
   indexedEventId String
@@ -143,12 +150,16 @@ model IndexedEventWebhookDelivery {
   event          Json
   signingSecret  String?
   headers        Json?
-  status         String   @default("pending")
+  status         WebhookDeliveryStatus @default(pending)
+  retryCount     Int      @default(0)
+  lastAttemptAt  DateTime?
+  lastError      String?
   processedAt    DateTime?
   createdAt      DateTime @default(now())
 
   @@unique([indexedEventId, subscriptionId])
   @@index([status, createdAt])
+  @@index([subscriptionId, status, createdAt])
 }
 
 model WebhookSubscription {

@@ -112,11 +112,6 @@ import { Keypair } from "@stellar/stellar-sdk";
 import { OAuth2Client } from "google-auth-library";
 import { registerGatewayHealthRoutes } from "./health.js";
 import {
-  consumeWalletChallenge,
-  storeWalletChallenge,
-  WALLET_CHALLENGE_TTL_MS,
-} from "./wallet-auth-challenge.js";
-import {
   startAbandonedPaymentsCron,
   stopAbandonedPaymentsCron,
 } from "./abandoned-payments-cron.js";

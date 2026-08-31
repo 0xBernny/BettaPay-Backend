@@ -39,6 +39,19 @@ export function getCronIntervalMs(opts?: CronOptions): number {
  * @param redis - Optional Redis client for distributed locking across gateway instances.
  * @returns The number of payments that were cancelled.
  */
+/**
+ * Lua script for atomic lock release.
+ * Only deletes the lock if the stored value matches what we wrote,
+ * preventing accidental deletion of a lock acquired by another instance.
+ */
+const RELEASE_LOCK_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`;
+
 export async function autoExpireAbandonedPayments(
   prisma: PrismaClient,
   logger: FastifyLoggerInstance,
@@ -128,8 +141,8 @@ export async function autoExpireAbandonedPayments(
     return 0;
   } finally {
     isCronRunning = false;
-    if (lockAcquired && redis && typeof redis.del === 'function') {
-      await redis.del(lockKey).catch(() => {});
+    if (lockAcquired && redis && typeof redis.eval === 'function') {
+      await redis.eval(RELEASE_LOCK_SCRIPT, 1, lockKey, lockVal).catch(() => {});
     }
   }
 }
