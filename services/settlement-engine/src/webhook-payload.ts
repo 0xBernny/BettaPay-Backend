@@ -1,4 +1,6 @@
-import type { FeeAuditSnapshot } from './settlement-amounts.js';
+import type { FeeAuditSnapshot } from "./settlement-amounts.js";
+import { feeSnapshotSchema } from "@bettapay/shared-validation";
+import { logger } from "@bettapay/shared-validation";
 
 /** The subset of a Settlement row that the webhook payload is built from. */
 export interface SettlementWebhookSource {
@@ -26,11 +28,34 @@ export interface SettlementWebhookSource {
  * the webhook alone — the full `feeSnapshot` breakdown plus a top-level
  * `feeVersion` for quick reconciliation. Fields are documented in
  * `docs/INDEXER_AND_WEBHOOKS.md`.
+ *
+ * Corrupt feeSnapshot validation (#625): validates the snapshot against the
+ * schema and logs errors if corrupt, returning null instead of propagating
+ * garbage.
  */
 export function buildSettlementWebhookData(
   s: SettlementWebhookSource,
 ): Record<string, unknown> {
-  const feeSnapshot = (s.feeSnapshot ?? null) as FeeAuditSnapshot | null;
+  let feeSnapshot: FeeAuditSnapshot | null = null;
+
+  // Validate feeSnapshot if present (#625)
+  if (s.feeSnapshot) {
+    const validationResult = feeSnapshotSchema.safeParse(s.feeSnapshot);
+    if (validationResult.success) {
+      feeSnapshot = validationResult.data as FeeAuditSnapshot;
+    } else {
+      logger.error(
+        {
+          settlementId: s.id,
+          merchantId: s.merchantId,
+          corruptSnapshot: s.feeSnapshot,
+          validationError: validationResult.error.message,
+        },
+        "Corrupt feeSnapshot detected in settlement, returning null",
+      );
+    }
+  }
+
   return {
     id: s.id,
     merchantId: s.merchantId,
