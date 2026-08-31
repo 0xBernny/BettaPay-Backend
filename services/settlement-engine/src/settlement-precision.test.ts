@@ -12,7 +12,7 @@
  */
 
 import test from 'tape';
-import { computeSettlementAmounts } from './settlement-amounts.js';
+import { computeSettlementAmounts, FEE_VERSION } from './settlement-amounts.js';
 
 // ─── Basic happy-path ────────────────────────────────────────────────────────
 
@@ -154,7 +154,7 @@ test('feeSnapshot: populated with correct fee parameters', (t) => {
   t.equal(feeSnapshot.maxFeeBpsApplied, 150, 'maxFeeBpsApplied matches input');
   t.equal(feeSnapshot.discountApplied, 0, 'discountApplied defaults to 0');
   t.equal(feeSnapshot.monthlyVolumeAtTime, 0, 'monthlyVolumeAtTime defaults to 0 when not supplied');
-  t.equal(feeSnapshot.feeVersion, '1.0', 'feeVersion is set');
+  t.equal(feeSnapshot.feeVersion, FEE_VERSION, 'feeVersion is set');
   t.end();
 });
 

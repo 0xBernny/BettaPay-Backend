@@ -1,6 +1,6 @@
 import test from 'tape';
 import { buildSettlementWebhookData } from './webhook-payload.js';
-import { computeSettlementAmounts } from './settlement-amounts.js';
+import { computeSettlementAmounts, FEE_VERSION } from './settlement-amounts.js';
 
 // Issue #538 — settlement webhook payloads must carry the fee breakdown so a
 // merchant can verify fee computation from the webhook alone.
@@ -35,8 +35,8 @@ test('payload includes the full feeSnapshot and a top-level feeVersion', (t) => 
   const snap = data.feeSnapshot as Record<string, unknown>;
   t.equal(typeof snap.feeBpsApplied, 'number', 'feeSnapshot.feeBpsApplied');
   t.equal(snap.discountApplied, 10, 'feeSnapshot.discountApplied reflects the volume discount');
-  t.equal(snap.feeVersion, '1.0', 'feeSnapshot.feeVersion');
-  t.equal(data.feeVersion, '1.0', 'top-level feeVersion mirrors the snapshot');
+  t.equal(snap.feeVersion, FEE_VERSION, 'feeSnapshot.feeVersion');
+  t.equal(data.feeVersion, FEE_VERSION, 'top-level feeVersion mirrors the snapshot');
   t.end();
 });
 
@@ -77,6 +77,6 @@ test('settlement.failed payloads carry the same fee fields', (t) => {
   const data = buildSettlementWebhookData(completedRow({ status: 'failed', completedAt: new Date() }));
   t.equal(data.status, 'failed');
   t.ok(data.feeSnapshot, 'feeSnapshot still present on failure');
-  t.equal(data.feeVersion, '1.0');
+  t.equal(data.feeVersion, FEE_VERSION);
   t.end();
 });
