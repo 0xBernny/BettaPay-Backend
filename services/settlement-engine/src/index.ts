@@ -43,6 +43,8 @@ import {
   getActiveCount,
 } from './redis-semaphore.js';
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
+import { validateTimeoutConstants } from './timeout-constants.js';
+import { startSettlementReaper } from './settlement-reaper.js';
 import {
   validateEnvOrExit,
   CreateSettlementBody,
@@ -80,6 +82,9 @@ const env = validateEnvOrExit(process.env);
 const PORT = Number(process.env.PORT ?? '3001');
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
+
+// Validate timeout constants (#495)
+validateTimeoutConstants();
 
 const pool = new pg.Pool({
   connectionString: buildPrismaConnectionUrl(env.DATABASE_URL, env.DATABASE_POOL_SIZE, env.DATABASE_POOL_TIMEOUT),
@@ -167,7 +172,16 @@ const redis = createRedisClient(env.REDIS_URL, fastify.log, {
   healthState: redisHealthState,
 });
 
+// Placeholder for settlement reaper stop function (defined later)
+let stopReaper = () => {};
+
 fastify.addHook('onClose', async () => {
+  // Stop settlement reaper before closing
+  try {
+    stopReaper();
+  } catch (err) {
+    fastify.log.error({ err }, 'Error stopping settlement reaper');
+  }
   await redis.quit().catch(() => {});
 });
 
@@ -466,6 +480,9 @@ const worker = new Worker(
 );
 
 const getActiveSettlementJob = trackActiveJob(worker);
+
+// Start settlement reaper (#496) to recover stuck processing settlements
+stopReaper = startSettlementReaper(prisma, settlementQueue, fastify.log, 10_000);
 
 worker.on('failed', async (job, err) => {
   if (job) {
