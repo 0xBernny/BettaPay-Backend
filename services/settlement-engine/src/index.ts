@@ -1493,11 +1493,10 @@ const batchWorker = new Worker(
             data: { status: 'processing' },
           });
 
-          // Update settlements with batchId and mark completed
-          await prisma.settlement.updateMany({
-            where: { id: { in: settlements.map((s) => s.id) } },
-            data: { batchId: batch.id, status: 'completed' },
-          });
+        if (chunk.length === 0) {
+          hasMore = false;
+          break;
+        }
 
           fastify.log.info(
             { traceId, batchId: batch.id, asset, count: totalCount, trigger: meetsCount ? 'count' : 'volume' },
@@ -1511,6 +1510,9 @@ const batchWorker = new Worker(
             'Skipping batch (below min count and volume threshold)',
           );
         }
+
+        offset += chunk.length;
+        if (chunk.length < CHUNK_SIZE) hasMore = false;
       }
 
       // Emit late-batch metric if we missed the interval
