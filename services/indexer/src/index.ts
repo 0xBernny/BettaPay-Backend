@@ -62,6 +62,8 @@ import {
   fxExecutedEvent,
   billPaidEvent,
   anchorSettledEvent,
+  isFeatureEnabled,
+  logFeatureFlags,
 } from "@bettapay/validation";
 import { buildPaginationMeta } from "@bettapay/shared-types";
 import type { EventType, CleanupDryRunResult } from "@bettapay/validation";
@@ -795,6 +797,12 @@ export async function persistEvent(
     now - cacheState.subscriptions.cachedAt < 30000
   ) {
     fastify.log.debug("[Indexer] Webhook subscriptions cache hit");
+    // #511 — renew TTL on read for hot entries so frequently-used subscription
+    // lists never expire under load. Gated behind a feature flag so the old
+    // fixed-30 s behaviour can be restored without a code change.
+    if (isFeatureEnabled('webhook_cache_ttl_refresh')) {
+      cacheState.subscriptions.cachedAt = now;
+    }
   } else {
     fastify.log.debug(
       "[Indexer] Webhook subscriptions cache miss, fetching from DB",
@@ -1670,6 +1678,10 @@ export async function discoverStartLedger(): Promise<number> {
 const start = async () => {
   try {
     // #391 — wait for both dependencies before accepting traffic
+    // #519 — log active feature flags at startup so the deployed flag set is
+    // always visible in the service logs.
+    logFeatureFlags(fastify.log);
+
     await connectWithRetry(prisma, fastify.log);
     await waitForRedis(redisHealth, fastify.log);
 
