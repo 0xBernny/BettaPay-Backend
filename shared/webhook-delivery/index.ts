@@ -9,6 +9,7 @@
  * that blocked the BullMQ worker thread during back-off sleeps and offered
  * no persistence, no dead-letter handling, and no observability.  This
  * package replaces both implementations with a single, queue-backed approach.
+ * Provides fail-closed deduplication, dead-letter archiving, and delivery reliability.
  *
  * Design
  * ──────
