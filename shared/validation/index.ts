@@ -356,6 +356,11 @@ export const EnvSchema = z.object({
   // Indexer — Poll cycle timeout (ms). When a cycle exceeds this, it is aborted.
   POLL_TIMEOUT_MS: z.string().transform((s) => parseInt(s, 10)).default('30000'),
 
+  // Indexer — Per-ledger processing timeout (ms). Wraps each server.getEvents()
+  // call so a single stuck ledger (Horizon/RPC hang) cannot block the poll loop
+  // indefinitely. Default: 15 s.
+  PER_LEDGER_TIMEOUT_MS: z.string().transform((s) => parseInt(s, 10)).default('15000'),
+
   // Indexer — Event retention policy
   EVENT_RETENTION_DAYS: z
     .string()
