@@ -1,5 +1,5 @@
 /**
- * Server-side wallet auth challenge store (Issue #554).
+ * Server-side wallet auth challenge store (Issue #554 & #605).
  *
  * Challenges used to live in a per-process `Map`. Nothing ever evicted an
  * entry that was never verified, the store was invisible to every other
@@ -18,18 +18,31 @@
  *     key that outlives its deadline (clock skew, a TTL that has not been
  *     reaped yet, a restored snapshot) is still rejected rather than
  *     accepted.
+ *
+ * Issue #605: Two parallel implementations existed (wallet-challenge-store.ts
+ * and wallet-auth-challenge.ts) with conflicting TTL values (5 min vs 2 min)
+ * and different schema (presence/absence of nonce and address fields).
+ * This consolidated version uses 2 minutes TTL and includes both nonce and
+ * address in the stored record for audit trail and signature verification.
  */
 
 import crypto from "crypto";
 
 /** How long an issued challenge stays valid. */
-export const WALLET_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+export const WALLET_CHALLENGE_TTL_MS = 2 * 60 * 1000;
 
 export const WALLET_CHALLENGE_KEY_PREFIX = "wallet_challenge:";
 
 export interface StoredWalletChallenge {
+  /** The exact string the wallet is expected to sign. */
   challenge: string;
+  /** Raw nonce embedded in challenge for traceability. */
+  nonce: string;
+  /** Address the challenge was issued to — the binding. */
+  address: string;
+  /** Epoch ms when issued. */
   issuedAt: number;
+  /** Epoch ms when the challenge stops being valid. */
   expiresAt: number;
 }
 
@@ -48,7 +61,7 @@ export interface WalletChallengeRedis {
     mode: "PX",
     ttlMs: number,
   ): Promise<unknown>;
-  getdel(key: string): Promise<string | null>;
+  eval(script: string, numKeys: number, ...args: Array<string>): Promise<any>;
   del(key: string): Promise<unknown>;
 }
 
@@ -61,6 +74,20 @@ export interface WalletChallengeStoreOptions {
 export function walletChallengeKey(address: string): string {
   return `${WALLET_CHALLENGE_KEY_PREFIX}${address}`;
 }
+
+/**
+ * Lua script for atomic consume (GET + DEL in one operation).
+ * Ensures a challenge can only be used once, even under concurrent verify requests.
+ */
+const CONSUME_CHALLENGE_SCRIPT = `
+  if redis.call("exists", KEYS[1]) == 1 then
+    local v = redis.call("GET", KEYS[1])
+    redis.call("DEL", KEYS[1])
+    return v
+  else
+    return nil
+  end
+`;
 
 export class WalletChallengeStore {
   private readonly redis: WalletChallengeRedis;
@@ -83,9 +110,12 @@ export class WalletChallengeStore {
    * unclaimed challenge is reaped rather than accumulating forever.
    */
   async issue(address: string): Promise<StoredWalletChallenge> {
+    const nonce = crypto.randomBytes(16).toString("hex");
     const issuedAt = this.now();
     const record: StoredWalletChallenge = {
-      challenge: crypto.randomBytes(32).toString("hex"),
+      challenge: `${nonce}:${crypto.randomBytes(16).toString("hex")}`,
+      nonce,
+      address,
       issuedAt,
       expiresAt: issuedAt + this.ttlMs,
     };
@@ -109,7 +139,9 @@ export class WalletChallengeStore {
    */
   async consume(address: string): Promise<ConsumeChallengeResult> {
     const key = walletChallengeKey(address);
-    const raw = await this.redis.getdel(key);
+    const raw = (await this.redis.eval(CONSUME_CHALLENGE_SCRIPT, 1, key)) as
+      | string
+      | null;
     if (!raw) return { status: "not_found" };
 
     let record: StoredWalletChallenge;
@@ -122,6 +154,7 @@ export class WalletChallengeStore {
 
     if (
       typeof record?.challenge !== "string" ||
+      typeof record?.address !== "string" ||
       typeof record?.expiresAt !== "number"
     ) {
       return { status: "not_found" };
@@ -139,3 +172,4 @@ export class WalletChallengeStore {
     await this.redis.del(walletChallengeKey(address));
   }
 }
+

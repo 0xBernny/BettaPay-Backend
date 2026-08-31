@@ -158,6 +158,60 @@ function getOrComputeRate(from: string, to: string): number {
   return resolvePairRate(from, to).rate;
 }
 
+/**
+ * Apply the deviation guard to fetched rates.
+ * 
+ * Validates that each fetched rate does not deviate more than maxDeviationBps
+ * from the current cached rate. Rates that exceed the deviation threshold are
+ * rejected and old rates are preserved.
+ * 
+ * @param fetched Record of newly fetched rates
+ * @param baseRates Current cached rates to compare against
+ * @param maxDeviationBps Maximum allowed deviation in basis points
+ * @returns Object containing merged rates, newly fetched list, and rejected list
+ */
+function applyDeviationGuard(
+  fetched: Record<string, number>,
+  baseRates: Record<string, number>,
+  maxDeviationBps: number,
+): {
+  merged: Record<string, number>;
+  newlyFetched: string[];
+  rejected: string[];
+} {
+  const merged: Record<string, number> = { ...baseRates };
+  const newlyFetched: string[] = [];
+  const rejected: string[] = [];
+
+  for (const [asset, newRate] of Object.entries(fetched)) {
+    const oldRate = baseRates[asset];
+    
+    // New asset or first fetch — accept without deviation check
+    if (oldRate === undefined || oldRate <= 0) {
+      merged[asset] = newRate;
+      newlyFetched.push(asset);
+      continue;
+    }
+
+    // Calculate deviation in basis points (bps)
+    const deviationBps = (Math.abs(newRate - oldRate) / oldRate) * 10000;
+
+    // Reject if deviation exceeds threshold
+    if (deviationBps > maxDeviationBps) {
+      rejected.push(
+        `${asset}: ${oldRate} → ${newRate} (${deviationBps.toFixed(0)} bps > ${maxDeviationBps} max)`,
+      );
+      continue;
+    }
+
+    // Accept the new rate
+    merged[asset] = newRate;
+    newlyFetched.push(asset);
+  }
+
+  return { merged, newlyFetched, rejected };
+}
+
 // ── Rate history snapshots (issue #56) ───────────────────────────────────
 // Snapshots are stored in a Redis Sorted Set (score = Unix ms timestamp).
 // ZREVRANGEBYSCORE lets us find the closest snapshot at or before any point
@@ -460,27 +514,11 @@ async function refreshTick(): Promise<void> {
         if (fetched) {
           const batchId = randomUUID();
           const maxDeviationBps = env.MAX_DEVIATION_BPS;
-          const merged: Record<string, number> = { ...cache.rates };
-          const rejected: string[] = [];
-          const newlyFetched: string[] = [];
-          for (const [asset, newRate] of Object.entries(fetched)) {
-            const oldRate = cache.rates[asset];
-            if (oldRate === undefined || oldRate === 0) {
-              merged[asset] = newRate;
-              newlyFetched.push(asset);
-              continue;
-            }
-            const deviationBps =
-              (Math.abs(newRate - oldRate) / oldRate) * 10000;
-            if (deviationBps > maxDeviationBps) {
-              rejected.push(
-                `${asset}: ${oldRate} → ${newRate} (${deviationBps.toFixed(0)} bps > ${maxDeviationBps} max)`,
-              );
-              continue;
-            }
-            merged[asset] = newRate;
-            newlyFetched.push(asset);
-          }
+          const { merged, newlyFetched, rejected } = applyDeviationGuard(
+            fetched,
+            cache.rates,
+            maxDeviationBps,
+          );
           if (rejected.length > 0) {
             fastify.log.warn(
               { rejected, maxDeviationBps },
@@ -537,27 +575,11 @@ async function refreshTick(): Promise<void> {
     if (fetched) {
       const batchId = randomUUID();
       const maxDeviationBps = env.MAX_DEVIATION_BPS;
-      const merged: Record<string, number> = { ...cache.rates };
-      const rejected: string[] = [];
-      const newlyFetched: string[] = [];
-      for (const [asset, newRate] of Object.entries(fetched)) {
-        const oldRate = cache.rates[asset];
-        if (oldRate === undefined || oldRate === 0) {
-          merged[asset] = newRate;
-          newlyFetched.push(asset);
-          continue;
-        }
-        const deviationBps =
-          (Math.abs(newRate - oldRate) / oldRate) * 10000;
-        if (deviationBps > maxDeviationBps) {
-          rejected.push(
-            `${asset}: ${oldRate} → ${newRate} (${deviationBps.toFixed(0)} bps > ${maxDeviationBps} max)`,
-          );
-          continue;
-        }
-        merged[asset] = newRate;
-        newlyFetched.push(asset);
-      }
+      const { merged, newlyFetched, rejected } = applyDeviationGuard(
+        fetched,
+        cache.rates,
+        maxDeviationBps,
+      );
       if (rejected.length > 0) {
         fastify.log.warn(
           { rejected, maxDeviationBps },
