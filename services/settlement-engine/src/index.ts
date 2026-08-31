@@ -1315,79 +1315,83 @@ const batchWorker = new Worker(
     fastify.log.info({ traceId }, 'Starting settlement batching job');
 
     try {
-      // Fetch all pending settlements
-      const pendingSettlements = await prisma.settlement.findMany({
-        where: { status: 'pending' },
-      });
+      // Fetch pending settlements in bounded chunks (#564)
+      const CHUNK_SIZE = 500;
+      let totalBatched = 0;
+      let offset = 0;
+      let hasMore = true;
 
-      if (pendingSettlements.length === 0) {
-        fastify.log.info({ traceId }, 'No pending settlements to batch');
-        return { batched: 0 };
-      }
+      while (hasMore) {
+        const chunk = await prisma.settlement.findMany({
+          where: { status: 'pending' },
+          take: CHUNK_SIZE,
+          skip: offset,
+          orderBy: { id: 'asc' },
+        });
 
-      // Group by asset
-      const grouped = pendingSettlements.reduce((acc, s) => {
-        if (!acc[s.asset]) acc[s.asset] = [];
-        acc[s.asset].push(s);
-        return acc;
-      }, {} as Record<string, typeof pendingSettlements>);
-
-      let batchedCount = 0;
-
-      // Create batches for assets with >= BATCH_MIN_COUNT
-      for (const [asset, settlements] of Object.entries(grouped)) {
-        if (settlements.length >= env.BATCH_MIN_COUNT) {
-          const totalGross = settlements.reduce(
-            (sum, s) => sum.plus(s.grossAmount),
-            new BigNumber(0)
-          ).toString();
-          const totalFees = settlements.reduce(
-            (sum, s) => sum.plus(s.feeAmount),
-            new BigNumber(0)
-          ).toString();
-          const totalNet = settlements.reduce(
-            (sum, s) => sum.plus(s.netAmount),
-            new BigNumber(0)
-          ).toString();
-
-          const batch = await prisma.settlementBatch.create({
-            data: {
-              asset,
-              totalCount: settlements.length,
-              totalGross,
-              totalFees,
-              totalNet,
-            },
-          });
-
-          // Update settlements to processing first
-          await prisma.settlement.updateMany({
-            where: { id: { in: settlements.map((s) => s.id) } },
-            data: { status: 'processing' },
-          });
-
-          // Update settlements with batchId and mark completed
-          await prisma.settlement.updateMany({
-            where: { id: { in: settlements.map((s) => s.id) } },
-            data: { batchId: batch.id, status: 'completed' },
-          });
-
-          fastify.log.info(
-            { traceId, batchId: batch.id, asset, count: settlements.length },
-            'Created settlement batch'
-          );
-
-          batchedCount += settlements.length;
-        } else {
-          fastify.log.info(
-            { traceId, asset, count: settlements.length },
-            'Skipping batch (below min count)'
-          );
+        if (chunk.length === 0) {
+          hasMore = false;
+          break;
         }
+
+        // Group by asset
+        const grouped = chunk.reduce((acc, s) => {
+          if (!acc[s.asset]) acc[s.asset] = [];
+          acc[s.asset].push(s);
+          return acc;
+        }, {} as Record<string, typeof chunk>);
+
+        // Create batches for assets with >= BATCH_MIN_COUNT
+        for (const [asset, settlements] of Object.entries(grouped)) {
+          if (settlements.length >= env.BATCH_MIN_COUNT) {
+            const totalGross = settlements.reduce(
+              (sum, s) => sum.plus(s.grossAmount),
+              new BigNumber(0)
+            ).toString();
+            const totalFees = settlements.reduce(
+              (sum, s) => sum.plus(s.feeAmount),
+              new BigNumber(0)
+            ).toString();
+            const totalNet = settlements.reduce(
+              (sum, s) => sum.plus(s.netAmount),
+              new BigNumber(0)
+            ).toString();
+
+            const batch = await prisma.settlementBatch.create({
+              data: {
+                asset,
+                totalCount: settlements.length,
+                totalGross,
+                totalFees,
+                totalNet,
+              },
+            });
+
+            await prisma.settlement.updateMany({
+              where: { id: { in: settlements.map((s) => s.id) } },
+              data: { status: 'processing' },
+            });
+
+            await prisma.settlement.updateMany({
+              where: { id: { in: settlements.map((s) => s.id) } },
+              data: { batchId: batch.id, status: 'completed' },
+            });
+
+            fastify.log.info(
+              { traceId, batchId: batch.id, asset, count: settlements.length },
+              'Created settlement batch'
+            );
+
+            totalBatched += settlements.length;
+          }
+        }
+
+        offset += chunk.length;
+        if (chunk.length < CHUNK_SIZE) hasMore = false;
       }
 
-      fastify.log.info({ traceId, batchedCount }, 'Settlement batching job completed');
-      return { batched: batchedCount };
+      fastify.log.info({ traceId, batchedCount: totalBatched }, 'Settlement batching job completed');
+      return { batched: totalBatched };
     } catch (error) {
       fastify.log.error({ traceId, error }, 'Settlement batching job failed');
       throw error;
