@@ -28,6 +28,7 @@ import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import pg from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { z } from "zod";
+import { encryptField, decryptField } from "@bettapay/shared-validation";
 import {
   validateEnvOrExit,
   registerErrorHandler,
@@ -166,7 +167,7 @@ const MAX_BACKOFF = env.MAX_BACKOFF_INTERVAL_MS;
 let currentBackoff: number = BASE_BACKOFF;
 
 // ── Shared Redis client ──────────────────────────────────────────────────────
-const redisHealthState: import('@bettapay/validation').RedisHealthState = {
+const redisHealthState: import("@bettapay/validation").RedisHealthState = {
   connected: false,
   errors: 0,
   reconnects: 0,
@@ -176,7 +177,7 @@ const sharedRedis = createRedisClient(env.REDIS_URL, fastify.log, {
   shared: true,
   healthState: redisHealthState,
 });
-fastify.addHook('onClose', async () => {
+fastify.addHook("onClose", async () => {
   await sharedRedis.quit().catch(() => {});
 });
 
@@ -247,16 +248,15 @@ export function calculateBackoffAfterError(err: unknown): number {
   return currentBackoff;
 }
 
-
 // ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
 // (Resolved previous merge conflict markers here)
 //
 // Queue name kept as 'indexer-webhooks' so any jobs already in Redis from the
 // previous inline implementation are picked up without data loss (migration
 // safety — see shared/webhook-delivery/index.ts for details).
-export const webhookQueue = createWebhookQueue('indexer-webhooks', sharedRedis);
+export const webhookQueue = createWebhookQueue("indexer-webhooks", sharedRedis);
 // Ensure only one webhook worker is created to prevent duplicate deliveries
-const webhookWorker = createWebhookWorker('indexer-webhooks', sharedRedis, {
+const webhookWorker = createWebhookWorker("indexer-webhooks", sharedRedis, {
   logger: {
     info: (obj, msg) => fastify.log.info(obj, msg),
     warn: (obj, msg) => fastify.log.warn(obj, msg),
@@ -321,7 +321,7 @@ webhookQueue.on("error", (err) => {
 
 // ── Replay queue & worker ─────────────────────────────────────────────────────
 
-const replayQueue = new Queue('indexer-replays', {
+const replayQueue = new Queue("indexer-replays", {
   connection: sharedRedis,
   defaultJobOptions: {
     attempts: 2,
@@ -340,7 +340,7 @@ replayProgressRedis.on("error", (err) =>
   ),
 );
 
-const PROGRESS_KEY_PREFIX = 'replay:progress:';
+const PROGRESS_KEY_PREFIX = "replay:progress:";
 
 async function updateReplayProgress(
   jobId: string,
@@ -448,7 +448,7 @@ const replayWorker = new Worker(
 
           for (const evt of response.events) {
             if (evt.ledger > toLedger) continue;
-            
+
             if (currentLedger !== -1 && currentLedger !== evt.ledger) {
               processedLedgers.add(currentLedger);
             }
@@ -684,13 +684,46 @@ export const cacheState: {
 export async function dispatchPendingWebhookDeliveries(): Promise<void> {
   const store = (prisma as any).indexedEventWebhookDelivery;
   let pending: any[];
-  try { pending = await store.findMany({ where: { status: 'pending' }, orderBy: { createdAt: 'asc' }, take: 100 }); }
-  catch (err) { fastify.log.warn({ err: String(err) }, '[Indexer] Unable to load pending webhook deliveries'); return; }
+  try {
+    pending = await store.findMany({
+      where: { status: "pending" },
+      orderBy: { createdAt: "asc" },
+      take: 100,
+    });
+  } catch (err) {
+    fastify.log.warn(
+      { err: String(err) },
+      "[Indexer] Unable to load pending webhook deliveries",
+    );
+    return;
+  }
   for (const delivery of pending) {
     try {
-      await webhookQueue.add('deliver', { url: delivery.url, event: delivery.event, version: '1.0', signingSecret: delivery.signingSecret ?? undefined, headers: delivery.headers ?? undefined }, { jobId: `indexed-event-delivery-${delivery.id}` });
-      await store.update({ where: { id: delivery.id }, data: { status: 'processed', processedAt: new Date() } });
-    } catch (err) { fastify.log.warn({ deliveryId: delivery.id, err: String(err) }, '[Indexer] Webhook enqueue failed; delivery remains pending'); }
+      // Decrypt signingSecret on read (#617)
+      const decryptedSecret = delivery.signingSecret
+        ? decryptField(delivery.signingSecret)
+        : undefined;
+      await webhookQueue.add(
+        "deliver",
+        {
+          url: delivery.url,
+          event: delivery.event,
+          version: "1.0",
+          signingSecret: decryptedSecret,
+          headers: delivery.headers ?? undefined,
+        },
+        { jobId: `indexed-event-delivery-${delivery.id}` },
+      );
+      await store.update({
+        where: { id: delivery.id },
+        data: { status: "processed", processedAt: new Date() },
+      });
+    } catch (err) {
+      fastify.log.warn(
+        { deliveryId: delivery.id, err: String(err) },
+        "[Indexer] Webhook enqueue failed; delivery remains pending",
+      );
+    }
   }
 }
 
@@ -756,7 +789,22 @@ export async function persistEvent(
   }
 
   const subs = cacheState.subscriptions.data;
-  if (subs.length) await (prisma as any).indexedEventWebhookDelivery.createMany({ data: subs.map((sub) => ({ id: `whd_${crypto.randomUUID().replace(/-/g, '')}`, indexedEventId: id, subscriptionId: sub.id, url: sub.url, event: record, signingSecret: sub.signingSecret ?? undefined, headers: (sub.headers as Record<string, string> | null) ?? undefined })), skipDuplicates: true });
+  if (subs.length)
+    await (prisma as any).indexedEventWebhookDelivery.createMany({
+      data: subs.map((sub) => ({
+        id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
+        indexedEventId: id,
+        subscriptionId: sub.id,
+        url: sub.url,
+        event: record,
+        // Encrypt signingSecret on write (#617)
+        signingSecret: sub.signingSecret
+          ? encryptField(sub.signingSecret)
+          : undefined,
+        headers: (sub.headers as Record<string, string> | null) ?? undefined,
+      })),
+      skipDuplicates: true,
+    });
   await dispatchPendingWebhookDeliveries();
 
   return record as Record<string, unknown>;
@@ -1008,7 +1056,11 @@ fastify.post(
     const { url, headers } = WebhookBody.parse(request.body);
     const sub = await prisma.$transaction(async (tx) => {
       const created = await tx.webhookSubscription.create({
-        data: { id: "wh_" + crypto.randomUUID().replace(/-/g, ""), url, headers: headers ?? undefined },
+        data: {
+          id: "wh_" + crypto.randomUUID().replace(/-/g, ""),
+          url,
+          headers: headers ?? undefined,
+        },
       });
       await logAuditEvent(
         "webhook.registered",
@@ -1078,37 +1130,47 @@ fastify.post<{ Params: { id: string } }>(
 
     if (!existing) {
       return reply.code(404).send({
-        error: { code: "NOT_FOUND", message: `Webhook subscription ${id} not found` },
+        error: {
+          code: "NOT_FOUND",
+          message: `Webhook subscription ${id} not found`,
+        },
       });
     }
 
     const payload = {
-      type: 'test',
+      type: "test",
       timestamp: new Date().toISOString(),
       subscriptionId: id,
       test: true,
     };
 
-    const job = await webhookQueue.add("deliver", {
-      url: existing.url,
-      event: payload,
-      version: "1.0",
-      signingSecret: existing.signingSecret ?? undefined,
-      headers: (existing.headers as Record<string, string> | null) ?? undefined,
-    }, { attempts: 1 });
+    const job = await webhookQueue.add(
+      "deliver",
+      {
+        url: existing.url,
+        event: payload,
+        version: "1.0",
+        signingSecret: existing.signingSecret ?? undefined,
+        headers:
+          (existing.headers as Record<string, string> | null) ?? undefined,
+      },
+      { attempts: 1 },
+    );
 
-    const queueEvents = new QueueEvents("indexer-webhooks", { connection: sharedRedis });
+    const queueEvents = new QueueEvents("indexer-webhooks", {
+      connection: sharedRedis,
+    });
     try {
       await job.waitUntilFinished(queueEvents);
-      
+
       const testedAt = new Date();
       await prisma.webhookSubscription.update({
         where: { id },
         data: {
           lastTestedAt: testedAt,
-          lastTestStatus: 'success',
+          lastTestStatus: "success",
           lastTestStatusCode: 200,
-        }
+        },
       });
       return { success: true, statusCode: 200 };
     } catch (err: any) {
@@ -1118,8 +1180,8 @@ fastify.post<{ Params: { id: string } }>(
       if (match) {
         statusCode = parseInt(match[1], 10);
         errorMsg = `HTTP ${statusCode}`;
-      } else if (errorMsg.includes('connect ECONNREFUSED')) {
-        errorMsg = 'connect ECONNREFUSED';
+      } else if (errorMsg.includes("connect ECONNREFUSED")) {
+        errorMsg = "connect ECONNREFUSED";
       }
 
       const testedAt = new Date();
@@ -1127,18 +1189,18 @@ fastify.post<{ Params: { id: string } }>(
         where: { id },
         data: {
           lastTestedAt: testedAt,
-          lastTestStatus: 'failed',
+          lastTestStatus: "failed",
           lastTestStatusCode: statusCode,
-        }
+        },
       });
-      
+
       const response: any = { success: false, error: errorMsg };
       if (statusCode) response.statusCode = statusCode;
       return response;
     } finally {
       await queueEvents.close();
     }
-  }
+  },
 );
 
 // ── Admin: dead-letter queue (#354) ──────────────────────────────────────────
@@ -1408,10 +1470,10 @@ export async function cleanupOldEvents(
   }
 
   // Issue 507: Skip cleanup for entries with active webhook jobs
-  const jobs = await webhookQueue.getJobs(['active', 'waiting', 'delayed']);
+  const jobs = await webhookQueue.getJobs(["active", "waiting", "delayed"]);
   const activeEventIds = jobs
     .map((j) => (j.data as any)?.event?.id)
-    .filter((id) => typeof id === 'string');
+    .filter((id) => typeof id === "string");
 
   if (activeEventIds.length > 0) {
     (where as any).id = { notIn: activeEventIds };

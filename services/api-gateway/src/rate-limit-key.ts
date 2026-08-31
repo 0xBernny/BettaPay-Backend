@@ -36,6 +36,38 @@ export interface RateLimitIdentity {
 }
 
 /**
+ * Normalize an IP address for rate limiting (#619).
+ *
+ * - Strips IPv6-mapped IPv4 prefix (::ffff:) so 1.2.3.4 and ::ffff:1.2.3.4 map to the same key
+ * - Converts to lowercase for consistent comparison
+ * - Removes zone IDs (e.g., %lo0, %eth0) that pollute the key
+ *
+ * @param ip - Raw IP address from request
+ * @returns Normalized IP address
+ *
+ * @example
+ *   normalizeIp('::ffff:192.168.1.1') // '192.168.1.1'
+ *   normalizeIp('2001:DB8::1%lo0')   // '2001:db8::1'
+ *   normalizeIp('192.168.1.1')       // '192.168.1.1'
+ */
+export function normalizeIp(ip: string): string {
+  let normalized = ip.trim().toLowerCase();
+
+  // Strip IPv6-mapped IPv4 prefix
+  if (normalized.startsWith("::ffff:")) {
+    normalized = normalized.slice(7);
+  }
+
+  // Remove zone ID (e.g., %lo0, %eth0)
+  const zoneIndex = normalized.indexOf("%");
+  if (zoneIndex !== -1) {
+    normalized = normalized.slice(0, zoneIndex);
+  }
+
+  return normalized;
+}
+
+/**
  * Client address as seen through a proxy.
  *
  * Mirrors the gateway's existing auth-reputation IP extraction so a client
@@ -49,9 +81,9 @@ export function resolveClientIp(
   const value = Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor;
   if (value) {
     const first = value.split(",")[0].trim();
-    if (first) return first;
+    if (first) return normalizeIp(first);
   }
-  return socketIp;
+  return normalizeIp(socketIp);
 }
 
 /**
