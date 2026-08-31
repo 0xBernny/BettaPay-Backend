@@ -194,6 +194,25 @@ export function createServiceAuth(
     throw new Error('createServiceAuth: a non-empty INTER_SERVICE_SECRET is required');
   }
 
+  // Compile-time dev-only guard (#548): the bypass flag must never be active
+  // in production. If NODE_ENV is production and the secret looks like a
+  // default/placeholder, throw immediately at startup so the misconfiguration
+  // is caught before any request is served.
+  if (process.env.NODE_ENV === 'production') {
+    const lower = secret.toLowerCase();
+    if (
+      lower.includes('dev-') ||
+      lower.includes('test') ||
+      lower.includes('change-me') ||
+      lower === 'inter-service-secret-value'
+    ) {
+      throw new Error(
+        'createServiceAuth: INTER_SERVICE_SECRET appears to be a development/test value. ' +
+        'Set a strong secret before deploying to production.',
+      );
+    }
+  }
+
   return async function serviceAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
     const header = request.headers['x-service-token'];
     const token = Array.isArray(header) ? header[0] : header;
