@@ -660,7 +660,20 @@ interface ReconcileQuery {
   merchantId?: string;
   from?: string;
   to?: string;
+  detail?: string;
 }
+
+const RECONCILE_DIFF_CAP = 100;
+
+const COMPARE_FIELDS = [
+  'status',
+  'grossAmount',
+  'feeAmount',
+  'netAmount',
+  'asset',
+  'feeBps',
+  'merchantId',
+] as const;
 
 /**
  * Local Consistency Check for Settlements
@@ -671,12 +684,14 @@ interface ReconcileQuery {
  * - Fee calculation accuracy: feeAmount matches feeBps applied to grossAmount
  * - Merchant reference validity: all settlements reference existing merchants
  *
- * This is a LOCAL consistency check - it does not make external HTTP calls.
- * All validation is performed against the settlement engine's own database.
+ * When `detail=true`, also performs a pairwise comparison of settlement IDs
+ * between local (engine) and gateway records, returning per-field mismatches.
+ * Capped at 100 diffs; a `truncated` flag indicates if more exist.
  */
 fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async (request, reply) => {
   try {
     const { merchantId, from, to } = request.query;
+    const detailMode = request.query.detail === 'true';
 
     const where: Record<string, unknown> = {};
     if (merchantId) {
@@ -740,10 +755,16 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       gatewayMap.set(r.id, r);
     }
 
-    const matchedIds = new Set<string>();
     const missing: any[] = []; // In gateway, but missing in local
     const extra: any[] = [];   // In local, but missing in gateway
-    const mismatched: any[] = []; // In both, but fields differ
+
+    // Per-record diff details (only populated when detail=true)
+    const diffs: Array<{
+      id: string;
+      field: string;
+      gatewayValue: unknown;
+      engineValue: unknown;
+    }> = [];
 
     let localGrossTotal = new BigNumber(0);
     let localFeeTotal = new BigNumber(0);
@@ -778,6 +799,25 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
 
     const merchants = await prisma.merchant.findMany({ select: { id: true } });
     const existingMerchantIds = new Set(merchants.map(m => m.id));
+
+    // Accumulate gateway totals for the summary
+    for (const gr of gatewayRecords) {
+      gatewayGrossTotal = gatewayGrossTotal.plus(parseBN(gr.grossAmount));
+      gatewayFeeTotal = gatewayFeeTotal.plus(parseBN(gr.feeAmount));
+      gatewayNetTotal = gatewayNetTotal.plus(parseBN(gr.netAmount));
+    }
+
+    // Identify missing (in gateway, not in local) and extra (in local, not in gateway)
+    for (const [id] of gatewayMap) {
+      if (!localMap.has(id)) {
+        missing.push({ id, source: 'gateway' });
+      }
+    }
+    for (const [id] of localMap) {
+      if (!gatewayMap.has(id)) {
+        extra.push({ id, source: 'engine' });
+      }
+    }
 
     for (const settlement of settlements) {
       const gross = parseBN(settlement.grossAmount);
@@ -839,11 +879,56 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       validCount++;
     }
 
+    // ── Pairwise field-level diff (detail mode) ──────────────────────────────
+    let truncated = false;
+
+    if (detailMode) {
+      for (const [id, localRecord] of localMap) {
+        const gwRecord = gatewayMap.get(id);
+        if (!gwRecord) continue; // missing-in-gateway already captured above
+
+        for (const field of COMPARE_FIELDS) {
+          const engineVal = String((localRecord as Record<string, unknown>)[field] ?? '');
+          const gwVal = String(gwRecord[field] ?? '');
+          if (engineVal !== gwVal) {
+            diffs.push({ id, field, gatewayValue: gwVal, engineValue: engineVal });
+          }
+        }
+
+        if (diffs.length >= RECONCILE_DIFF_CAP) {
+          truncated = true;
+          break;
+        }
+      }
+
+      // Also check gateway records not in local (missing = field diff with null engine side)
+      if (!truncated) {
+        for (const [id, gwRecord] of gatewayMap) {
+          if (localMap.has(id)) continue; // already compared above
+
+          for (const field of COMPARE_FIELDS) {
+            const gwVal = String(gwRecord[field] ?? '');
+            diffs.push({ id, field, gatewayValue: gwVal, engineValue: null });
+            if (diffs.length >= RECONCILE_DIFF_CAP) {
+              truncated = true;
+              break;
+            }
+          }
+          if (truncated) break;
+        }
+      }
+
+      // Cap at exactly the limit
+      diffs.length = Math.min(diffs.length, RECONCILE_DIFF_CAP);
+    }
+
     return {
       summary: {
         total: settlements.length,
         valid: validCount,
         inconsistent: inconsistencies.length,
+        missingInEngine: missing.length,
+        missingInGateway: extra.length,
       },
       statusBreakdown: statusCounts,
       totals: {
@@ -851,7 +936,13 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
         fee: totalFee.toString(),
         net: totalNet.toString(),
       },
+      gatewayTotals: {
+        gross: gatewayGrossTotal.toString(),
+        fee: gatewayFeeTotal.toString(),
+        net: gatewayNetTotal.toString(),
+      },
       inconsistencies,
+      ...(detailMode ? { diffs, truncated } : {}),
       reconciliationType: 'local_consistency_check',
     };
   } catch (error) {
@@ -1298,8 +1389,13 @@ fastify.get<{ Params: { batchId: string } }>(
 // ============================================================================
 
 // BullMQ repeatable job that runs every BATCH_INTERVAL_SECONDS to batch
-// pending settlements by asset. Only creates batches for assets with
-// >= BATCH_MIN_COUNT settlements.
+// pending settlements by asset.  Supports:
+//   - Catch-up: if a window was missed (e.g. worker was down), pending
+//     settlements from the missed window are batched on the next run.
+//   - Volume threshold: assets whose gross total exceeds
+//     BATCH_VOLUME_THRESHOLD are batched even when count < BATCH_MIN_COUNT.
+//   - Late-batch metric: a prom-client counter is incremented when the
+//     time since the last successful batch exceeds BATCH_INTERVAL_SECONDS.
 
 const batchQueue = new Queue('settlement-batching', {
   connection: redis,
@@ -1311,20 +1407,42 @@ const batchQueue = new Queue('settlement-batching', {
   },
 });
 
+// Track the last successful batch run for late-batch detection
+let lastBatchCompletedAt: number = Date.now();
+
+const lateBatchCounter = new promClient.Counter({
+  name: 'settlement_batch_late_total',
+  help: 'Total number of settlement batches that ran late (missed the expected interval)',
+  labelNames: ['asset'],
+});
+
 const batchWorker = new Worker(
   'settlement-batching',
   async (job) => {
     const traceId = job.data.traceId || crypto.randomUUID();
+    const batchStartTime = Date.now();
     fastify.log.info({ traceId }, 'Starting settlement batching job');
 
+    // Detect late batch (missed interval)
+    const elapsedMs = batchStartTime - lastBatchCompletedAt;
+    const expectedIntervalMs = env.BATCH_INTERVAL_SECONDS * 1000;
+    if (elapsedMs > expectedIntervalMs * 1.5) {
+      const missedIntervals = Math.floor(elapsedMs / expectedIntervalMs) - 1;
+      fastify.log.warn(
+        { traceId, elapsedMs, missedIntervals },
+        'Batching job running late — catching up missed windows',
+      );
+    }
+
     try {
-      // Fetch all pending settlements
+      // Fetch all pending settlements (catch-up: these may span missed windows)
       const pendingSettlements = await prisma.settlement.findMany({
         where: { status: 'pending' },
       });
 
       if (pendingSettlements.length === 0) {
         fastify.log.info({ traceId }, 'No pending settlements to batch');
+        lastBatchCompletedAt = batchStartTime;
         return { batched: 0 };
       }
 
@@ -1337,20 +1455,26 @@ const batchWorker = new Worker(
 
       let batchedCount = 0;
 
-      // Create batches for assets with >= BATCH_MIN_COUNT
+      // Create batches for assets meeting count or volume threshold
       for (const [asset, settlements] of Object.entries(grouped)) {
-        if (settlements.length >= env.BATCH_MIN_COUNT) {
-          const totalGross = settlements.reduce(
-            (sum, s) => sum.plus(s.grossAmount),
-            new BigNumber(0)
-          ).toString();
+        const totalCount = settlements.length;
+        const totalGrossBN = settlements.reduce(
+          (sum, s) => sum.plus(s.grossAmount),
+          new BigNumber(0),
+        );
+        const meetsCount = totalCount >= env.BATCH_MIN_COUNT;
+        const meetsVolume = env.BATCH_VOLUME_THRESHOLD > 0 &&
+          totalGrossBN.isGreaterThanOrEqualTo(env.BATCH_VOLUME_THRESHOLD);
+
+        if (meetsCount || meetsVolume) {
+          const totalGross = totalGrossBN.toString();
           const totalFees = settlements.reduce(
             (sum, s) => sum.plus(s.feeAmount),
-            new BigNumber(0)
+            new BigNumber(0),
           ).toString();
           const totalNet = settlements.reduce(
             (sum, s) => sum.plus(s.netAmount),
-            new BigNumber(0)
+            new BigNumber(0),
           ).toString();
 
           const batch = await prisma.settlementBatch.create({
@@ -1376,19 +1500,27 @@ const batchWorker = new Worker(
           });
 
           fastify.log.info(
-            { traceId, batchId: batch.id, asset, count: settlements.length },
-            'Created settlement batch'
+            { traceId, batchId: batch.id, asset, count: totalCount, trigger: meetsCount ? 'count' : 'volume' },
+            'Created settlement batch',
           );
 
-          batchedCount += settlements.length;
+          batchedCount += totalCount;
         } else {
           fastify.log.info(
-            { traceId, asset, count: settlements.length },
-            'Skipping batch (below min count)'
+            { traceId, asset, count: totalCount, grossTotal: totalGrossBN.toString() },
+            'Skipping batch (below min count and volume threshold)',
           );
         }
       }
 
+      // Emit late-batch metric if we missed the interval
+      if (elapsedMs > expectedIntervalMs * 1.5) {
+        for (const asset of Object.keys(grouped)) {
+          lateBatchCounter.inc({ asset });
+        }
+      }
+
+      lastBatchCompletedAt = batchStartTime;
       fastify.log.info({ traceId, batchedCount }, 'Settlement batching job completed');
       return { batched: batchedCount };
     } catch (error) {
