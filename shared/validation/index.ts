@@ -20,6 +20,7 @@ export * from './redis.js';
 export * from './metrics-server.js';
 export * from './feature-flags.js';
 export * from './startup-checks.js';
+export * from './encryption.js';
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {
