@@ -19,11 +19,15 @@
  * effective fee is clamped to [0, feeBps] so it can never go negative.
  */
 
-import BigNumber from 'bignumber.js';
-import type { Amount } from '@bettapay/shared-types';
+import BigNumber from "bignumber.js";
+import type { Amount } from "@bettapay/shared-types";
+import { feeSnapshotSchema } from "@bettapay/shared-validation";
 
 // Always round DOWN (conservative/banker-safe), never use scientific notation
-BigNumber.config({ ROUNDING_MODE: BigNumber.ROUND_DOWN, EXPONENTIAL_AT: [-20, 40] });
+BigNumber.config({
+  ROUNDING_MODE: BigNumber.ROUND_DOWN,
+  EXPONENTIAL_AT: [-20, 40],
+});
 
 /** Maximum allowed settlement amount (10^15). */
 export const MAX_SETTLEMENT_AMOUNT = "1000000000000000";
@@ -32,7 +36,7 @@ export const MAX_SETTLEMENT_AMOUNT = "1000000000000000";
 export class SettlementAmountError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = 'SettlementAmountError';
+    this.name = "SettlementAmountError";
   }
 }
 
@@ -142,14 +146,17 @@ export function computeSettlementAmounts(
   }
 
   // Resolve volume-based discount and clamp to [0, feeBps]
-  const discountBps = Math.min(resolveVolumeDiscount(monthlyVolume, discountTiers), feeBps);
+  const discountBps = Math.min(
+    resolveVolumeDiscount(monthlyVolume, discountTiers),
+    feeBps,
+  );
   const effectiveFeeBps = Math.max(0, feeBps - discountBps);
 
   // fee = gross × effectiveFeeBps / 10 000   (rounded DOWN to preserve net accuracy)
   const fee = gross.multipliedBy(effectiveFeeBps).dividedBy(10_000);
 
   // Preserve the same decimal places as the original input string.
-  const inputDecimals = (grossAmountStr.split('.')[1] ?? '').length;
+  const inputDecimals = (grossAmountStr.split(".")[1] ?? "").length;
   const feeStr = fee.toFixed(inputDecimals, BigNumber.ROUND_DOWN);
   const netStr = gross.minus(feeStr).toFixed(inputDecimals);
 
@@ -158,11 +165,19 @@ export function computeSettlementAmounts(
     maxFeeBpsApplied: feeBps,
     discountApplied: discountBps,
     monthlyVolumeAtTime: monthlyVolume,
-    feeVersion: '1.0',
+    feeVersion: "1.0",
   };
 
+  // Validate fee snapshot against schema (#625)
+  const validationResult = feeSnapshotSchema.safeParse(feeSnapshot);
+  if (!validationResult.success) {
+    throw new SettlementAmountError(
+      `Invalid fee snapshot: ${validationResult.error.message}`,
+    );
+  }
+
   return {
-    grossAmount: grossAmountStr,   // exact original — zero rounding
+    grossAmount: grossAmountStr, // exact original — zero rounding
     feeAmount: feeStr,
     netAmount: netStr,
     feeSnapshot,
@@ -181,7 +196,7 @@ export function computeSettlementAmounts(
 export function resolveFeeBpsForAsset(
   asset: string,
   feeSchedules: FeeScheduleItem[] | undefined,
-  defaultBps: number
+  defaultBps: number,
 ): number {
   if (!feeSchedules || feeSchedules.length === 0) {
     return defaultBps;
@@ -204,7 +219,7 @@ export function computeSettlementAmountsWithSchedule(
   grossAmountStr: Amount,
   asset: string,
   feeSchedules: FeeScheduleItem[] | undefined,
-  defaultBps: number
+  defaultBps: number,
 ): SettlementAmounts {
   const feeBps = resolveFeeBpsForAsset(asset, feeSchedules, defaultBps);
   return computeSettlementAmounts(grossAmountStr, feeBps);
