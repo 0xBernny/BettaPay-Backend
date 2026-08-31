@@ -132,21 +132,30 @@ export const EnvSchema = z.object({
     .optional()
     .transform((s): Array<{ volumeUsd: number; discountBps: number }> => {
       if (!s) return [];
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(s);
-        if (!Array.isArray(parsed)) return [];
-        return parsed.filter(
-          (t): t is { volumeUsd: number; discountBps: number } =>
-            typeof t === "object" &&
-            t !== null &&
-            typeof t.volumeUsd === "number" &&
-            typeof t.discountBps === "number" &&
-            t.volumeUsd >= 0 &&
-            t.discountBps >= 0,
-        );
+        parsed = JSON.parse(s);
       } catch {
-        return [];
+        throw new Error(`contains invalid JSON: ${s}`);
       }
+      if (!Array.isArray(parsed)) {
+        throw new Error(`must be a JSON array, got ${typeof parsed}`);
+      }
+      const invalid = parsed.find(
+        (t) =>
+          typeof t !== "object" ||
+          t === null ||
+          typeof t.volumeUsd !== "number" ||
+          typeof t.discountBps !== "number" ||
+          t.volumeUsd < 0 ||
+          t.discountBps < 0,
+      );
+      if (invalid) {
+        throw new Error(
+          `contains invalid tier: ${JSON.stringify(invalid)}. Each tier must have volumeUsd (>= 0) and discountBps (>= 0).`,
+        );
+      }
+      return parsed as Array<{ volumeUsd: number; discountBps: number }>;
     })
     .pipe(
       z.array(
