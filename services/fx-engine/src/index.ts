@@ -1712,6 +1712,17 @@ const start = async () => {
     // First refresh before we start serving: if it succeeds, cache is
     // updated; if it fails, we keep the FALLBACK_RATES seed.
     await refreshTick();
+
+    // Verify minimum fill ratio on startup (#499)
+    const validRateCount = Object.values(cache.rates).filter(
+      (r) => typeof r === "number" && Number.isFinite(r) && r > 0,
+    ).length;
+    if (validRateCount === 0) {
+      throw new Error(
+        "[FX] Fatal: Startup cache warmup failed — all rate sources unavailable and rate cache is empty. Refusing to serve empty rates.",
+      );
+    }
+
     startRefreshLoop();
 
     // #387 — Redis memory monitoring: update prom gauges every 30 s
