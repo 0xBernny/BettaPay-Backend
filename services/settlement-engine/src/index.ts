@@ -68,6 +68,8 @@ import {
   runStartupChecks,
   startPrismaPoolMetricsCollector,
   WebhookHeadersSchema,
+  SETTLEMENT_STATUS_TRANSITIONS,
+  isValidTransition,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
@@ -87,16 +89,17 @@ const pool = new pg.Pool({
 const adapter = new PrismaPg(pool);
 const prismaBase = new PrismaClient({ adapter, log: getPrismaLogLevels() });
 
-export const SettlementStatusTransitions: Record<string, string[]> = {
-  pending: ['processing', 'failed'],
-  processing: ['completed', 'failed'],
-  completed: [],
-  failed: [],
-};
+// The settlement status state machine lives in @bettapay/validation
+// (SETTLEMENT_STATUS_TRANSITIONS) and is the single source of truth shared by
+// the api-gateway and this service, so a status added in one place can never
+// drift out of sync with the other (#473). Re-exported under the historical
+// name for existing importers.
+export const SettlementStatusTransitions: Record<string, readonly string[]> =
+  SETTLEMENT_STATUS_TRANSITIONS;
 
 export function validateTransition(current: string, next: string) {
   if (current === next) return;
-  if (!SettlementStatusTransitions[current]?.includes(next)) {
+  if (!isValidTransition(SETTLEMENT_STATUS_TRANSITIONS, current, next)) {
     throw new Error(`Invalid status transition from ${current} to ${next}`);
   }
 }
