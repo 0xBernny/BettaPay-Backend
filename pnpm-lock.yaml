@@ -75,6 +75,9 @@ importers:
       '@bettapay/validation':
         specifier: workspace:*
         version: link:../../shared/validation
+      '@bettapay/webhook-delivery':
+        specifier: workspace:*
+        version: link:../../shared/webhook-delivery
       '@fastify/helmet':
         specifier: ^12.0.0
         version: 12.0.1
@@ -90,6 +93,9 @@ importers:
       '@stellar/stellar-sdk':
         specifier: ^16.0.1
         version: 16.0.1
+      bullmq:
+        specifier: ^5.79.1
+        version: 5.80.10
       google-auth-library:
         specifier: ^10.9.0
         version: 10.9.0
@@ -136,6 +142,9 @@ importers:
       '@fastify/rate-limit':
         specifier: ^10.0.0
         version: 10.3.0
+      bullmq:
+        specifier: ^5.79.1
+        version: 5.80.10
       ioredis:
         specifier: ^5.11.1
         version: 5.11.1
@@ -167,6 +176,9 @@ importers:
 
   services/indexer:
     dependencies:
+      '@bettapay/shared-types':
+        specifier: workspace:^
+        version: link:../../shared/types
       '@bettapay/validation':
         specifier: workspace:*
         version: link:../../shared/validation
@@ -312,9 +324,19 @@ importers:
       '@bettapay/stellar-utils':
         specifier: workspace:^
         version: link:../stellar-utils
+      '@prisma/extension-read-replicas':
+        specifier: ^0.5.0
+        version: 0.5.0(@prisma/client@7.9.0(prisma@7.9.0(@types/react@19.2.17)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.9.3))(typescript@5.9.3))
+      ioredis:
+        specifier: ^5.11.1
+        version: 5.11.1
       zod:
         specifier: ^3.22.4
         version: 3.25.76
+    devDependencies:
+      fast-check:
+        specifier: ^4.9.0
+        version: 4.9.0
 
   shared/webhook-delivery:
     dependencies:
@@ -519,6 +541,11 @@ packages:
 
   '@prisma/engines@7.9.0':
     resolution: {integrity: sha512-lDWJp/pgSWCLfYsupmmNo96jfsbQnH1yjia8XVM2Kh8nRZhD0bQU2jCHuy3ZTPMLR3apRD3k145ybENalAYjYw==}
+
+  '@prisma/extension-read-replicas@0.5.0':
+    resolution: {integrity: sha512-t0kLjqFMte4wwGrZFhya4iFoyoOY4kjlyyE60WXZL66PqP6PcBpW/35eKb/3UcxgjJxcDlaJKfmGokFLOyafiQ==}
+    peerDependencies:
+      '@prisma/client': ^7.0.0
 
   '@prisma/fetch-engine@7.9.0':
     resolution: {integrity: sha512-F0XlIgjbE3EywRVR/HpCerNI/dxo40vK66tHcWpsWYwH/Jk9+FsICEzATeMsZ7bdnpZz93hkD4sAb5rKLsCCpA==}
@@ -828,8 +855,11 @@ packages:
     resolution: {integrity: sha512-NZKeq9AfyQvEeNlN0zSYAaWrmBffJh3IELMZfRpJVWgrpEbtEpnjvzqBPf+mxoI287JohRDoa+/nsfqqiZmF6g==}
     engines: {node: '>= 6.0.0'}
 
-  axios@1.18.1:
-    resolution: {integrity: sha512-3nTvFlvpn9Zu/RkHUqtc7/+al4UpRW5az71ap5zccp6e8RAYEzhMTecX8Dz1wWDYrPpUoB1HAQEGEAEvUr7S9g==}
+  axios@1.15.0:
+    resolution: {integrity: sha512-wWyJDlAatxk30ZJer+GeCWS209sA42X+N5jU2jy6oHTp7ufw8uzUTVFBX9+wTfAlhiJXGS0Bq7X6efruWjuK9Q==}
+
+  axios@1.16.1:
+    resolution: {integrity: sha512-caYkukvroVPO8KrzuJEb50Hm07KwfBZPEC3VeFHTsqWHvKTsy54hjJz9BS/cdaypROE2rH6xvm9mHX4fgWkr3A==}
 
   balanced-match@1.0.2:
     resolution: {integrity: sha512-3oSeUO0TMV67hN1AmbXsK4yaqU7tjiHlbxRDZOpH0KW9+CeX4bRAaX0Anxt0tx2MrpRpWwQaPwIlISEJhYU5Pw==}
@@ -929,6 +959,7 @@ packages:
   cron-parser@4.9.0:
     resolution: {integrity: sha512-p0SaNjrHOnQeR8/VnfGbmg9te2kfyYSQ7Sc/j/6DtPL3JQvKxmjO9TSjNFpujqV3vEYYBvNNvXSxzyksBWAx1Q==}
     engines: {node: '>=12.0.0'}
+    deprecated: v4 is no longer maintained, upgrade to v5
 
   cross-env@7.0.3:
     resolution: {integrity: sha512-+/HKd6EgcQCJGh2PSjZuUitQBQynKor4wrFbRg4DtAgS1aWO+gU52xpH7M9ScGgXSYmAVS9bIJ8EzuaGw0oNAw==}
@@ -1760,6 +1791,7 @@ packages:
   prom-client@15.1.3:
     resolution: {integrity: sha512-6ZiOBfCywsD4k1BN9IX0uZhF+tJkV8q8llP64G5Hajs4JOeVLPCwpPVcpXy3BwYiUGgyJzsJJQeOIv7+hDSq8g==}
     engines: {node: ^16 || ^18 || >=20}
+    deprecated: prom-client has been replaced by @prometheus-io/client
 
   proper-lockfile@4.1.2:
     resolution: {integrity: sha512-TjNPblN4BwAWMXU8s9AEz4JmQxnD1NNL7bNOY/AKUzyamc379FWASUhc/K1pL2noVb+XmZKLL68cjzLsiOAMaA==}
@@ -2325,6 +2357,10 @@ snapshots:
       '@prisma/fetch-engine': 7.9.0
       '@prisma/get-platform': 7.9.0
 
+  '@prisma/extension-read-replicas@0.5.0(@prisma/client@7.9.0(prisma@7.9.0(@types/react@19.2.17)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.9.3))(typescript@5.9.3))':
+    dependencies:
+      '@prisma/client': 7.9.0(prisma@7.9.0(@types/react@19.2.17)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.9.3))(typescript@5.9.3)
+
   '@prisma/fetch-engine@7.9.0':
     dependencies:
       '@prisma/debug': 7.9.0
@@ -2450,7 +2486,7 @@ snapshots:
   '@stellar/stellar-sdk@15.1.0':
     dependencies:
       '@stellar/stellar-base': 15.0.0
-      axios: 1.18.1
+      axios: 1.15.0
       bignumber.js: 9.3.1
       commander: 14.0.3
       eventsource: 2.0.2
@@ -2460,14 +2496,13 @@ snapshots:
       urijs: 1.19.11
     transitivePeerDependencies:
       - debug
-      - supports-color
 
   '@stellar/stellar-sdk@16.0.1':
     dependencies:
       '@noble/ed25519': 3.1.0
       '@noble/hashes': 2.2.0
       '@stellar/js-xdr': 4.0.0
-      axios: 1.18.1
+      axios: 1.16.1
       base32.js: 0.1.0
       bignumber.js: 11.1.5
       buffer: 6.0.3
@@ -2708,7 +2743,15 @@ snapshots:
 
   aws-ssl-profiles@1.1.2: {}
 
-  axios@1.18.1:
+  axios@1.15.0:
+    dependencies:
+      follow-redirects: 1.16.0
+      form-data: 4.0.6
+      proxy-from-env: 2.1.0
+    transitivePeerDependencies:
+      - debug
+
+  axios@1.16.1:
     dependencies:
       follow-redirects: 1.16.0
       form-data: 4.0.6

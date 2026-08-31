@@ -61,20 +61,61 @@ export function classifyError(error: unknown, statusCode?: number): ErrorClass {
   return 'fatal';
 }
 
+export const PII_FIELD_PATTERNS = [/email/i, /address/i, /secret/i, /key/i, /token/i];
+
+export function isPiiField(path: (string | number)[]): boolean {
+  return path.some((segment) =>
+    typeof segment === 'string' && PII_FIELD_PATTERNS.some((re) => re.test(segment))
+  );
+}
+
+export function redactPiiFromDetails(details: unknown): unknown {
+  if (!Array.isArray(details)) return details;
+  return details.map((item: Record<string, unknown>) => {
+    const path: (string | number)[] = Array.isArray(item.path)
+      ? (item.path as (string | number)[])
+      : typeof item.instancePath === 'string'
+        ? item.instancePath.split('/').filter(Boolean)
+        : [];
+    if (isPiiField(path)) {
+      return { ...item, message: '[REDACTED]', received: undefined, data: undefined, value: undefined, params: undefined };
+    }
+    return item;
+  });
+}
+
+const LEAK_PATTERNS = [
+  /node_modules[/\\]/g,
+  /\/[a-zA-Z0-9_/.-]+\.(ts|js|json)/g,
+  /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|ECONNRESET/gi,
+  /postgres(ql)?(ql)?|mysql|redis|mongodb/gi,
+  /at\s+\S+\s+\([^)]*\)/g,
+  /\/home\/|\/usr\/|\/var\/|\/etc\//g,
+  /password|secret|token|credential/gi,
+];
+
+export function sanitizeErrorMessage(message: string): string {
+  let sanitized = message;
+  for (const pattern of LEAK_PATTERNS) {
+    sanitized = sanitized.replace(pattern, '[FILTERED]');
+  }
+  return sanitized;
+}
+
 export function registerErrorHandler(fastify: FastifyInstance, customLogger?: FastifyBaseLogger) {
   fastify.setErrorHandler((error, request, reply) => {
     const logger = customLogger || request.log || fastify.log;
 
     if (error instanceof z.ZodError) {
-      const response = createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid request data', error.errors);
+      const response = createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid request data', redactPiiFromDetails(error.errors));
       return reply.code(400).send(response);
     }
 
     if ((error as FastifyError).statusCode) {
-      const fastifyErr = error as FastifyError;
-      // Use the attached status code. Preserve the safe message.
+      const fastifyErr = error as FastifyError & { validation?: unknown };
       const code = fastifyErr.code || ErrorCodes.INVALID_REQUEST;
-      const response = createErrorResponse(code, fastifyErr.message);
+      const details = fastifyErr.validation ? redactPiiFromDetails(fastifyErr.validation) : undefined;
+      const response = createErrorResponse(code, sanitizeErrorMessage(fastifyErr.message), details);
       return reply.code(fastifyErr.statusCode!).send(response);
     }
 
@@ -153,13 +194,32 @@ export function createServiceAuth(
     throw new Error('createServiceAuth: a non-empty INTER_SERVICE_SECRET is required');
   }
 
+  // Compile-time dev-only guard (#548): the bypass flag must never be active
+  // in production. If NODE_ENV is production and the secret looks like a
+  // default/placeholder, throw immediately at startup so the misconfiguration
+  // is caught before any request is served.
+  if (process.env.NODE_ENV === 'production') {
+    const lower = secret.toLowerCase();
+    if (
+      lower.includes('dev-') ||
+      lower.includes('test') ||
+      lower.includes('change-me') ||
+      lower === 'inter-service-secret-value'
+    ) {
+      throw new Error(
+        'createServiceAuth: INTER_SERVICE_SECRET appears to be a development/test value. ' +
+        'Set a strong secret before deploying to production.',
+      );
+    }
+  }
+
   return async function serviceAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
     const header = request.headers['x-service-token'];
     const token = Array.isArray(header) ? header[0] : header;
 
     if (!token || !timingSafeStrEqual(token, secret)) {
       request.log?.warn({ reqId: request.id }, 'serviceAuth: missing or invalid service token');
-      await reply
+      return reply
         .code(401)
         .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid or missing service token'));
     }

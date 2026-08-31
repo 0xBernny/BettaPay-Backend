@@ -1,41 +1,29 @@
-# fix: settlement batching and dynamic supported assets (#319, #320)
+# fix: enforce strong JWT_SECRET in production and prevent silent dev value fallback (#563)
 
-Closes #319, Closes #320
+Closes #563
 
 ## Summary
 
-- **#319** — Added `SupportedAsset` model with admin CRUD endpoints (`GET /api/assets`, `POST /admin/assets`, `PATCH /admin/assets/:code`, `DELETE /admin/assets/:code`). Settlement creation now validates assets against this table, returning 422 for unsupported/inactive assets. Initial seed includes USDC, EURT, and XLMS.
-- **#320** — Implemented settlement batching via BullMQ repeatable job. Job runs every `BATCH_INTERVAL_SECONDS` (default 300s), queries pending settlements, groups by asset, and creates `SettlementBatch` records for assets with ≥ `BATCH_MIN_COUNT` settlements (default 2). Individual settlements are linked via `batchId` and marked completed. Includes comprehensive tests.
+- **Production Startup Guard**: Modified the shared environment validation schema so that if the application starts up in a production environment (`NODE_ENV === "production"`), it refuses to boot and fails fast with a clear error message if `JWT_SECRET` is missing, set to a known development default, or is too weak.
+- **Development/Test Compatibility**: Maintained compatibility for development and test environments so they can still boot and run test suites using simple or default keys.
+- **JWT Strength Checks**: Implemented security requirements in production for `JWT_SECRET`:
+  - Must not be one of the known development secrets (e.g., `super-secret-development-key-please-change`, `change-me-to-a-long-random-secret-before-production`).
+  - Must not contain development placeholders (like `change-me`, `please-change`, or `development`).
+  - Must contain at least 8 unique characters (preventing simple repeated patterns like `a.repeat(32)`).
+  - Must contain a mix of uppercase letters, lowercase letters, and digits or special characters.
+- **Unit Tests**: Added 6 tests to `shared/validation/validateEnv.test.ts` to assert all validation rules across environments.
 
 ## Files changed
 
-**Schema & Migrations:**
-- `prisma/schema.prisma` — added `SupportedAsset` and `SettlementBatch` models
-- `prisma/migrations/20260728110538_add_supported_assets_and_batching/migration.sql` — migration with seed data
-
-**Backend Services:**
-- `services/settlement-engine/src/index.ts` — BullMQ repeatable batching job, graceful shutdown updates
-- `services/api-gateway/src/index.ts` — asset validation in settlement creation, new `/api/assets` and admin CRUD routes
-- `services/settlement-engine/src/settlement-batching.test.ts` — test suite for batching logic
-
 **Shared Libraries:**
-- `shared/validation/index.ts` — added `BATCH_INTERVAL_SECONDS` and `BATCH_MIN_COUNT` env vars
-- `shared/validation/schemas.ts` — added `SupportedAssetSchema`, `CreateSupportedAssetBody`, `UpdateSupportedAssetBody`
+- [index.ts](file:///c:/Users/SHATTER/.vscode/BettaPay-Backend/shared/validation/index.ts) — replaced `EnvSchema.refine` with `EnvSchema.superRefine` incorporating the production environment check, default block list, placeholder checks, and complexity strength validator.
+- [validateEnv.test.ts](file:///c:/Users/SHATTER/.vscode/BettaPay-Backend/shared/validation/validateEnv.test.ts) — added unit tests for production vs non-production validation behavior.
 
 ## Test Coverage
 
-**#319 - Supported Assets:**
-- ✅ GET /api/assets returns seeded assets
-- ✅ Settlement creation with unsupported asset returns 422
-- ✅ Admin can add/update/delete assets
-
-**#320 - Settlement Batching:**
-- ✅ 2 USDC + 1 EURT pending → USDC batch created, EURT stays pending
-- ✅ 1 pending settlement → no batch (below min count)
-- ✅ 0 pending settlements → no batches created
-
-## Deployment Notes
-
-- Run migration: `npx prisma migrate deploy`
-- Configure env vars: `BATCH_INTERVAL_SECONDS`, `BATCH_MIN_COUNT`
-- Initial assets seeded automatically (USDC, EURT, XLMS)
+- ✅ Validation allows defaults/simple keys in `development` and `test` environments
+- ✅ Validation fails in `production` for default/known development secrets
+- ✅ Validation fails in `production` for placeholder-containing secrets
+- ✅ Validation fails in `production` for secrets lacking 8 unique characters
+- ✅ Validation fails in `production` for secrets lacking lowercase/uppercase/digits/special characters mix
+- ✅ Validation succeeds in `production` for a strong, complex secret
