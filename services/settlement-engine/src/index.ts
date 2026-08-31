@@ -187,6 +187,25 @@ const settlementDelayCounter = new promClient.Counter({
   labelNames: ['merchant_id'],
 });
 
+// Reconciliation metrics (#490)
+const reconciliationRunCounter = new promClient.Counter({
+  name: 'settlement_reconciliation_runs_total',
+  help: 'Total number of reconciliation runs performed',
+  labelNames: ['merchant_id', 'status'],
+});
+
+const reconciliationDiscrepancyGauge = new promClient.Gauge({
+  name: 'settlement_reconciliation_discrepancies',
+  help: 'Current count of settlement discrepancies by type',
+  labelNames: ['merchant_id', 'discrepancy_type'],
+});
+
+const reconciliationAmountDiffGauge = new promClient.Gauge({
+  name: 'settlement_reconciliation_amount_diff',
+  help: 'Absolute difference in amounts between local and gateway',
+  labelNames: ['merchant_id', 'amount_type'],
+});
+
 // Served on its own port (see startMetricsServer below), not on the
 // application port — keeps the scrape endpoint unauthenticated without
 // exposing it alongside application traffic.
@@ -444,6 +463,8 @@ function signHS256(payload: object, secret: string): string {
 }
 
 fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async (request, reply) => {
+  const merchantIdLabel = request.query.merchantId || 'all';
+  
   try {
     const { merchantId, from, to } = request.query;
 
@@ -498,6 +519,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       gatewayRecords = data.data;
     } catch (error) {
       fastify.log.error({ error }, 'Failed to fetch settlements from API Gateway');
+      reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: 'upstream_error' });
       return reply.code(502).send({
         error: { code: 'UPSTREAM_ERROR', message: 'Failed to fetch settlement records from api-gateway', details: error instanceof Error ? error.message : String(error) }
       });
@@ -601,6 +623,45 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     }
 
     const matchedCount = matchedIds.size - mismatched.length;
+    const hasDiscrepancies = missing.length > 0 || extra.length > 0 || mismatched.length > 0;
+
+    // Emit metrics (#490)
+    reconciliationRunCounter.inc({ 
+      merchant_id: merchantIdLabel, 
+      status: hasDiscrepancies ? 'discrepancies_found' : 'clean' 
+    });
+
+    // Update discrepancy gauges
+    reconciliationDiscrepancyGauge.set({ merchant_id: merchantIdLabel, discrepancy_type: 'missing' }, missing.length);
+    reconciliationDiscrepancyGauge.set({ merchant_id: merchantIdLabel, discrepancy_type: 'extra' }, extra.length);
+    reconciliationDiscrepancyGauge.set({ merchant_id: merchantIdLabel, discrepancy_type: 'mismatched' }, mismatched.length);
+
+    // Calculate amount differences
+    const grossDiff = localGrossTotal.minus(gatewayGrossTotal).abs();
+    const feeDiff = localFeeTotal.minus(gatewayFeeTotal).abs();
+    const netDiff = localNetTotal.minus(gatewayNetTotal).abs();
+
+    reconciliationAmountDiffGauge.set({ merchant_id: merchantIdLabel, amount_type: 'gross' }, parseFloat(grossDiff.toString()));
+    reconciliationAmountDiffGauge.set({ merchant_id: merchantIdLabel, amount_type: 'fee' }, parseFloat(feeDiff.toString()));
+    reconciliationAmountDiffGauge.set({ merchant_id: merchantIdLabel, amount_type: 'net' }, parseFloat(netDiff.toString()));
+
+    // Log discrepancies for alerting
+    if (hasDiscrepancies) {
+      fastify.log.warn({
+        merchantId: merchantIdLabel,
+        missing: missing.length,
+        extra: extra.length,
+        mismatched: mismatched.length,
+        grossDiff: grossDiff.toString(),
+        feeDiff: feeDiff.toString(),
+        netDiff: netDiff.toString(),
+      }, 'Reconciliation discrepancies detected');
+    } else {
+      fastify.log.info({
+        merchantId: merchantIdLabel,
+        matched: matchedCount,
+      }, 'Reconciliation completed with no discrepancies');
+    }
 
     return {
       matched: matchedCount,
@@ -630,7 +691,200 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     };
   } catch (error) {
     fastify.log.error({ error }, 'Reconciliation error');
+    reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: 'error' });
     return reply.code(400).send({ error: 'Failed to perform reconciliation' });
+  }
+});
+
+// ── Reconciliation Report Endpoint (#490) ──────────────────────────────────────
+// Returns a summary of reconciliation status without full detail records.
+// Useful for monitoring dashboards and alerts.
+fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report', async (request, reply) => {
+  const merchantIdLabel = request.query.merchantId || 'all';
+  
+  try {
+    const { merchantId, from, to } = request.query;
+
+    const localWhere: any = {};
+    if (merchantId) {
+      localWhere.merchantId = merchantId;
+    }
+    if (from || to) {
+      localWhere.initiatedAt = {};
+      if (from) {
+        localWhere.initiatedAt.gte = new Date(from);
+      }
+      if (to) {
+        localWhere.initiatedAt.lte = new Date(to);
+      }
+    }
+
+    // 1. Query local settlements
+    const localRecords = await prisma.settlement.findMany({
+      where: localWhere,
+      select: {
+        id: true,
+        merchantId: true,
+        grossAmount: true,
+        totalAmount: true,
+        feeAmount: true,
+        netAmount: true,
+        feeBps: true,
+        asset: true,
+        status: true,
+      },
+    });
+
+    // 2. Fetch api-gateway records via HTTP call
+    const gatewayUrl = process.env.API_GATEWAY_URL || 'http://localhost:3000';
+    const url = new URL(`${gatewayUrl}/api/settlements`);
+    if (merchantId) url.searchParams.append('merchantId', merchantId);
+    if (from) url.searchParams.append('from', from);
+    if (to) url.searchParams.append('to', to);
+
+    const jwtPayload = {
+      sub: 'settlement-engine-reconciler',
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 60,
+    };
+    const token = signHS256(jwtPayload, env.JWT_SECRET);
+
+    let gatewayRecords: any[] = [];
+    try {
+      const response = await fetch(url.toString(), {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`API Gateway returned status ${response.status}`);
+      }
+
+      const data = await response.json() as { data: any[] };
+      gatewayRecords = data.data;
+    } catch (error) {
+      fastify.log.error({ error }, 'Failed to fetch settlements from API Gateway for report');
+      return reply.code(502).send({
+        error: { code: 'UPSTREAM_ERROR', message: 'Failed to fetch settlement records from api-gateway' }
+      });
+    }
+
+    // 3. Compute summary statistics
+    const localIds = new Set(localRecords.map(r => r.id));
+    const gatewayIds = new Set(gatewayRecords.map(r => r.id));
+
+    const missingCount = gatewayRecords.filter(r => !localIds.has(r.id)).length;
+    const extraCount = localRecords.filter(r => !gatewayIds.has(r.id)).length;
+
+    let mismatchedCount = 0;
+    const matchedIds = [...localIds].filter(id => gatewayIds.has(id));
+    
+    const localMap = new Map(localRecords.map(r => [r.id, r]));
+    const gatewayMap = new Map(gatewayRecords.map(r => [r.id, r]));
+
+    for (const id of matchedIds) {
+      const localRec = localMap.get(id)!;
+      const gatewayRec = gatewayMap.get(id);
+      
+      const fieldsToCompare = ['merchantId', 'totalAmount', 'grossAmount', 'feeAmount', 'netAmount', 'feeBps', 'asset', 'status'];
+      const hasDifference = fieldsToCompare.some(field => {
+        const localVal = String((localRec as any)[field] ?? '');
+        const gatewayVal = String(gatewayRec[field] ?? '');
+        return localVal !== gatewayVal;
+      });
+
+      if (hasDifference) {
+        mismatchedCount++;
+      }
+    }
+
+    const matchedCount = matchedIds.length - mismatchedCount;
+
+    // Calculate totals
+    const parseBN = (val: any) => {
+      const bn = new BigNumber(val ?? 0);
+      return bn.isFinite() ? bn : new BigNumber(0);
+    };
+
+    let localGrossTotal = new BigNumber(0);
+    let localFeeTotal = new BigNumber(0);
+    let localNetTotal = new BigNumber(0);
+
+    for (const r of localRecords) {
+      localGrossTotal = localGrossTotal.plus(parseBN(r.grossAmount || r.totalAmount));
+      localFeeTotal = localFeeTotal.plus(parseBN(r.feeAmount));
+      localNetTotal = localNetTotal.plus(parseBN(r.netAmount));
+    }
+
+    let gatewayGrossTotal = new BigNumber(0);
+    let gatewayFeeTotal = new BigNumber(0);
+    let gatewayNetTotal = new BigNumber(0);
+
+    for (const r of gatewayRecords) {
+      gatewayGrossTotal = gatewayGrossTotal.plus(parseBN(r.grossAmount || r.totalAmount));
+      gatewayFeeTotal = gatewayFeeTotal.plus(parseBN(r.feeAmount));
+      gatewayNetTotal = gatewayNetTotal.plus(parseBN(r.netAmount));
+    }
+
+    const grossDiff = localGrossTotal.minus(gatewayGrossTotal);
+    const feeDiff = localFeeTotal.minus(gatewayFeeTotal);
+    const netDiff = localNetTotal.minus(gatewayNetTotal);
+
+    const hasDiscrepancies = missingCount > 0 || extraCount > 0 || mismatchedCount > 0;
+    const hasAmountDifferences = !grossDiff.isZero() || !feeDiff.isZero() || !netDiff.isZero();
+
+    return {
+      timestamp: new Date().toISOString(),
+      merchantId: merchantId || null,
+      period: {
+        from: from || null,
+        to: to || null,
+      },
+      status: hasDiscrepancies ? 'discrepancies_found' : 'clean',
+      summary: {
+        totalLocal: localRecords.length,
+        totalGateway: gatewayRecords.length,
+        matched: matchedCount,
+        missing: missingCount,
+        extra: extraCount,
+        mismatched: mismatchedCount,
+      },
+      amounts: {
+        local: {
+          gross: localGrossTotal.toString(),
+          fee: localFeeTotal.toString(),
+          net: localNetTotal.toString(),
+        },
+        gateway: {
+          gross: gatewayGrossTotal.toString(),
+          fee: gatewayFeeTotal.toString(),
+          net: gatewayNetTotal.toString(),
+        },
+        differences: {
+          gross: grossDiff.toString(),
+          fee: feeDiff.toString(),
+          net: netDiff.toString(),
+        },
+      },
+      alerts: hasDiscrepancies || hasAmountDifferences ? [
+        ...(missingCount > 0 ? [`${missingCount} settlement(s) in gateway but missing in local database`] : []),
+        ...(extraCount > 0 ? [`${extraCount} settlement(s) in local database but missing in gateway`] : []),
+        ...(mismatchedCount > 0 ? [`${mismatchedCount} settlement(s) with field mismatches`] : []),
+        ...(!grossDiff.isZero() ? [`Gross amount difference: ${grossDiff.toString()}`] : []),
+        ...(!feeDiff.isZero() ? [`Fee amount difference: ${feeDiff.toString()}`] : []),
+        ...(!netDiff.isZero() ? [`Net amount difference: ${netDiff.toString()}`] : []),
+      ] : [],
+    };
+  } catch (error) {
+    fastify.log.error({ error }, 'Reconciliation report error');
+    return reply.code(500).send({ 
+      error: { 
+        code: 'RECONCILIATION_ERROR', 
+        message: 'Failed to generate reconciliation report' 
+      } 
+    });
   }
 });
 
