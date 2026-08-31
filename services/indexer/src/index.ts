@@ -165,6 +165,10 @@ const BASE_BACKOFF = 1000;
 const MAX_BACKOFF = env.MAX_BACKOFF_INTERVAL_MS;
 let currentBackoff: number = BASE_BACKOFF;
 
+// Per-ledger timeout retry state (#565)
+let consecutiveSkips = 0;
+const MAX_CONSECUTIVE_SKIPS = 5;
+
 // ── Shared Redis client ──────────────────────────────────────────────────────
 const redisHealthState: import('@bettapay/validation').RedisHealthState = {
   connected: false,
@@ -201,6 +205,17 @@ const indexerLastIndexedLedgerGauge = new promClient.Gauge({
 const indexerNetworkTipLedgerGauge = new promClient.Gauge({
   name: "indexer_network_tip_ledger",
   help: "Current network tip ledger sequence number",
+});
+
+// Per-ledger timeout metrics (#565)
+const indexerLedgerTimeoutsCounter = new promClient.Counter({
+  name: "indexer_ledger_timeouts_total",
+  help: "Total number of per-ledger timeouts (stuck ledgers skipped)",
+});
+
+const indexerLedgerSkipsCounter = new promClient.Counter({
+  name: "indexer_ledger_skips_total",
+  help: "Total number of ledger retries/skips due to stuck ledgers",
 });
 
 function parseRetryAfterMs(err: unknown): number | null {
@@ -1235,15 +1250,50 @@ async function pollEvents() {
       return;
     }
 
-    const response = await server.getEvents({
-      startLedger: latestLedgerCursor ?? 0,
-      filters: CONTRACT_IDS.map((contractId) => ({
-        type: "contract" as const,
-        contractIds: [contractId],
-        topics: [],
-      })),
-      limit: 100,
-    });
+    const perLedgerTimeoutMs = env.PER_LEDGER_TIMEOUT_MS;
+
+    // Wrap server.getEvents() with per-ledger timeout (#565)
+    let response: Awaited<ReturnType<typeof server.getEvents>>;
+    try {
+      response = await Promise.race([
+        server.getEvents({
+          startLedger: latestLedgerCursor ?? 0,
+          filters: CONTRACT_IDS.map((contractId) => ({
+            type: "contract" as const,
+            contractIds: [contractId],
+            topics: [],
+          })),
+          limit: 100,
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("PER_LEDGER_TIMEOUT")), perLedgerTimeoutMs),
+        ),
+      ]);
+      consecutiveSkips = 0;
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message === "PER_LEDGER_TIMEOUT") {
+        indexerLedgerTimeoutsCounter.inc();
+        consecutiveSkips++;
+        fastify.log.warn(
+          { consecutiveSkips, perLedgerTimeoutMs },
+          "[Indexer] Per-ledger timeout — skipping stuck ledger",
+        );
+        if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
+          currentBackoff = Math.min(currentBackoff * 2, MAX_BACKOFF);
+          indexerPollBackoffGauge.set(currentBackoff);
+          fastify.log.error(
+            { consecutiveSkips, backoff: currentBackoff },
+            "[Indexer] Too many consecutive timeouts — backing off",
+          );
+        }
+        indexerLedgerSkipsCounter.inc();
+        pollCyclesCounter.inc({ status: "timeout" });
+        pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
+        setTimeout(pollEvents, currentBackoff);
+        return;
+      }
+      throw err;
+    }
 
     const timeoutMs = env.POLL_TIMEOUT_MS;
 
