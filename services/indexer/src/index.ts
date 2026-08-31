@@ -17,7 +17,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import crypto from 'crypto';
 import { Queue, Worker } from 'bullmq';
-import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
+import { createWebhookQueue, createWebhookWorker, WEBHOOK_DEFAULTS } from '@bettapay/webhook-delivery';
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { PrismaClient, WebhookSubscription } from '@prisma/client';
 import { rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
@@ -48,6 +48,7 @@ import {
   startRedisMemoryMonitor,
   startMetricsServer,
 } from '@bettapay/validation';
+import { buildPaginationMeta } from '@bettapay/shared-types';
 import type { EventType } from '@bettapay/validation';
 import * as promClient from 'prom-client';
 
@@ -125,6 +126,36 @@ const webhookWorker = createWebhookWorker('indexer-webhooks', connectionParams, 
   },
 });
 const getActiveWebhookJob = trackActiveJob(webhookWorker);
+
+// ── Dead-letter queue (DLQ) for webhooks that exhaust all retries (#354) ─────
+const DLQ_QUEUE_NAME = 'indexer-webhooks-dlq';
+const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
+  connection: connectionParams,
+  defaultJobOptions: {
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 1000 },
+  },
+});
+
+webhookWorker.on('failed', async (job, err) => {
+  if (!job || job.attemptsMade < (job.opts.attempts ?? WEBHOOK_DEFAULTS.attempts)) return;
+  // All retries exhausted — move to DLQ
+  try {
+    await dlqQueue.add('failed-delivery', {
+      ...job.data,
+      failedAt: new Date().toISOString(),
+      error: err?.message ?? String(err),
+      attempts: job.attemptsMade,
+      originalJobId: job.id,
+    } as any);
+    fastify.log.warn(
+      { jobId: job.id, url: job.data.url },
+      '[Indexer] Webhook moved to dead-letter queue after all retries',
+    );
+  } catch (dlqErr) {
+    fastify.log.error({ err: dlqErr }, '[Indexer] Failed to enqueue job to DLQ');
+  }
+});
 
 // #386 — exponential backoff retry strategy
 const redisHealth = createRedisClient(env.REDIS_URL, fastify.log);
@@ -236,20 +267,31 @@ const replayWorker = new Worker(
               if (existing) continue;
             }
 
-            await prisma.indexedEvent.create({
-              data: {
-                id: 'evt_' + crypto.randomUUID().replace(/-/g, ''),
-                stellarId,
-                contractId: resolvedContractId,
-                contractName,
-                topics,
-                type: topics[0],
-                rawValue,
-                decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
-                ledger: evt.ledger,
-                indexedAt: new Date(),
-              },
-            });
+            try {
+              await prisma.indexedEvent.create({
+                data: {
+                  id: 'evt_' + crypto.randomUUID().replace(/-/g, ''),
+                  stellarId,
+                  contractId: resolvedContractId,
+                  contractName,
+                  topics,
+                  type: topics[0],
+                  rawValue,
+                  decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
+                  ledger: evt.ledger,
+                  indexedAt: new Date(),
+                },
+              });
+            } catch (err: any) {
+              if (err?.code === 'P2002') {
+                fastify.log.debug(
+                  { stellarId, contractId: resolvedContractId, ledger: evt.ledger },
+                  '[Indexer] Replay duplicate event — skipping (composite constraint)',
+                );
+                continue;
+              }
+              throw err;
+            }
 
             processedLedgers = Math.max(processedLedgers, evt.ledger - fromLedger + 1);
             await updateReplayProgress(job.id!, {
@@ -365,23 +407,35 @@ export async function persistEvent(
   rawValue: string,
   decodedPayload: unknown,
   ledger: number
-): Promise<Record<string, unknown>> {
+): Promise<Record<string, unknown> | null> {
   const id = 'evt_' + crypto.randomUUID().replace(/-/g, '');
 
-  const record = await prisma.indexedEvent.create({
-    data: {
-      id,
-      stellarId,
-      contractId,
-      contractName,
-      topics,
-      type,
-      rawValue,
-      decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
-      ledger,
-      indexedAt: new Date(),
-    },
-  });
+  let record: Record<string, unknown>;
+  try {
+    record = await prisma.indexedEvent.create({
+      data: {
+        id,
+        stellarId,
+        contractId,
+        contractName,
+        topics,
+        type,
+        rawValue,
+        decodedPayload: decodedPayload !== null ? (decodedPayload as any) : undefined,
+        ledger,
+        indexedAt: new Date(),
+      },
+    }) as Record<string, unknown>;
+  } catch (err: any) {
+    if (err?.code === 'P2002') {
+      fastify.log.debug(
+        { stellarId, contractId, ledger, type },
+        '[Indexer] Duplicate event — skipping (composite constraint)',
+      );
+      return null;
+    }
+    throw err;
+  }
 
   fastify.log.info({ id, type, contractName, ledger }, '[Indexer] Event indexed');
 
@@ -396,7 +450,11 @@ export async function persistEvent(
 
   const subs = cacheState.subscriptions.data;
   for (const sub of subs) {
-    await webhookQueue.add('deliver', { url: sub.url, event: record as Record<string, unknown> });
+    await webhookQueue.add('deliver', {
+      url: sub.url,
+      event: record as Record<string, unknown>,
+      signingSecret: sub.signingSecret ?? undefined,
+    });
   }
 
   return record as Record<string, unknown>;
@@ -422,10 +480,10 @@ fastify.get('/api/health', async (_request, reply) => {
   return reply.code(statusCode).send(health);
 });
 
-// Issue #67 — paginated events endpoint with { total, limit, offset, hasMore }
+// Issue #67 — paginated events endpoint using the shared PaginatedResponse envelope
 // Internal endpoint — requires a valid x-service-token (#117).
 fastify.get('/api/events', { preValidation: [fastify.serviceAuth] }, async (request) => {
-  const { limit, offset } = PaginationQuery.parse(request.query ?? {});
+  const { limit, page } = PaginationQuery.parse(request.query ?? {});
   const typeParam = (request.query as Record<string, unknown>)?.type as string | undefined;
 
   const where: Record<string, unknown> = {};
@@ -441,14 +499,13 @@ fastify.get('/api/events', { preValidation: [fastify.serviceAuth] }, async (requ
     prisma.indexedEvent.findMany({
       where,
       take: limit,
-      skip: offset,
+      skip: (page - 1) * limit,
       orderBy: { indexedAt: 'desc' },
     }),
     prisma.indexedEvent.count({ where }),
   ]);
 
-  const hasMore = offset + limit < total;
-  return { data: dbEvents, pagination: { total, limit, offset, hasMore }, latestLedgerCursor };
+  return { data: dbEvents, pagination: buildPaginationMeta(page, limit, total), latestLedgerCursor };
 });
 
 // Issue #68 — replay historical events for a ledger range (all contracts)
@@ -556,6 +613,58 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', { preValidation:
   return reply.code(204).send();
 });
 
+// ── Admin: dead-letter queue (#354) ──────────────────────────────────────────
+
+fastify.get('/api/admin/webhooks/dead-letter', { preValidation: [fastify.serviceAuth] }, async (request) => {
+  const { limit = 50, offset = 0 } = (request.query as Record<string, unknown>) as { limit?: number; offset?: number };
+  const safeLimit = Math.min(Number(limit) || 50, 200);
+  const safeOffset = Math.max(Number(offset) || 0, 0);
+
+  const jobs = await dlqQueue.getJobs(['failed'], safeOffset, safeOffset + safeLimit - 1);
+  const total = await dlqQueue.getJobCounts('failed');
+
+  return {
+    data: jobs.map((job) => ({
+      id: job.id,
+      url: job.data.url,
+      event: job.data.event,
+      failedAt: (job.data as any).failedAt,
+      error: (job.data as any).error,
+      attempts: (job.data as any).attempts,
+      originalJobId: (job.data as any).originalJobId,
+      timestamp: job.timestamp,
+    })),
+    pagination: { total: total.failed, limit: safeLimit, offset: safeOffset },
+  };
+});
+
+fastify.post<{ Params: { id: string } }>(
+  '/api/admin/webhooks/dead-letter/:id/replay',
+  { preValidation: [fastify.serviceAuth] },
+  async (request, reply) => {
+    const { id } = request.params;
+    const job = await dlqQueue.getJob(id);
+    if (!job) {
+      return reply.code(404).send({
+        error: { code: 'NOT_FOUND', message: `DLQ job ${id} not found` },
+      });
+    }
+
+    // Re-enqueue on the main webhook delivery queue
+    await webhookQueue.add('deliver', {
+      url: job.data.url,
+      event: job.data.event,
+      signingSecret: job.data.signingSecret,
+    });
+
+    // Remove from DLQ
+    await job.remove();
+
+    fastify.log.info({ jobId: id, url: job.data.url }, '[Indexer] DLQ job replayed');
+    return { status: 'requeued', jobId: id, url: job.data.url };
+  },
+);
+
 // ── Stellar RPC polling loop ──────────────────────────────────────────────────
 
 async function pollEvents() {
@@ -598,8 +707,8 @@ async function pollEvents() {
         const contractName = getContractName(resolvedContractId);
         const stellarId = typeof evt.id === 'string' ? evt.id : null;
 
-        await persistEvent(stellarId, topics, topics[0], resolvedContractId, contractName, rawValue, decodedPayload, evt.ledger);
-        if (latestLedgerCursor !== undefined) {
+        const result = await persistEvent(stellarId, topics, topics[0], resolvedContractId, contractName, rawValue, decodedPayload, evt.ledger);
+        if (latestLedgerCursor !== undefined && result !== null) {
           latestLedgerCursor = Math.max(latestLedgerCursor, evt.ledger + 1);
         }
       }
@@ -692,6 +801,60 @@ export function stopCleanupScheduler(): void {
 }
 // ── Startup ───────────────────────────────────────────────────────────────────
 
+/**
+ * Discovers the correct starting ledger for the polling loop (#352).
+ *
+ * Priority:
+ *   1. INDEX_FROM_LEDGER env var (manual override)
+ *   2. Latest indexed event ledger + 1 (resume where we left off)
+ *   3. Network tip - INITIAL_BACKFILL_LEDGERS (fresh deployment)
+ *   4. Ledger 1 (RPC failure fallback)
+ */
+export async function discoverStartLedger(): Promise<number> {
+  // 1. Manual override
+  if (env.INDEX_FROM_LEDGER) {
+    const manual = parseInt(env.INDEX_FROM_LEDGER, 10);
+    if (Number.isFinite(manual) && manual >= 1) {
+      fastify.log.info({ ledger: manual }, '[Indexer] Starting from manual INDEX_FROM_LEDGER');
+      return manual;
+    }
+    fastify.log.warn({ raw: env.INDEX_FROM_LEDGER }, '[Indexer] Invalid INDEX_FROM_LEDGER — ignoring');
+  }
+
+  // 2. Resume from latest indexed event
+  try {
+    const latest = await prisma.indexedEvent.findFirst({
+      orderBy: { ledger: 'desc' },
+      select: { ledger: true },
+    });
+    if (latest) {
+      const resumeFrom = latest.ledger + 1;
+      fastify.log.info({ ledger: resumeFrom, latestIndexed: latest.ledger }, '[Indexer] Resuming from latest indexed event');
+      return resumeFrom;
+    }
+  } catch (err) {
+    fastify.log.warn({ err: String(err) }, '[Indexer] Failed to query latest indexed event');
+  }
+
+  // 3. Fresh deployment — start from network tip minus backfill window
+  try {
+    const tip = await server.getLatestLedger();
+    const backfill = env.INITIAL_BACKFILL_LEDGERS;
+    const startLedger = Math.max(1, tip.sequence - backfill);
+    fastify.log.info(
+      { tip: tip.sequence, backfill, startLedger },
+      '[Indexer] Fresh deployment — starting from network tip minus backfill',
+    );
+    return startLedger;
+  } catch (err) {
+    fastify.log.warn({ err: String(err) }, '[Indexer] Failed to query Stellar RPC for tip — falling back to ledger 1');
+  }
+
+  // 4. Fallback
+  fastify.log.warn('[Indexer] No indexed events and RPC unavailable — starting from ledger 1');
+  return 1;
+}
+
 const start = async () => {
   try {
     // #391 — wait for both dependencies before accepting traffic
@@ -700,6 +863,9 @@ const start = async () => {
 
     // #387 — Redis memory monitoring
     startRedisMemoryMonitor(redisHealth, fastify.log);
+
+    // #352 — smart startup ledger discovery
+    latestLedgerCursor = await discoverStartLedger();
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
     fastify.log.info('[Indexer] Starting Stellar RPC polling loop...');
@@ -715,9 +881,10 @@ process.on('SIGTERM', async () => {
   await prisma.$disconnect();
   await replayQueue.close();
   await closeWorkerWithTimeout(replayWorker, 'indexer-replays', fastify.log, getActiveReplayJob);
-  await replayProgressRedis.quit().catch(() => {});
   await webhookQueue.close();
   await closeWorkerWithTimeout(webhookWorker, 'indexer-webhooks', fastify.log, getActiveWebhookJob);
+  await dlqQueue.close();
+  await replayProgressRedis.quit().catch(() => {});
   await fastify.close();
   await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
   process.exit(0);

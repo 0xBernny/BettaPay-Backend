@@ -62,6 +62,7 @@ import {
   runStartupChecks,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
+import { buildPaginationMeta } from '@bettapay/shared-types';
 
 
 
@@ -418,7 +419,7 @@ fastify.get('/api/health', async (_request, reply) => {
 });
 
 fastify.get('/api/settlements', async (request, reply): Promise<PaginatedResponse<SettlementRecord>> => {
-  const { limit, offset, status, from, to } = SettlementListQuery.parse(request.query ?? {});
+  const { limit, offset, status, from, to, includeDeleted } = SettlementListQuery.parse(request.query ?? {});
   const where: any = {};
   if (status) where.status = status;
   if (from || to) {
@@ -426,19 +427,130 @@ fastify.get('/api/settlements', async (request, reply): Promise<PaginatedRespons
     if (from) where.initiatedAt.gte = new Date(from);
     if (to) where.initiatedAt.lte = new Date(to);
   }
+  // Exclude superseded settlements by default (#322)
+  if (!includeDeleted) {
+    where.supersededById = null;
+  }
   const records = await prisma.settlement.findMany({
     where,
     take: limit,
-    skip: offset,
+    skip: (page - 1) * limit,
     orderBy: { initiatedAt: 'desc' },
   });
   const total = await prisma.settlement.count({ where });
-  const hasMore = offset + limit < total;
   return {
     data: records,
-    pagination: { total, limit, offset, hasMore }
+    pagination: buildPaginationMeta(page, limit, total)
   };
 });
+
+// ============================================================================
+// SETTLEMENT RETRY (#322)
+// ============================================================================
+
+fastify.post<{ Params: { id: string } }>(
+  '/api/settlements/:id/retry',
+  async (request, reply) => {
+    const { id } = request.params;
+
+    // Fetch the original settlement
+    const original = await prisma.settlement.findUnique({
+      where: { id },
+    });
+
+    if (!original) {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Settlement not found'));
+    }
+
+    // Only failed settlements can be retried
+    if (original.status !== 'failed') {
+      return reply.code(422).send(createErrorResponse(
+        ErrorCodes.VALIDATION_ERROR,
+        'Only failed settlements can be retried',
+        { currentStatus: original.status }
+      ));
+    }
+
+    // Count the retry chain to enforce max 3 retries
+    const retryChain = await prisma.settlement.findMany({
+      where: {
+        OR: [
+          { supersededById: id },
+          { id: original.supersededById ?? '' },
+        ],
+      },
+    });
+
+    // Find the root of the chain
+    let current = original;
+    let chainLength = 0;
+    const visited = new Set<string>();
+
+    while (current.supersededById && !visited.has(current.id)) {
+      visited.add(current.id);
+      chainLength++;
+      const parent = await prisma.settlement.findUnique({
+        where: { id: current.supersededById },
+      });
+      if (!parent) break;
+      current = parent;
+    }
+
+    // Count forward retries from original
+    const forwardRetries = await prisma.settlement.count({
+      where: { supersededById: id },
+    });
+
+    const totalRetries = chainLength + forwardRetries;
+
+    if (totalRetries >= 3) {
+      return reply.code(422).send(createErrorResponse(
+        ErrorCodes.VALIDATION_ERROR,
+        'Maximum retry limit (3) exceeded',
+        { retryCount: totalRetries }
+      ));
+    }
+
+    // Clone the settlement
+    const newSettlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
+    const traceId = crypto.randomUUID();
+
+    const newSettlement = await prisma.settlement.create({
+      data: {
+        id: newSettlementId,
+        merchantId: original.merchantId,
+        totalAmount: original.totalAmount,
+        grossAmount: original.grossAmount,
+        feeAmount: original.feeAmount,
+        netAmount: original.netAmount,
+        feeBps: original.feeBps,
+        asset: original.asset,
+        status: 'pending',
+        webhookUrl: original.webhookUrl,
+        feeSnapshot: original.feeSnapshot,
+      },
+    });
+
+    // Mark original as superseded
+    await prisma.settlement.update({
+      where: { id },
+      data: { supersededById: newSettlementId },
+    });
+
+    // Queue the new settlement for processing
+    await settlementQueue.add('process-settlement', {
+      id: newSettlementId,
+      merchantId: newSettlement.merchantId,
+      grossAmount: newSettlement.grossAmount,
+      asset: newSettlement.asset,
+      traceId,
+    });
+
+    fastify.log.info({ originalId: id, newId: newSettlementId, retryCount: totalRetries + 1 }, 'Settlement retried');
+
+    return reply.code(201).send({ data: newSettlement });
+  }
+);
 
 interface ReconcileQuery {
   merchantId?: string;
@@ -446,45 +558,41 @@ interface ReconcileQuery {
   to?: string;
 }
 
-// Signs a minimal HS256 JWT using Node's native crypto
-function signHS256(payload: object, secret: string): string {
-  const header = { alg: 'HS256', typ: 'JWT' };
-  const base64UrlEncode = (obj: object) => 
-    Buffer.from(JSON.stringify(obj))
-      .toString('base64url');
-  
-  const tokenInput = `${base64UrlEncode(header)}.${base64UrlEncode(payload)}`;
-  const signature = crypto
-    .createHmac('sha256', secret)
-    .update(tokenInput)
-    .digest('base64url');
-  
-  return `${tokenInput}.${signature}`;
-}
-
+/**
+ * Local Consistency Check for Settlements
+ *
+ * This endpoint performs internal validation of settlement records to ensure
+ * data integrity. It verifies:
+ * - Mathematical consistency: grossAmount - feeAmount = netAmount
+ * - Fee calculation accuracy: feeAmount matches feeBps applied to grossAmount
+ * - Merchant reference validity: all settlements reference existing merchants
+ *
+ * This is a LOCAL consistency check - it does not make external HTTP calls.
+ * All validation is performed against the settlement engine's own database.
+ */
 fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async (request, reply) => {
   const merchantIdLabel = request.query.merchantId || 'all';
   
   try {
     const { merchantId, from, to } = request.query;
 
-    const localWhere: any = {};
+    const where: Record<string, unknown> = {};
     if (merchantId) {
-      localWhere.merchantId = merchantId;
+      where.merchantId = merchantId;
     }
     if (from || to) {
-      localWhere.initiatedAt = {};
+      where.initiatedAt = {};
       if (from) {
-        localWhere.initiatedAt.gte = new Date(from);
+        (where.initiatedAt as Record<string, Date>).gte = new Date(from);
       }
       if (to) {
-        localWhere.initiatedAt.lte = new Date(to);
+        (where.initiatedAt as Record<string, Date>).lte = new Date(to);
       }
     }
 
-    // 1. Query local settlements
-    const localRecords = await prisma.settlement.findMany({
-      where: localWhere,
+    // Query settlements from local database
+    const settlements = await prisma.settlement.findMany({
+      where,
       orderBy: { initiatedAt: 'desc' },
     });
 
@@ -549,78 +657,85 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     let gatewayFeeTotal = new BigNumber(0);
     let gatewayNetTotal = new BigNumber(0);
 
-    const parseBN = (val: any) => {
-      const bn = new BigNumber(val ?? 0);
+    const parseBN = (val: unknown): BigNumber => {
+      const bn = new BigNumber(val as string ?? 0);
       return bn.isFinite() ? bn : new BigNumber(0);
     };
 
-    // Process local records
-    for (const localRec of localRecords) {
-      localGrossTotal = localGrossTotal.plus(parseBN(localRec.grossAmount || localRec.totalAmount));
-      localFeeTotal = localFeeTotal.plus(parseBN(localRec.feeAmount));
-      localNetTotal = localNetTotal.plus(parseBN(localRec.netAmount));
+    const inconsistencies: Array<{
+      settlementId: string;
+      type: 'amount_mismatch' | 'fee_calculation' | 'missing_merchant';
+      details: Record<string, unknown>;
+    }> = [];
 
-      if (!gatewayMap.has(localRec.id)) {
-        extra.push(localRec);
-      }
-    }
+    let totalGross = new BigNumber(0);
+    let totalFee = new BigNumber(0);
+    let totalNet = new BigNumber(0);
+    let validCount = 0;
 
-    // Process gateway records
-    for (const gatewayRec of gatewayRecords) {
-      gatewayGrossTotal = gatewayGrossTotal.plus(parseBN(gatewayRec.grossAmount || gatewayRec.totalAmount));
-      gatewayFeeTotal = gatewayFeeTotal.plus(parseBN(gatewayRec.feeAmount));
-      gatewayNetTotal = gatewayNetTotal.plus(parseBN(gatewayRec.netAmount));
+    const statusCounts: Record<string, number> = {
+      pending: 0,
+      processing: 0,
+      completed: 0,
+      failed: 0,
+    };
 
-      if (!localMap.has(gatewayRec.id)) {
-        missing.push(gatewayRec);
-      } else {
-        matchedIds.add(gatewayRec.id);
-      }
-    }
+    for (const settlement of settlements) {
+      const gross = parseBN(settlement.grossAmount);
+      const fee = parseBN(settlement.feeAmount);
+      const net = parseBN(settlement.netAmount);
 
-    // Check mismatches
-    for (const id of matchedIds) {
-      const localRec = localMap.get(id)!;
-      const gatewayRec = gatewayMap.get(id);
+      totalGross = totalGross.plus(gross);
+      totalFee = totalFee.plus(fee);
+      totalNet = totalNet.plus(net);
 
-      const diffFields: string[] = [];
-      const fieldsToCompare = ['merchantId', 'totalAmount', 'grossAmount', 'feeAmount', 'netAmount', 'feeBps', 'asset', 'status'];
-      
-      for (const field of fieldsToCompare) {
-        const localVal = String((localRec as any)[field] ?? '');
-        const gatewayVal = String(gatewayRec[field] ?? '');
-        if (localVal !== gatewayVal) {
-          diffFields.push(field);
-        }
-      }
+      statusCounts[settlement.status] = (statusCounts[settlement.status] || 0) + 1;
 
-      if (diffFields.length > 0) {
-        mismatched.push({
-          id,
-          local: {
-            merchantId: localRec.merchantId,
-            totalAmount: localRec.totalAmount,
-            grossAmount: localRec.grossAmount,
-            feeAmount: localRec.feeAmount,
-            netAmount: localRec.netAmount,
-            feeBps: localRec.feeBps,
-            asset: localRec.asset,
-            status: localRec.status,
+      // Check 1: Verify grossAmount - feeAmount = netAmount
+      const expectedNet = gross.minus(fee);
+      if (!expectedNet.isEqualTo(net)) {
+        inconsistencies.push({
+          settlementId: settlement.id,
+          type: 'amount_mismatch',
+          details: {
+            grossAmount: settlement.grossAmount,
+            feeAmount: settlement.feeAmount,
+            netAmount: settlement.netAmount,
+            expectedNet: expectedNet.toString(),
           },
-          gateway: {
-            merchantId: gatewayRec.merchantId,
-            totalAmount: gatewayRec.totalAmount,
-            grossAmount: gatewayRec.grossAmount,
-            feeAmount: gatewayRec.feeAmount,
-            netAmount: gatewayRec.netAmount,
-            feeBps: gatewayRec.feeBps,
-            asset: gatewayRec.asset,
-            status: gatewayRec.status,
-          },
-          diff: diffFields,
         });
+        continue;
       }
-    }
+
+      // Check 2: Verify fee calculation matches feeBps
+      // feeAmount = floor(grossAmount × feeBps / 10000)
+      const expectedFee = gross.times(settlement.feeBps).dividedBy(10000).integerValue(BigNumber.ROUND_DOWN);
+      // Allow for minor precision differences (within 1 unit)
+      if (expectedFee.minus(fee).abs().isGreaterThan(1)) {
+        inconsistencies.push({
+          settlementId: settlement.id,
+          type: 'fee_calculation',
+          details: {
+            grossAmount: settlement.grossAmount,
+            feeBps: settlement.feeBps,
+            actualFee: settlement.feeAmount,
+            expectedFee: expectedFee.toString(),
+          },
+        });
+        continue;
+      }
+
+      // Check 3: Verify merchant exists
+      if (!existingMerchantIds.has(settlement.merchantId)) {
+        inconsistencies.push({
+          settlementId: settlement.id,
+          type: 'missing_merchant',
+          details: {
+            merchantId: settlement.merchantId,
+          },
+        });
+        continue;
+      }
 
     const matchedCount = matchedIds.size - mismatched.length;
     const hasDiscrepancies = missing.length > 0 || extra.length > 0 || mismatched.length > 0;
@@ -661,33 +776,23 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
         merchantId: merchantIdLabel,
         matched: matchedCount,
       }, 'Reconciliation completed with no discrepancies');
+      validCount++;
     }
 
     return {
-      matched: matchedCount,
-      missing,
-      extra,
-      mismatches: mismatched,
-      counts: {
-        local: localRecords.length,
-        gateway: gatewayRecords.length,
-        matched: matchedCount,
-        missing: missing.length,
-        extra: extra.length,
-        mismatched: mismatched.length,
+      summary: {
+        total: settlements.length,
+        valid: validCount,
+        inconsistent: inconsistencies.length,
       },
+      statusBreakdown: statusCounts,
       totals: {
-        local: {
-          gross: localGrossTotal.toString(),
-          fee: localFeeTotal.toString(),
-          net: localNetTotal.toString(),
-        },
-        gateway: {
-          gross: gatewayGrossTotal.toString(),
-          fee: gatewayFeeTotal.toString(),
-          net: gatewayNetTotal.toString(),
-        },
-      }
+        gross: totalGross.toString(),
+        fee: totalFee.toString(),
+        net: totalNet.toString(),
+      },
+      inconsistencies,
+      reconciliationType: 'local_consistency_check',
     };
   } catch (error) {
     fastify.log.error({ error }, 'Reconciliation error');
@@ -914,8 +1019,14 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
     const parsedFeeRule = FeeRule.passthrough().safeParse(merchant?.settings);
     let feeBps = env.FEES_DEFAULT_BPS;
+    let maxFeeBps: number | undefined;
+    let maxFeeThreshold: string | undefined;
+    
     if (parsedFeeRule.success) {
       feeBps = parsedFeeRule.data.feeBps;
+      const settings = parsedFeeRule.data as Record<string, unknown>;
+      maxFeeBps = settings.maxFeeBps as number | undefined;
+      maxFeeThreshold = settings.maxFeeThreshold as string | undefined;
     } else {
       feeFallbackCounter.inc({ merchant_id: d.merchantId });
       fastify.log.warn({
@@ -1039,7 +1150,10 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
 
     const parsedFeeRule = FeeRule.passthrough().safeParse(merchant?.settings);
     const feeBps = parsedFeeRule.success ? parsedFeeRule.data.feeBps : env.FEES_DEFAULT_BPS;
-    const webhookUrl = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>).webhookUrl as string ?? null : null;
+    const settings_data = parsedFeeRule.success ? (parsedFeeRule.data as Record<string, unknown>) : {};
+    const maxFeeBps = settings_data.maxFeeBps as number | undefined;
+    const maxFeeThreshold = settings_data.maxFeeThreshold as string | undefined;
+    const webhookUrl = settings_data.webhookUrl as string ?? null;
 
     // Fetch monthly volume for volume-based fee discount (#323).
     const monthlyVolume = await getMonthlyVolume(d.merchantId);

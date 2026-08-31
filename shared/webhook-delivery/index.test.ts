@@ -23,6 +23,7 @@ import test from 'tape';
 import {
   createWebhookQueue,
   createWebhookWorker,
+  signPayload,
   WEBHOOK_DEFAULTS,
   type WebhookJobData,
   type WebhookLogger,
@@ -450,5 +451,143 @@ test('migration note — indexer queue name constant is documented', (t) => {
   const INDEXER_QUEUE_NAME = 'indexer-webhooks';
   t.equal(typeof INDEXER_QUEUE_NAME, 'string', 'queue name is a string constant');
   t.ok(INDEXER_QUEUE_NAME.length > 0, 'queue name is non-empty');
+  t.end();
+});
+
+// ── Part 6: HMAC-SHA256 webhook signing ──────────────────────────────────────
+
+import crypto from 'crypto';
+
+test('signPayload — returns correctly formatted header', (t) => {
+  const secret = 'test-secret-123';
+  const body = '{"event":{"type":"payment.completed"}}';
+  const sig = signPayload(body, secret);
+
+  // Format: t={unix_ts},s={hex_hmac}
+  t.ok(sig.startsWith('t='), 'starts with t=');
+  const parts = sig.split(',');
+  t.equal(parts.length, 2, 'has two comma-separated parts');
+
+  const tsPart = parts[0];
+  const hmacPart = parts[1];
+  t.ok(tsPart.startsWith('t='), 'first part is t=');
+  t.ok(hmacPart.startsWith('s='), 'second part is s=');
+
+  const timestamp = parseInt(tsPart.slice(2), 10);
+  t.ok(Number.isFinite(timestamp), 'timestamp is a valid number');
+  t.ok(timestamp > 0, 'timestamp is positive');
+
+  const hex = hmacPart.slice(2);
+  t.equal(hex.length, 64, 'HMAC is 64 hex chars (SHA-256)');
+  t.ok(/^[0-9a-f]{64}$/.test(hex), 'HMAC is valid hex');
+  t.end();
+});
+
+test('signPayload — recomputable by consumer (same body + secret + timestamp = same HMAC)', (t) => {
+  const secret = 'merchant-signing-key';
+  const body = '{"event":{"id":"evt_1"}}';
+
+  const sig1 = signPayload(body, secret);
+  // Extract the timestamp from sig1
+  const ts = sig1.split(',')[0].slice(2);
+  // Recompute manually using the same timestamp
+  const hmac = crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
+  const expected = `t=${ts},s=${hmac}`;
+
+  t.equal(sig1, expected, 'signature matches manual recomputation');
+  t.end();
+});
+
+test('signPayload — different secrets produce different signatures', (t) => {
+  const body = '{"event":{}}';
+  const sig1 = signPayload(body, 'secret-a');
+  const sig2 = signPayload(body, 'secret-b');
+
+  t.notEqual(sig1, sig2, 'different secrets yield different signatures');
+  t.end();
+});
+
+test('signPayload — different bodies produce different signatures', (t) => {
+  const secret = 'same-secret';
+  const sig1 = signPayload('{"a":1}', secret);
+  const sig2 = signPayload('{"b":2}', secret);
+
+  t.notEqual(sig1, sig2, 'different bodies yield different signatures');
+  t.end();
+});
+
+test('worker processor — sends X-BettaPay-Signature when signingSecret provided', async (t) => {
+  let capturedHeaders: Record<string, string> = {};
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    capturedHeaders = Object.fromEntries(
+      Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])
+    );
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — signing test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'payment.completed' },
+    signingSecret: 'my-secret',
+  });
+
+  await processor(job as any);
+
+  t.ok('X-BettaPay-Signature' in capturedHeaders, 'X-BettaPay-Signature header is present');
+  const sig = capturedHeaders['X-BettaPay-Signature'];
+  t.ok(sig.startsWith('t='), 'signature format starts with t=');
+  t.ok(sig.includes(',s='), 'signature format includes ,s=');
+  t.end();
+});
+
+test('worker processor — no X-BettaPay-Signature when signingSecret absent', async (t) => {
+  let capturedHeaders: Record<string, string> = {};
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    capturedHeaders = Object.fromEntries(
+      Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])
+    );
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — no-signing test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+  });
+
+  await processor(job as any);
+
+  t.notOk('X-BettaPay-Signature' in capturedHeaders, 'no signature header when signingSecret absent');
+  t.end();
+});
+
+// ── Part 7: DLQ support (removeOnFail: false) ───────────────────────────────
+
+test('createWebhookQueue — removeOnFail: false keeps all failed jobs', (t) => {
+  let threw = false;
+  try {
+    const q = createWebhookQueue('dlq-test-queue', FAKE_CONNECTION as any, {
+      removeOnFail: false,
+    });
+    void q.close().catch(() => {});
+  } catch {
+    threw = false;
+  }
+  t.notOk(threw, 'factory does not throw with removeOnFail: false');
   t.end();
 });

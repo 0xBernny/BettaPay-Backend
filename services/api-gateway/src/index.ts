@@ -27,6 +27,8 @@ import cors from '@fastify/cors';
 import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
+import zlib from 'zlib';
+import { Transform } from 'stream';
 import { z } from 'zod';
 import { validateEnvOrExit, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createRedisClient, waitForRedis, startRedisMemoryMonitor, startMetricsServer, logFeatureFlags } from '@bettapay/validation';
 import * as promClient from 'prom-client';
@@ -50,7 +52,9 @@ import {
   WalletChallengeQuery,
   WalletVerifyBody,
   SettlementListQuery,
+  PaginationQuery,
   BulkCancelPaymentsBody,
+  UpdateMerchantKycBody,
   PAYMENT_STATUS_TRANSITIONS,
   SETTLEMENT_STATUS_TRANSITIONS,
   isValidTransition,
@@ -63,6 +67,7 @@ import {
 } from '@bettapay/validation';
 import type { Merchant } from '@prisma/client';
 import type { ApiResponse, PaginatedResponse } from '@bettapay/shared-types';
+import { buildPaginationMeta } from '@bettapay/shared-types';
 import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import helmet from '@fastify/helmet';
@@ -72,6 +77,8 @@ import { Keypair } from '@stellar/stellar-sdk';
 import { OAuth2Client } from 'google-auth-library';
 import { registerGatewayHealthRoutes } from './health.js';
 import { startAbandonedPaymentsCron, stopAbandonedPaymentsCron } from './abandoned-payments-cron.js';
+import { createWebhookQueue, type WebhookJobData } from '@bettapay/webhook-delivery';
+import { Queue } from 'bullmq';
 import { readServiceVersion } from '@bettapay/validation';
 
 declare module 'fastify' {
@@ -82,6 +89,54 @@ declare module 'fastify' {
 
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Caps decompressed request bodies. Fastify's own bodyLimit only sees the
+// compressed (on-the-wire) byte count, so a small gzip payload can otherwise
+// decompress to many times its transmitted size before bodyLimit ever applies.
+const MAX_DECOMPRESSED_BODY_BYTES = 1_048_576;
+
+class DecompressedSizeLimitError extends Error {
+  statusCode = 413;
+  code = 'DECOMPRESSED_BODY_TOO_LARGE';
+  constructor() {
+    super('Decompressed request body exceeds the maximum allowed size');
+  }
+}
+
+class InvalidGzipStreamError extends Error {
+  statusCode = 400;
+  code = 'INVALID_GZIP_STREAM';
+  constructor() {
+    super('Request body is not a valid gzip stream');
+  }
+}
+
+// Wraps a gunzip stream with a byte counter so an oversized decompressed
+// payload is rejected (413) before it is buffered into memory, and any
+// decompression failure surfaces as a 400 rather than a hung connection.
+function createLimitedGunzipStream(maxBytes: number): { input: zlib.Gunzip; output: Transform } {
+  const gunzip = zlib.createGunzip();
+  let received = 0;
+
+  const limiter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      received += chunk.length;
+      if (received > maxBytes) {
+        callback(new DecompressedSizeLimitError());
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+
+  gunzip.on('error', () => {
+    limiter.destroy(new InvalidGzipStreamError());
+  });
+
+  gunzip.pipe(limiter);
+
+  return { input: gunzip, output: limiter };
+}
 
 function readIdempotencyKey(request: FastifyRequest): string | null {
   const raw = request.headers['idempotency-key'];
@@ -216,6 +271,28 @@ export function buildApp(opts: AppOptions = {}) {
   registerTracing(fastify);
   registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 
+  // Guards against decompression bombs: Fastify's own bodyLimit only checks
+  // the compressed (on-the-wire) size, so a small gzip payload could otherwise
+  // decompress to well beyond the intended cap before anything notices.
+  fastify.addHook('preParsing', async (request, _reply, payload) => {
+    const contentEncoding = request.headers['content-encoding'];
+    if (!contentEncoding || contentEncoding === 'identity') {
+      return payload;
+    }
+    if (contentEncoding !== 'gzip') {
+      return payload;
+    }
+
+    // The decompressed size no longer matches the original (compressed)
+    // Content-Length, so drop it — otherwise Fastify's own body reader
+    // rejects the request with FST_ERR_CTP_INVALID_CONTENT_LENGTH.
+    delete request.headers['content-length'];
+
+    const { input, output } = createLimitedGunzipStream(MAX_DECOMPRESSED_BODY_BYTES);
+    payload.pipe(input);
+    return output;
+  });
+
   const prisma = opts.prisma ?? getDefaultPrisma();
   const indexerClient = opts.indexerClient ?? createIndexerClient({
     baseUrl: env.INDEXER_URL,
@@ -264,17 +341,45 @@ fastify.register(rateLimit, {
   }
 });
 
-// Global auth rate limit for brute-force protection
-fastify.register(async function authRateLimit(childServer) {
-  childServer.register(rateLimit, {
-    max: 100,
-    timeWindow: '1 minute',
-  });
-});
+// Exposes standard X-RateLimit-* response headers on every rate-limited
+// route. The installed @fastify/rate-limit version tracks hit counts in a
+// store that's private to its own onRequest hook, with no read-only "peek"
+// API, so we mirror it with our own counter built from the same
+// `createRateLimit` helper and the route's own (global or overridden) limit
+// config. One `checkRateLimit` instance is cached per route so its counter
+// persists (and accumulates) across requests exactly like the real one —
+// both increment exactly once per request against the same max/window, so
+// they always agree on the numbers. Routes opted out via
+// `config: { rateLimit: false }` (e.g. health checks) are skipped.
+const rateLimitCheckers = new WeakMap<object, ReturnType<typeof fastify.createRateLimit>>();
 
-fastify.register(rateLimit, {
-  max: 100,
-  timeWindow: '1 minute',
+fastify.addHook('onSend', async (request: FastifyRequest, reply: FastifyReply, payload) => {
+  const routeConfig = request.routeOptions?.config as { rateLimit?: false | Record<string, unknown> } | undefined;
+  if (!routeConfig || routeConfig.rateLimit === false) {
+    return payload;
+  }
+
+  let checkRateLimit = rateLimitCheckers.get(routeConfig);
+  if (!checkRateLimit) {
+    checkRateLimit = fastify.createRateLimit(
+      typeof routeConfig.rateLimit === 'object' ? routeConfig.rateLimit : {}
+    );
+    rateLimitCheckers.set(routeConfig, checkRateLimit);
+  }
+
+  const result = await checkRateLimit(request) as {
+    max?: number;
+    remaining?: number;
+    ttlInSeconds?: number;
+  };
+
+  if (typeof result.max === 'number') {
+    reply.header('X-RateLimit-Limit', result.max);
+    reply.header('X-RateLimit-Remaining', result.remaining ?? 0);
+    reply.header('X-RateLimit-Reset', Math.ceil(Date.now() / 1000) + (result.ttlInSeconds ?? 0));
+  }
+
+  return payload;
 });
 
 // --- Same-origin enforcement --------------------------------------------------
@@ -325,7 +430,7 @@ fastify.decorate('authenticate', async function (request: FastifyRequest, reply:
     await request.jwtVerify();
   } catch (err) {
     request.log.error(err);
-    reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 });
 
@@ -720,6 +825,11 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantSetti
 }, async (request, reply) => {
   const d = UpdateMerchantSettingsBody.parse(request.body);
 
+  // Reject attempts to set kycStatus via the merchant settings endpoint
+  if ('kycStatus' in (request.body as Record<string, unknown>)) {
+    return reply.code(403).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'kycStatus cannot be updated via this endpoint'));
+  }
+
   const { id } = request.params;
   const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
   if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
@@ -733,6 +843,30 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantSetti
       data: { settings: nextSettings as object },
     });
     await logAuditEvent('merchant.updated', 'merchant', merchantUpdate.id, { before: merchant, after: merchantUpdate }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+    return merchantUpdate;
+  });
+
+  return reply.code(200).send({ data: { merchant: updated } });
+});
+
+// Admin-only: update merchant KYC status
+fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateMerchantKycBody> }>('/api/admin/merchants/:id/kyc', {
+  preValidation: [fastify.serviceAuth],
+  preHandler: [logRequestBody],
+  config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
+}, async (request, reply) => {
+  const d = UpdateMerchantKycBody.parse(request.body);
+  const { id } = request.params;
+
+  const merchant = await prisma.merchant.findFirst({ where: { id, deletedAt: null } });
+  if (!merchant) return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const merchantUpdate = await tx.merchant.update({
+      where: { id },
+      data: { kycStatus: d.kycStatus },
+    });
+    await logAuditEvent('merchant.kyc.updated', 'merchant', merchantUpdate.id, { before: { kycStatus: merchant.kycStatus }, after: { kycStatus: merchantUpdate.kycStatus } }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
     return merchantUpdate;
   });
 
@@ -982,26 +1116,47 @@ fastify.patch<{ Params: { id: string }; Body: z.infer<typeof UpdateSettlementSta
 });
 
 // Settlements
+//
+// Authorization: service-to-service callers (x-service-token) may pass
+// merchantId to filter across merchants. Merchant-authenticated callers
+// (JWT) are always scoped to their own merchantId — the query parameter is
+// ignored for them so one merchant can never read another's settlements.
 fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: string } }>('/api/settlements', {
-  preValidation: [fastify.authenticate],
+  preValidation: async (request: FastifyRequest, reply: FastifyReply) => {
+    if (request.headers['x-service-token']) {
+      await fastify.serviceAuth(request, reply);
+      return;
+    }
+    await fastify.authenticate(request, reply);
+  },
   config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
 }, async (request, reply) => {
   const query = SettlementListQuery.parse(request.query);
-  const { merchantId, status, from, to, limit, offset, includeDeleted } = query as any;
+  const { status, from, to, limit, page } = query;
+  const requestedMerchantId = (request.query as { merchantId?: string }).merchantId;
+
+  const isServiceAuth = Boolean(request.headers['x-service-token']);
+  const scopedMerchantId = isServiceAuth
+    ? requestedMerchantId
+    : (request.user as { merchantId?: string } | undefined)?.merchantId;
+
+  const { merchantId, status, from, to, startDate, endDate, limit, offset, includeDeleted } = query as any;
   const where: any = {};
-  if (merchantId) {
-    where.merchantId = merchantId;
+  if (scopedMerchantId) {
+    where.merchantId = scopedMerchantId;
   }
   if (status) {
     where.status = status;
   }
-  if (from || to) {
+  const effectiveFrom = startDate ?? from;
+  const effectiveTo = endDate ?? to;
+  if (effectiveFrom || effectiveTo) {
     where.initiatedAt = {};
-    if (from) {
-      where.initiatedAt.gte = new Date(from);
+    if (effectiveFrom) {
+      where.initiatedAt.gte = new Date(effectiveFrom);
     }
-    if (to) {
-      where.initiatedAt.lte = new Date(to);
+    if (effectiveTo) {
+      where.initiatedAt.lte = new Date(effectiveTo);
     }
   }
 
@@ -1016,20 +1171,14 @@ fastify.get<{ Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: 
       where,
       orderBy: { initiatedAt: 'desc' },
       take: limit,
-      skip: offset,
+      skip: (page - 1) * limit,
     }),
     prisma.settlement.count({ where }),
   ]);
 
-  const hasMore = offset + limit < total;
   return {
     data: records,
-    pagination: {
-      total,
-      limit,
-      offset,
-      hasMore,
-    },
+    pagination: buildPaginationMeta(page, limit, total),
   };
 });
 
@@ -1154,9 +1303,8 @@ fastify.get('/api/admin/audit-log', {
   preValidation: [fastify.serviceAuth],
   config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
 }, async (request, reply) => {
+  const { page, limit } = PaginationQuery.parse(request.query ?? {});
   const query = request.query as Record<string, string | undefined>;
-  const limit = Math.min(Number(query.limit ?? 50), 200);
-  const offset = Math.max(Number(query.offset ?? 0), 0);
   const where: Record<string, unknown> = {};
 
   if (query.entityType) {
@@ -1180,12 +1328,12 @@ fastify.get('/api/admin/audit-log', {
       where,
       orderBy: { createdAt: 'desc' },
       take: limit,
-      skip: offset,
+      skip: (page - 1) * limit,
     }),
     prisma.auditLog.count({ where }),
   ]);
 
-  return reply.send({ data: rows, pagination: { total, limit, offset, hasMore: offset + limit < total } });
+  return reply.send({ data: rows, pagination: buildPaginationMeta(page, limit, total) });
 });
 
 fastify.get('/api/deployments', async (request, reply) => {
@@ -1485,7 +1633,8 @@ const start = async () => {
     startRedisMemoryMonitor(redis, app.log);
 
     if (process.env.NODE_ENV !== 'test') {
-      startAbandonedPaymentsCron(prisma, app.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24);
+      const webhookQueue = createWebhookQueue('gateway-expired-webhooks', { url: env.REDIS_URL });
+      startAbandonedPaymentsCron(prisma, app.log, (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24, webhookQueue);
     }
     await app.listen({ port: PORT, host: '0.0.0.0' });
   } catch (err) {

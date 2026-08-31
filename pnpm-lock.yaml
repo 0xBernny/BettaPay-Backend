@@ -167,6 +167,9 @@ importers:
 
   services/indexer:
     dependencies:
+      '@bettapay/shared-types':
+        specifier: workspace:^
+        version: link:../../shared/types
       '@bettapay/validation':
         specifier: workspace:*
         version: link:../../shared/validation
