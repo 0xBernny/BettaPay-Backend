@@ -990,7 +990,7 @@ test('worker processor — duplicate eventId is skipped and warning logged', asy
   t.end();
 });
 
-test('worker processor — Redis unavailable delivers anyway (fail-open)', async (t) => {
+test('worker processor — Redis unavailable fails closed (throws without delivering duplicate)', async (t) => {
   let delivered = false;
   const mockRedis: DedupRedis = {
     set: async () => { throw new Error('ECONNREFUSED'); },
@@ -1003,7 +1003,7 @@ test('worker processor — Redis unavailable delivers anyway (fail-open)', async
 
   const processor = extractProcessor(mockFetch, undefined, mockRedis);
   if (!processor) {
-    t.pass('Worker constructor unavailable (no Redis) — fail-open test skipped');
+    t.pass('Worker constructor unavailable (no Redis) — fail-closed test skipped');
     t.end();
     return;
   }
@@ -1011,16 +1011,23 @@ test('worker processor — Redis unavailable delivers anyway (fail-open)', async
   const job = makeFakeJob({
     url: 'https://merchant.example/hook',
     event: { type: 'settlement.completed' },
-    eventId: 'evt_failopen',
+    eventId: 'evt_failclosed',
   });
 
-  await processor(job as any);
+  let threw = false;
+  try {
+    await processor(job as any);
+  } catch (err) {
+    threw = true;
+    t.ok((err as Error).message.includes('Redis dedup check failed'), 'error mentions dedup check failure');
+  }
 
-  t.ok(delivered, 'webhook was delivered despite Redis being down');
+  t.true(threw, 'processor throws when Redis dedup check fails (fail-closed)');
+  t.false(delivered, 'webhook was NOT delivered when Redis dedup failed');
   t.end();
 });
 
-// ── Part 8: DLQ support (removeOnFail: false) ───────────────────────────────
+// ── Part 8: DLQ support (removeOnFail: false & deadLetterQueue) ───────────────
 
 test('createWebhookQueue — removeOnFail: false keeps all failed jobs', (t) => {
   let threw = false;
@@ -1033,5 +1040,42 @@ test('createWebhookQueue — removeOnFail: false keeps all failed jobs', (t) => 
     threw = false;
   }
   t.notOk(threw, 'factory does not throw with removeOnFail: false');
+  t.end();
+});
+
+test('createWebhookWorker — routes exhausted failed jobs to deadLetterQueue', async (t) => {
+  const archivedJobs: Array<{ name: string; data: WebhookJobData }> = [];
+  const mockDlq = {
+    add: async (name: string, data: WebhookJobData) => {
+      archivedJobs.push({ name, data });
+    },
+  };
+
+  try {
+    const worker = createWebhookWorker('test-worker-dlq', FAKE_CONNECTION as any, {
+      deadLetterQueue: mockDlq,
+    });
+    // Emit failed event on worker with exhausted attempts
+    const failedJob: any = {
+      id: 'job_dlq_1',
+      attemptsMade: 5,
+      opts: { attempts: 5 },
+      data: {
+        url: 'https://merchant.example/hook',
+        event: { type: 'payment.failed' },
+        eventId: 'evt_dlq_1',
+      },
+    };
+
+    worker.emit('failed', failedJob, new Error('Simulated failure'));
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    t.equal(archivedJobs.length, 1, 'job was routed to dead-letter queue');
+    t.equal(archivedJobs[0]?.data?.eventId, 'evt_dlq_1', 'archived correct job data');
+    void worker.close().catch(() => {});
+  } catch {
+    t.pass('Worker constructor skipped (no Redis connection)');
+  }
   t.end();
 });

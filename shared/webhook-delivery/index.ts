@@ -145,6 +145,8 @@ export interface WebhookWorkerOptions {
    *  an eventId on the job, the worker performs a SET NX with 1-hour TTL
    *  before dispatch.  If the key already exists the delivery is skipped. */
   redis?: DedupRedis;
+  /** Optional dead-letter queue or archive queue to route permanently failed jobs. */
+  deadLetterQueue?: Queue<WebhookJobData> | { add: (name: string, data: WebhookJobData) => Promise<unknown> };
   /** Any additional BullMQ WorkerOptions to pass through. */
   workerOptions?: Partial<WorkerOptions>;
 }
@@ -374,9 +376,12 @@ export function createWebhookWorker(
             return;
           }
         } catch (err) {
-          logger?.warn(
+          logger?.error(
             { url, jobId: job.id, eventId, err: err instanceof Error ? err.message : String(err) },
-            '[webhook-delivery] Redis dedup check failed — delivering anyway (fail-open)',
+            '[webhook-delivery] Redis dedup check failed — failing closed with backoff to prevent duplicate delivery',
+          );
+          throw new Error(
+            `[webhook-delivery] Redis dedup check failed for event ${eventId}: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
       }
@@ -438,6 +443,26 @@ export function createWebhookWorker(
       ...workerOptions,
     },
   );
+
+  if (opts.deadLetterQueue) {
+    const dlq = opts.deadLetterQueue;
+    worker.on('failed', async (job: any, err: any) => {
+      if (job && job.attemptsMade >= (job.opts?.attempts ?? WEBHOOK_DEFAULTS.attempts)) {
+        try {
+          await dlq.add('dead-letter', job.data);
+          logger?.info(
+            { jobId: job.id, eventId: job.data.eventId },
+            '[webhook-delivery] Archived permanently failed job to dead-letter queue',
+          );
+        } catch (dlqErr) {
+          logger?.error(
+            { jobId: job.id, err: dlqErr instanceof Error ? dlqErr.message : String(dlqErr) },
+            '[webhook-delivery] Failed to archive job to dead-letter queue',
+          );
+        }
+      }
+    });
+  }
 
   return worker;
 }
