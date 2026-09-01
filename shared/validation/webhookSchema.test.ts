@@ -286,9 +286,33 @@ test('WebhookHeadersSchema', async (t) => {
     assert.strictEqual(result.success, false);
   });
 
-  await t.test('rejects header values containing line breaks (header injection)', () => {
-    const result = WebhookHeadersSchema.safeParse({ 'X-Custom': 'value\r\nX-Injected: evil' });
+  await t.test('rejects header values containing line breaks (header injection) (#607)', () => {
+    // The exact attack shape from #607's acceptance criteria.
+    const result = WebhookHeadersSchema.safeParse({ 'X-Ok': 'a\r\nInjected: b' });
     assert.strictEqual(result.success, false);
+  });
+
+  await t.test('rejects Host as a custom header (case-insensitive) (#607)', () => {
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ Host: 'evil.example.com' }).success, false);
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ host: 'evil.example.com' }).success, false);
+  });
+
+  await t.test('rejects Content-Length as a custom header (case-insensitive) (#607)', () => {
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ 'Content-Length': '0' }).success, false);
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ 'content-length': '0' }).success, false);
+  });
+
+  await t.test('rejects Transfer-Encoding and Connection as custom headers (#607)', () => {
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ 'Transfer-Encoding': 'chunked' }).success, false);
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ Connection: 'keep-alive' }).success, false);
+  });
+
+  await t.test('valid headers round-trip unchanged (#607)', () => {
+    const result = WebhookHeadersSchema.safeParse({ 'X-Ok': 'a normal value', 'X-Idempotency-Key': 'abc123' });
+    assert.strictEqual(result.success, true);
+    if (result.success) {
+      assert.deepStrictEqual(result.data, { 'X-Ok': 'a normal value', 'X-Idempotency-Key': 'abc123' });
+    }
   });
 
   await t.test('rejects more than 20 custom headers', () => {
