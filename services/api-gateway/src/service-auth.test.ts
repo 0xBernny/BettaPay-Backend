@@ -61,6 +61,19 @@ test('createServiceAuth throws when given an empty secret', (t) => {
   t.end();
 });
 
+test('createServiceAuth accepts an array of secrets for key rotation', (t) => {
+  t.doesNotThrow(
+    () => createServiceAuth(['old-secret-key-1234567890', 'new-secret-key-1234567890']),
+    'accepts array of secrets for rotation',
+  );
+  t.end();
+});
+
+test('createServiceAuth throws when array is empty', (t) => {
+  t.throws(() => createServiceAuth([]), /at least one non-empty/, 'fails fast on empty array');
+  t.end();
+});
+
 test('createServiceAuth rejects dev/test secrets when NODE_ENV=production (#548)', (t) => {
   const original = process.env.NODE_ENV;
   try {
@@ -88,4 +101,27 @@ test('createServiceAuth rejects dev/test secrets when NODE_ENV=production (#548)
     process.env.NODE_ENV = original;
     t.end();
   }
+});
+
+test('serviceAuth accepts overlapping keys during rotation on gateway admin route', async (t) => {
+  const oldSecret = 'old-gw-admin-secret-12345678';
+  const newSecret = 'new-gw-admin-secret-12345678';
+  const app = buildApp({ prisma: createMockPrisma() as any, logger: false, interServiceSecret: [oldSecret, newSecret] });
+
+  const resOld = await app.inject({
+    method: 'GET',
+    url: '/api/admin/audit-log',
+    headers: { 'x-service-token': oldSecret },
+  });
+  t.equal(resOld.statusCode, 200, 'old key accepted during rotation');
+
+  const resNew = await app.inject({
+    method: 'GET',
+    url: '/api/admin/audit-log',
+    headers: { 'x-service-token': newSecret },
+  });
+  t.equal(resNew.statusCode, 200, 'new key accepted during rotation');
+
+  await app.close();
+  t.end();
 });
