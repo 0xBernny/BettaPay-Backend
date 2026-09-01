@@ -296,6 +296,16 @@ export const EnvSchema = z
     SETTLEMENT_ENGINE_URL: z.string().url().default("http://localhost:3001"),
     INDEXER_URL: z.string().url().default("http://localhost:3003"),
 
+    // Number of trusted reverse-proxy hops in front of the gateway (#621).
+    // X-Forwarded-For / X-Real-IP are only consulted when this is > 0 — the
+    // header is otherwise attacker-controlled and unconditionally trusting it
+    // (the prior behavior) let a spoofed X-Forwarded-For poison AuditLog.ipAddress.
+    // Default 0 means: never trust the header, always use the raw socket address.
+    TRUSTED_PROXY_COUNT: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("0"),
+
     // FX Engine — live rate fetching and caching
     RATES_API_URL: z
       .string()

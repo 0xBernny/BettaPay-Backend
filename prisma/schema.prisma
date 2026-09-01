@@ -76,6 +76,8 @@ model Payment {
   fxQuoteExpiresAt        DateTime?
 
   @@index([merchantId, status, createdAt(sort: Desc)])
+  // #622 — supports the idempotency-key cleanup job's scan for expired keys.
+  @@index([idempotencyKeyExpiresAt])
 }
 
 model Settlement {
@@ -112,6 +114,8 @@ model Settlement {
   @@index([merchantId, initiatedAt(sort: Desc)])
   @@index([merchantId, status, initiatedAt(sort: Desc)])
   @@index([supersededById])
+  // #622 — supports the idempotency-key cleanup job's scan for expired keys.
+  @@index([idempotencyKeyExpiresAt])
 }
 
 model IndexedEvent {

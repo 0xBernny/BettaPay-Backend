@@ -116,6 +116,10 @@ import {
   stopAbandonedPaymentsCron,
 } from "./abandoned-payments-cron.js";
 import {
+  startIdempotencyKeyCleanupCron,
+  stopIdempotencyKeyCleanupCron,
+} from "./idempotency-key-cleanup-cron.js";
+import {
   createWebhookQueue,
   type WebhookJobData,
 } from "@bettapay/webhook-delivery";
@@ -3185,6 +3189,7 @@ async function shutdown(signal: string) {
     }
     await getDefaultPrisma().$disconnect();
     stopAbandonedPaymentsCron();
+    stopIdempotencyKeyCleanupCron();
     process.exit(0);
   } catch (err) {
     app.log.error(err, "Error during shutdown");
@@ -3221,6 +3226,7 @@ const start = async () => {
         (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24,
         webhookQueue,
       );
+      startIdempotencyKeyCleanupCron(prisma, app.log, { redis });
     }
     await app.listen({ port: PORT, host: "0.0.0.0" });
   } catch (err) {
