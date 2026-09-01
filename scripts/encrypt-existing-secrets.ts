@@ -26,7 +26,7 @@ import {
   encryptField,
   decryptField,
   isEncrypted,
-} from "@bettapay/shared-validation";
+} from "@bettapay/validation";
 
 const prisma = new PrismaClient();
 

@@ -21,7 +21,7 @@
 
 import BigNumber from "bignumber.js";
 import type { Amount } from "@bettapay/shared-types";
-import { feeSnapshotSchema } from "@bettapay/shared-validation";
+import { feeSnapshotSchema } from "@bettapay/validation";
 
 // Always round DOWN (conservative/banker-safe), never use scientific notation
 BigNumber.config({
