@@ -127,6 +127,10 @@ model IndexedEvent {
   ledger           Int
   indexedAt        DateTime @default(now())
 
+  // The Prisma schema DSL cannot express NULLS NOT DISTINCT, but the actual
+  // Postgres index (see migration 20260901000000_dedupe_null_stellarid_indexed_events,
+  // #612) is created with it so that two events sharing a (contractId, ledger)
+  // pair and a NULL stellarId are also rejected as duplicates.
   @@unique([stellarId, contractId, ledger])
   @@index([ledger])
   @@index([type])
