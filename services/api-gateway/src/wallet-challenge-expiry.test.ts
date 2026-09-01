@@ -187,6 +187,28 @@ test('consuming is atomic, so concurrent attempts cannot both win', async (t) =>
   t.end();
 });
 
+test('consuming is atomic under 10 concurrent verify calls (#611)', async (t) => {
+  // This is the real, currently-wired consume path (the Lua GET+DEL script
+  // in wallet-challenge-store.ts's `consume()`), exercised at the
+  // concurrency level #611 calls for — not the separate hand-rolled
+  // get-then-del reimplementation in wallet-auth-challenge.test.ts, which
+  // duplicates route logic that isn't actually what index.ts wires up (see
+  // that file's own removal in this change).
+  const redis = fakeRedis();
+  const store = new WalletChallengeStore(redis, { now: redis.now });
+
+  await store.issue(ADDRESS);
+  const results = await Promise.all(
+    Array.from({ length: 10 }, () => store.consume(ADDRESS)),
+  );
+  const valid = results.filter((r) => r.status === 'valid');
+  const notFound = results.filter((r) => r.status === 'not_found');
+
+  t.equal(valid.length, 1, 'exactly one of ten concurrent verifications gets the challenge');
+  t.equal(notFound.length, 9, 'the other nine find nothing outstanding');
+  t.end();
+});
+
 test('a corrupt record is discarded rather than trusted', async (t) => {
   const redis = fakeRedis();
   const store = new WalletChallengeStore(redis, { now: redis.now });
