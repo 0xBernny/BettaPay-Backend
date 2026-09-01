@@ -61,7 +61,10 @@ per cycle until it reaches the tip, bounded by the per-cycle timeout.
 `settlement.completed` and `settlement.failed` webhook events carry a
 **projected** payload (built by `buildSettlementWebhookData`), not the raw
 database row — internal columns (`idempotencyKey*`, `webhookHeaders`) are
-never sent.
+never sent. `webhookUrl` (the delivery target itself, which can carry an
+internal Vercel preview / ngrok / staging hostname) is excluded from the
+payload for the same reason (#608) — it is used only for internal delivery
+routing and is never mirrored back to the merchant that configured it.
 
 ```jsonc
 {
@@ -84,7 +87,6 @@ never sent.
         "monthlyVolumeAtTime": "…",
         "feeVersion": "1.0"
       },
-      "webhookUrl": "https://…",
       "createdAt": "…",
       "completedAt": "…"
     }

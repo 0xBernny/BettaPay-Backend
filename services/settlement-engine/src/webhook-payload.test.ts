@@ -66,6 +66,18 @@ test('internal columns are never leaked into the payload', (t) => {
   t.end();
 });
 
+test('webhookUrl (the internal delivery target) is never leaked into the payload (#608)', (t) => {
+  // completedRow() always sets a webhookUrl — this asserts it is excluded
+  // even though it is present on the source row, not just "happens to be
+  // undefined". A merchant receiving this payload must never see the
+  // delivery URL mirrored back at them: it can carry internal Vercel
+  // preview / ngrok / staging hostnames.
+  const data = buildSettlementWebhookData(completedRow());
+  t.equal(data.webhookUrl, undefined, 'webhookUrl is not in the payload');
+  t.equal('webhookUrl' in data, false, 'webhookUrl key is absent, not merely undefined');
+  t.end();
+});
+
 test('feeVersion is null (not undefined) when a legacy settlement has no snapshot', (t) => {
   const data = buildSettlementWebhookData(completedRow({ feeSnapshot: null }));
   t.equal(data.feeSnapshot, null, 'feeSnapshot: null');
