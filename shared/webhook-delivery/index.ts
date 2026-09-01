@@ -135,7 +135,11 @@ export interface DedupRedis {
 export interface WebhookWorkerOptions {
   /** Per-attempt HTTP timeout in milliseconds (default 5000). */
   timeoutMs?: number;
-  /** Worker concurrency — how many jobs run in parallel (default 10). */
+  /** 
+   * Worker concurrency — how many jobs run in parallel.
+   * Defaults to WEBHOOK_CONCURRENCY env var if set, otherwise 10.
+   * Can be overridden per-worker for fine-tuned control (#516).
+   */
   concurrency?: number;
   /** Optional structured logger.  If omitted all logging is suppressed. */
   logger?: WebhookLogger;
@@ -162,6 +166,24 @@ export const WEBHOOK_DEFAULTS = {
   removeOnFailCount: 500,
 } as const;
 
+/**
+ * Resolves webhook worker concurrency from environment or default.
+ * 
+ * Checks WEBHOOK_CONCURRENCY env var first; falls back to default of 10.
+ * This allows operators to tune concurrency without code changes (#516).
+ * 
+ * @param defaultValue  Fallback if env var is unset or invalid (default: 10)
+ * @returns             Resolved concurrency value
+ */
+export function resolveWebhookConcurrency(defaultValue = WEBHOOK_DEFAULTS.concurrency): number {
+  const envValue = process.env.WEBHOOK_CONCURRENCY;
+  if (envValue) {
+    const parsed = parseInt(envValue, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return defaultValue;
 // ── Canonical JSON serialization ─────────────────────────────────────────────
 
 /**
@@ -349,7 +371,7 @@ export function createWebhookWorker(
 ): Worker<WebhookJobData> {
   const {
     timeoutMs = WEBHOOK_DEFAULTS.timeoutMs,
-    concurrency = WEBHOOK_DEFAULTS.concurrency,
+    concurrency = resolveWebhookConcurrency(), // Env-driven default (#516)
     logger,
     fetchImpl = fetch,
     workerOptions = {},
@@ -417,8 +439,6 @@ export function createWebhookWorker(
           signal: controller.signal,
         });
 
-        clearTimeout(timeoutId);
-
         if (!response.ok) {
           // Throw so BullMQ marks this attempt failed and schedules a retry.
           throw new Error(
@@ -428,13 +448,19 @@ export function createWebhookWorker(
 
         logger?.info({ url, jobId: job.id, attempt, status: response.status }, '[webhook-delivery] Webhook delivered');
       } catch (err) {
-        clearTimeout(timeoutId);
         logger?.warn(
           { url, jobId: job.id, attempt, err: err instanceof Error ? err.message : String(err) },
           '[webhook-delivery] Delivery attempt failed — BullMQ will retry',
         );
         // Re-throw so BullMQ applies back-off and retry logic.
         throw err;
+      } finally {
+        // Ensure timer and abort signal are always cleaned up (#517)
+        clearTimeout(timeoutId);
+        // Abort if still pending (e.g., on error path before response completes)
+        if (!controller.signal.aborted) {
+          controller.abort();
+        }
       }
     },
     {
