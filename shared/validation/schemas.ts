@@ -346,6 +346,13 @@ export const MerchantSettings = z
     maxSettlementAmount: z.number().positive().optional(),
     minSettlementAmount: z.number().positive().optional(),
     dailySettlementLimit: z.number().positive().optional(),
+    // Referenced by the mutual-exclusivity `.refine` below but never
+    // declared on this schema — a pre-existing gap unrelated to #607/#608/
+    // #611/#624, fixed here only to unblock building this package (every
+    // other service imports it). `feeSchedules` isn't otherwise implemented
+    // anywhere in this codebase yet, so this is left as an untyped
+    // passthrough rather than guessing its intended shape.
+    feeSchedules: z.unknown().optional(),
   })
   .refine(
     (data) => !(data.feeBps !== undefined && data.feeSchedules !== undefined),

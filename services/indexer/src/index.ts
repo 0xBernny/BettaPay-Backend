@@ -28,8 +28,9 @@ import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import pg from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { z } from "zod";
-import { encryptField, decryptField } from "@bettapay/shared-validation";
 import {
+  encryptField,
+  decryptField,
   validateEnvOrExit,
   registerErrorHandler,
   registerRequestId,
@@ -1142,11 +1143,12 @@ fastify.delete<{ Params: { id: string } }>(
   },
 );
 
-fastify.post<{ Params: { id: string } }>(
+fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
   "/api/webhooks/:id/test",
   { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
     const { id } = request.params;
+    const { merchantId: callerMerchantId } = request.query;
     const existing = await prisma.webhookSubscription.findUnique({
       where: { id },
     });
@@ -1156,6 +1158,30 @@ fastify.post<{ Params: { id: string } }>(
         error: {
           code: "NOT_FOUND",
           message: `Webhook subscription ${id} not found`,
+        },
+      });
+    }
+
+    // #624: this route sits behind serviceAuth (any trusted internal caller,
+    // not a merchant-identity check), so it has no auth boundary of its own
+    // for *which* merchant is allowed to test *which* subscription. The
+    // merchant-facing api-gateway route already rejects a cross-merchant
+    // test before ever calling this one, and forwards its own verified
+    // caller as `?merchantId=`. Re-checking it here is defense in depth: a
+    // future internal caller that skips that pre-check (or a stale/replayed
+    // request) cannot silently poison another merchant's subscription
+    // status. A subscription without a merchantId (a global/system
+    // subscription) has no owner to check against here — see the analogous
+    // gap already called out for the gateway route in issue #624.
+    if (
+      existing.merchantId &&
+      callerMerchantId &&
+      existing.merchantId !== callerMerchantId
+    ) {
+      return reply.code(403).send({
+        error: {
+          code: "FORBIDDEN",
+          message: "Cannot test webhook subscription owned by another merchant",
         },
       });
     }

@@ -1,6 +1,5 @@
 import type { FeeAuditSnapshot } from "./settlement-amounts.js";
-import { feeSnapshotSchema } from "@bettapay/shared-validation";
-import { logger } from "@bettapay/shared-validation";
+import { feeSnapshotSchema } from "@bettapay/validation";
 
 /** The subset of a Settlement row that the webhook payload is built from. */
 export interface SettlementWebhookSource {
@@ -29,6 +28,14 @@ export interface SettlementWebhookSource {
  * `feeVersion` for quick reconciliation. Fields are documented in
  * `docs/INDEXER_AND_WEBHOOKS.md`.
  *
+ * `webhookUrl` is deliberately excluded from the returned `data` (#608): it
+ * is the delivery *target* — often an internal Vercel preview / ngrok /
+ * staging hostname — not settlement data, and mirroring it back to the
+ * merchant that configured it leaks infrastructure topology for no reason.
+ * Internal delivery routing reads `webhookUrl` directly off the `Settlement`
+ * row (see the call sites of `buildSettlementWebhookData`), never from this
+ * projection.
+ *
  * Corrupt feeSnapshot validation (#625): validates the snapshot against the
  * schema and logs errors if corrupt, returning null instead of propagating
  * garbage.
@@ -44,14 +51,14 @@ export function buildSettlementWebhookData(
     if (validationResult.success) {
       feeSnapshot = validationResult.data as FeeAuditSnapshot;
     } else {
-      logger.error(
+      console.error(
+        "Corrupt feeSnapshot detected in settlement, returning null",
         {
           settlementId: s.id,
           merchantId: s.merchantId,
           corruptSnapshot: s.feeSnapshot,
           validationError: validationResult.error.message,
         },
-        "Corrupt feeSnapshot detected in settlement, returning null",
       );
     }
   }
@@ -67,7 +74,6 @@ export function buildSettlementWebhookData(
     feeBps: s.feeBps,
     feeSnapshot,
     feeVersion: feeSnapshot?.feeVersion ?? null,
-    webhookUrl: s.webhookUrl,
     createdAt: s.createdAt ?? null,
     completedAt: s.completedAt ?? null,
   };

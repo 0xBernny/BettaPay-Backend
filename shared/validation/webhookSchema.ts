@@ -137,7 +137,20 @@ export const WebhookPayloadSchema = z.object({
 // of silently being dropped at delivery time.
 
 const HTTP_TOKEN_PATTERN = /^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/;
-const RESERVED_WEBHOOK_HEADER_NAMES = new Set(['content-type', 'x-bettapay-signature']);
+// `content-type`/`x-bettapay-signature` are ours to control (see comment
+// above). `host`/`content-length`/`transfer-encoding`/`connection` are
+// reserved for a different reason (#607): they are meaningful to whatever
+// HTTP client actually sends the request, so letting a merchant set them
+// risks request-smuggling / response-splitting-style header confusion at
+// delivery time, not just a misconfiguration on our side.
+const RESERVED_WEBHOOK_HEADER_NAMES = new Set([
+  'content-type',
+  'x-bettapay-signature',
+  'host',
+  'content-length',
+  'transfer-encoding',
+  'connection',
+]);
 const MAX_CUSTOM_WEBHOOK_HEADERS = 20;
 
 export const WebhookHeadersSchema = z
@@ -150,7 +163,7 @@ export const WebhookHeadersSchema = z
   })
   .refine(
     (headers) => Object.keys(headers).every((name) => !RESERVED_WEBHOOK_HEADER_NAMES.has(name.toLowerCase())),
-    { message: 'Content-Type and X-BettaPay-Signature are reserved and cannot be set as custom headers' },
+    { message: 'This header is reserved and cannot be set as a custom header' },
   )
   .refine((headers) => Object.values(headers).every((value) => !/[\r\n]/.test(value)), {
     message: 'Header values must not contain line breaks',

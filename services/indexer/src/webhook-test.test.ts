@@ -131,6 +131,75 @@ test('webhook test fails without status code for unreachable URL', async (t) => 
   }
 });
 
+test('webhook test returns 403 and does not mutate lastTestedAt for a cross-merchant caller (#624)', async (t) => {
+  await fastify.ready();
+
+  const id = 'wh_owned_by_mch_b';
+  prisma.webhookSubscription.findUnique = async () => ({
+    id,
+    url: 'https://example.com/webhook',
+    signingSecret: null,
+    merchantId: 'mch_b',
+  }) as any;
+  let updateCalled = false;
+  prisma.webhookSubscription.update = async () => {
+    updateCalled = true;
+    return {} as any;
+  };
+
+  try {
+    const res = await fastify.inject({
+      method: 'POST',
+      url: `/api/webhooks/${id}/test?merchantId=mch_a`,
+      headers: { 'x-service-token': 'test-service-secret-value' },
+    });
+
+    t.equal(res.statusCode, 403, 'cross-merchant test is forbidden');
+    const body = JSON.parse(res.body);
+    t.equal(body.error.code, 'FORBIDDEN', 'error code identifies the rejection');
+    t.equal(updateCalled, false, 'lastTestedAt/lastTestStatus are not mutated');
+  } finally {
+    t.end();
+  }
+});
+
+test('webhook test succeeds when the caller owns the subscription (#624)', async (t) => {
+  await fastify.ready();
+  webhookQueue.add = async () => ({
+    waitUntilFinished: async () => {},
+  } as any);
+
+  const originalFetch = global.fetch;
+  global.fetch = async () => new Response('', { status: 200 });
+
+  const id = 'wh_owned_by_mch_a';
+  prisma.webhookSubscription.findUnique = async () => ({
+    id,
+    url: 'https://example.com/webhook',
+    signingSecret: null,
+    merchantId: 'mch_a',
+  }) as any;
+  let updatedData: any;
+  prisma.webhookSubscription.update = async (args: any) => {
+    updatedData = args.data;
+    return {} as any;
+  };
+
+  try {
+    const res = await fastify.inject({
+      method: 'POST',
+      url: `/api/webhooks/${id}/test?merchantId=mch_a`,
+      headers: { 'x-service-token': 'test-service-secret-value' },
+    });
+
+    t.equal(res.statusCode, 200, 'own-subscription test succeeds');
+    t.equal(updatedData?.lastTestStatus, 'success', 'lastTestStatus is updated');
+  } finally {
+    global.fetch = originalFetch;
+    t.end();
+  }
+});
+
 test('webhook test returns 404 for non-existent subscription', async (t) => {
   await fastify.ready();
   prisma.webhookSubscription.findUnique = async () => null;
