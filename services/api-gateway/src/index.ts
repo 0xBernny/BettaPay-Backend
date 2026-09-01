@@ -1599,6 +1599,7 @@ export function normalizeAndValidateEmail(
       try {
         const testResult = await indexerClient.testWebhook(
           id,
+          payload.merchantId,
           request.headers as Record<string, string | string[] | undefined>
         );
         if (!testResult) {

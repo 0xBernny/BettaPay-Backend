@@ -73,10 +73,14 @@ export interface IndexerClient {
    * Triggers a synthetic test event for a webhook subscription via the indexer.
    *
    * @param id The webhook subscription ID to test.
+   * @param merchantId The calling merchant's own id (#624) — forwarded so the
+   *        indexer can enforce ownership as a second, independent check even
+   *        though this gateway route already rejects a cross-merchant test
+   *        before ever reaching here (defense in depth, not the only guard).
    * @param incomingHeaders inbound request headers; tracing headers are propagated.
    * @returns the test result, or `null` if the indexer is unavailable.
    */
-  testWebhook(id: string, incomingHeaders?: IncomingHeaders): Promise<{ success: boolean; statusCode?: number; error?: string } | null>;
+  testWebhook(id: string, merchantId: string, incomingHeaders?: IncomingHeaders): Promise<{ success: boolean; statusCode?: number; error?: string } | null>;
 }
 
 export function createIndexerClient(options: IndexerClientOptions): IndexerClient {
@@ -162,10 +166,13 @@ export function createIndexerClient(options: IndexerClientOptions): IndexerClien
 
   async function testWebhook(
     id: string,
+    merchantId: string,
     incomingHeaders: IncomingHeaders = {},
   ): Promise<{ success: boolean; statusCode?: number; error?: string } | null> {
     const headers = propagateTracingHeaders(incomingHeaders, { ...authHeaders });
-    const url = `${root}/api/webhooks/${encodeURIComponent(id)}/test`;
+    const url =
+      `${root}/api/webhooks/${encodeURIComponent(id)}/test` +
+      `?merchantId=${encodeURIComponent(merchantId)}`;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
