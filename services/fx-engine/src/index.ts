@@ -1250,6 +1250,14 @@ const QuoteQuerySchema = z.object({
   slippageBps: z
     .string()
     .regex(/^\d+$/, "slippageBps must be a non-negative integer")
+    // Issue #620: without an upper bound, a merchant could submit an
+    // arbitrarily large slippageBps (e.g. 10000 = 100%) and get silently
+    // clamped to env.MAX_SLIPPAGE_BPS below with no error signal — the
+    // request looked accepted while their actual tolerance was ignored.
+    // Reject out-of-range values outright instead.
+    .refine((val) => parseInt(val, 10) <= 1000, {
+      message: "slippageBps must be between 0 and 1000",
+    })
     .optional(),
 });
 
