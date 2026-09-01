@@ -365,6 +365,35 @@ function hashSecret(secret: string): string {
   return crypto.createHash("sha256").update(secret).digest("hex");
 }
 
+export function normalizeAndValidateEmail(
+  rawEmail: unknown,
+): { email: string; domain: string } | null {
+  if (typeof rawEmail !== "string") return null;
+
+  const trimmed = rawEmail.trim().replace(/[\uFF0E\u3002\uFF61]/g, ".");
+  if (!trimmed || trimmed.length > 320) return null;
+
+  const parsed = z.string().email().safeParse(trimmed);
+  if (!parsed.success) return null;
+
+  const normalized = trimmed.toLowerCase();
+  const parts = normalized.split("@");
+  if (parts.length !== 2) return null;
+
+  const [localPart, domainPart] = parts;
+  if (!localPart || !domainPart) return null;
+
+  if (
+    domainPart.startsWith(".") ||
+    domainPart.endsWith(".") ||
+    domainPart.includes("..")
+  ) {
+    return null;
+  }
+
+  return { email: normalized, domain: domainPart };
+}
+
 export function buildApp(opts: AppOptions = {}) {
   const fastify = Fastify({
     logger:
@@ -1386,35 +1415,6 @@ fastify.get('/api/admin/auth/ip-score', {
       return reply.send({ token });
     },
   );
-
-export function normalizeAndValidateEmail(
-  rawEmail: unknown,
-): { email: string; domain: string } | null {
-  if (typeof rawEmail !== "string") return null;
-
-  const trimmed = rawEmail.trim().replace(/[\uFF0E\u3002\uFF61]/g, ".");
-  if (!trimmed || trimmed.length > 320) return null;
-
-  const parsed = z.string().email().safeParse(trimmed);
-  if (!parsed.success) return null;
-
-  const normalized = trimmed.toLowerCase();
-  const parts = normalized.split("@");
-  if (parts.length !== 2) return null;
-
-  const [localPart, domainPart] = parts;
-  if (!localPart || !domainPart) return null;
-
-  if (
-    domainPart.startsWith(".") ||
-    domainPart.endsWith(".") ||
-    domainPart.includes("..")
-  ) {
-    return null;
-  }
-
-  return { email: normalized, domain: domainPart };
-}
 
   interface GoogleAuthRouteBody {
     token?: unknown;
@@ -3018,6 +3018,10 @@ export function normalizeAndValidateEmail(
       const body = UpdateSupportedAssetBody.parse(request.body);
 
       try {
+        const before = await prisma.supportedAsset.findUnique({
+          where: { code },
+        });
+
         const asset = await prisma.supportedAsset.update({
           where: { code },
           data: body,
@@ -3027,7 +3031,7 @@ export function normalizeAndValidateEmail(
           "asset.updated",
           "SupportedAsset",
           asset.code,
-          { before: null, after: asset },
+          { before, after: asset },
           request,
         );
 
@@ -3061,7 +3065,7 @@ export function normalizeAndValidateEmail(
       const { code } = request.params as { code: string };
 
       try {
-        await prisma.supportedAsset.delete({
+        const before = await prisma.supportedAsset.delete({
           where: { code },
         });
 
@@ -3069,7 +3073,7 @@ export function normalizeAndValidateEmail(
           "asset.deleted",
           "SupportedAsset",
           code,
-          { before: null, after: null },
+          { before, after: null },
           request,
         );
 
