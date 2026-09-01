@@ -102,6 +102,24 @@ interface ComputedRateEntry {
 
 const computedRateCache = new Map<string, ComputedRateEntry>();
 
+/**
+ * Actively evict computed-rate entries older than RATE_TTL_MS (issue #615).
+ *
+ * `resolveRate` already refuses to *serve* an expired entry (it recomputes
+ * live once `now - computedAt >= ttlMs`), but nothing previously removed the
+ * stale entry itself: if base-rate refreshes keep failing (upstream outage),
+ * `updateBaseRates` never runs `computedRateCache.clear()`, so every pair
+ * ever queried sits in the map forever. Called once per refresh tick so the
+ * map can't grow unbounded during a prolonged outage.
+ */
+function pruneExpiredComputedRates(now = Date.now()): void {
+  for (const [key, entry] of computedRateCache) {
+    if (now - entry.computedAt >= RATE_TTL_MS) {
+      computedRateCache.delete(key);
+    }
+  }
+}
+
 function computeRate(
   from: string,
   to: string,
@@ -486,6 +504,7 @@ async function releaseRateFetchLock(token: string): Promise<void> {
 }
 
 async function refreshTick(): Promise<void> {
+  pruneExpiredComputedRates();
   try {
     // ── Circuit breaker gate ────────────────────────────────────────────────
     const cbState = getCircuitBreakerState(env.CIRCUIT_BREAKER_COOLDOWN_MS);

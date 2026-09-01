@@ -1300,11 +1300,17 @@ fastify.post<{ Params: { id: string } }>(
       });
     }
 
-    // Re-enqueue on the main webhook delivery queue
+    // Re-enqueue on the main webhook delivery queue. Custom headers
+    // (Authorization, X-Idempotency-Key, ...) live on job.data.headers
+    // alongside url/event/signingSecret (see dispatchPendingWebhookDeliveries
+    // and the webhookWorker "failed" handler that spreads job.data into the
+    // DLQ) — omitting it here meant a replayed delivery arrived without the
+    // merchant's expected auth header and was rejected (#614).
     await webhookQueue.add("deliver", {
       url: job.data.url,
       event: job.data.event,
       signingSecret: job.data.signingSecret,
+      headers: job.data.headers,
     });
 
     // Remove from DLQ
