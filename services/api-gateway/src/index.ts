@@ -228,6 +228,7 @@ export interface AppOptions {
   redis?: ReturnType<typeof createRedisClient>;
   logger?: any;
   fetchImpl?: typeof fetch;
+  interServiceSecret?: string | string[];
 }
 
 export interface MerchantJwtPayload {
@@ -412,7 +413,7 @@ export function buildApp(opts: AppOptions = {}) {
   registerRequestId(fastify);
   registerErrorHandler(fastify);
   registerTracing(fastify);
-  registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
+  registerServiceAuth(fastify, opts.interServiceSecret ?? env.INTER_SERVICE_SECRET);
 
   // Centralized query and path parameter sanitization preHandler hook:
   // Recursively strips unsafe ASCII control characters (0x00-0x1F except \t, 0x7F)
